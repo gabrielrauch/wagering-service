@@ -1,0 +1,57 @@
+# Linting for the wagering service. Run with `make lint`.
+#
+# golangci-lint must be built with a Go at least as new as the `go` directive in
+# go.mod, or it refuses to start ("the Go language version used to build
+# golangci-lint is lower than the targeted Go version"). A Homebrew bottle is
+# often a release behind, so install it with the project's own toolchain:
+#
+#	GOTOOLCHAIN=go1.27.0 go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    # Modernisation: keep the tree on current Go idiom rather than letting it
+    # drift back. All four report zero today, so they are regression guards.
+    - copyloopvar
+    - intrange
+    - modernize
+    - usetesting
+
+    # Errors are a domain concern here: failure.Code is matched with errors.Is
+    # and errors.AsType, never by string or by ==.
+    - errorlint
+
+    # Database hygiene. The service talks to PostgreSQL through pgx, and the
+    # tests hold transactions open deliberately to prove locking behaviour.
+    - noctx
+    - rowserrcheck
+    - sqlclosecheck
+
+    - nilnil
+    - unconvert
+  settings:
+    rowserrcheck:
+      packages:
+        - github.com/jackc/pgx/v5
+    staticcheck:
+      checks:
+        - all
+  exclusions:
+    generated: lax
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/gabrielrauch/wagering-service
+
+issues:
+  # Report every occurrence. The defaults (max-same-issues: 3) silently collapse
+  # repeated findings, which understates a rule that is broken in many places --
+  # noctx was 66 findings behind a display of 16.
+  max-issues-per-linter: 0
+  max-same-issues: 0

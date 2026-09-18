@@ -1,0 +1,17 @@
+# The migrate command built into the working tree. It is normally run with
+# `go run ./cmd/migrate` (see the Makefile), so a binary here is a local
+# convenience, never something to ship.
+/migrate
+
+# Compiled test binaries from `go test -c`.
+*.test
+
+# Coverage profiles written by `make cover`.
+*.out
+
+# Session state for the assistant tooling used against this tree. It lives at
+# the repository root but belongs to the machine, not to the project.
+.remember/
+
+# macOS directory metadata.
+.DS_Store

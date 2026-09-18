@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: build and test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: wagering
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # The suite starts its own PostgreSQL through testcontainers when this is
+      # unset, and skips every storage test when that fails -- a skipped test
+      # still exits zero, so CI would pass having checked nothing. Pointed at the
+      # service container above, an unreachable or malformed DSN fails instead.
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/wagering?sslmode=disable
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+      - name: Fuzz the parsers briefly
+        # The seed corpus runs as part of the tests above. This is a short
+        # search for inputs nobody wrote down; `make fuzz` runs it for longer.
+        run: make fuzz FUZZTIME=30s
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          # Pinned, and not below v2.13.2: golangci-lint refuses to run when it
+          # was built with a Go older than the `go` directive in go.mod, and
+          # v2.13.2 is the first release built with Go 1.27.
+          version: v2.13.2
+
+  vuln:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: golang/govulncheck-action@v1
+        with:
+          go-version-file: go.mod
+
+  migrate:
+    name: migrate command
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: wagering
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/wagering?sslmode=disable
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      # The storage tests drive the Migrator API directly. This drives the
+      # command: its flag parsing, its exit codes and the migrations as shipped,
+      # against a real cluster. It runs against its own database, and creating
+      # the roles is idempotent, so it cannot disturb the test job.
+      - name: Apply, report and revert
+        run: |
+          go run ./cmd/migrate -database "$DATABASE_URL" up
+          go run ./cmd/migrate -database "$DATABASE_URL" version
+          go run ./cmd/migrate -database "$DATABASE_URL" down

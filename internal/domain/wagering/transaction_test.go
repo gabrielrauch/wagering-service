@@ -805,7 +805,6 @@ func TestRehydrateAcceptsExactlyWhatConstructionProduces(t *testing.T) {
 func TestRehydrateWagerTransaction(t *testing.T) {
 	t.Parallel()
 
-	result := brl(t, "75.00")
 	valid := TransactionSnapshot{
 		ID:        NewTransactionID(),
 		WalletID:  NewWalletID(),
@@ -815,7 +814,7 @@ func TestRehydrateWagerTransaction(t *testing.T) {
 		Status:    Processed,
 		CreatedAt: baseTime,
 		UpdatedAt: baseTime.Add(time.Second),
-		Result:    &result,
+		Result:    new(brl(t, "75.00")),
 		External: &ExternalSnapshot{
 			Provider:              testProvider,
 			ExternalTransactionID: "ext-1",
@@ -950,16 +949,14 @@ func TestRehydrateWagerTransaction(t *testing.T) {
 				// acts on one wallet, and a wallet holds one currency.
 				"a balance reported in another currency",
 				func(s *TransactionSnapshot) {
-					result := usd(t, "90.00")
-					s.Result = &result
+					s.Result = new(usd(t, "90.00"))
 				},
 				failure.CurrencyMismatch,
 			},
 			{
 				"a balance below what a wallet can hold",
 				func(s *TransactionSnapshot) {
-					result := negative(t, "5.00")
-					s.Result = &result
+					s.Result = new(negative(t, "5.00"))
 				},
 				failure.InsufficientFunds,
 			},
@@ -1049,12 +1046,10 @@ func TestRehydrateWagerTransaction(t *testing.T) {
 				// other's fixture.
 				snapshot := valid
 				if valid.External != nil {
-					external := *valid.External
-					snapshot.External = &external
+					snapshot.External = new(*valid.External)
 				}
 				if valid.Result != nil {
-					result := *valid.Result
-					snapshot.Result = &result
+					snapshot.Result = new(*valid.Result)
 				}
 				tc.mutate(&snapshot)
 				tx, err := RehydrateWagerTransaction(snapshot)
