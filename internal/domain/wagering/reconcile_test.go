@@ -173,8 +173,8 @@ func TestReconcileReportsDisagreement(t *testing.T) {
 	// The bet's entry is missing from the ledger handed back.
 	err = Reconcile(w, ledgerOf(t, w, opening))
 
-	var mismatch *ReconciliationError
-	if !errors.As(err, &mismatch) {
+	mismatch, ok := errors.AsType[*ReconciliationError](err)
+	if !ok {
 		t.Fatalf("Reconcile = %v, want a ReconciliationError", err)
 	}
 	if mismatch.Expected().Amount() != "100.00" || mismatch.Actual().Amount() != "70.00" {
@@ -294,9 +294,9 @@ func TestReconciliationErrorIsReachableByCode(t *testing.T) {
 	if !errors.Is(err, failure.New(failure.LedgerBalanceMismatch, "any message at all")) {
 		t.Error("errors.Is did not match the finding against its own code")
 	}
-	var coded *failure.Error
-	if !errors.As(err, &coded) {
-		t.Fatal("errors.As did not find a failure.Error")
+	coded, ok := errors.AsType[*failure.Error](err)
+	if !ok {
+		t.Fatal("errors.AsType did not find a failure.Error")
 	}
 	if coded.Code != failure.LedgerBalanceMismatch {
 		t.Errorf("Code = %s, want %s", coded.Code, failure.LedgerBalanceMismatch)
@@ -304,9 +304,9 @@ func TestReconciliationErrorIsReachableByCode(t *testing.T) {
 
 	// The structured finding must survive the change, or the fix traded one
 	// caller's needs for another's.
-	var mismatch *ReconciliationError
-	if !errors.As(err, &mismatch) {
-		t.Fatal("errors.As no longer finds the ReconciliationError")
+	mismatch, ok := errors.AsType[*ReconciliationError](err)
+	if !ok {
+		t.Fatal("errors.AsType no longer finds the ReconciliationError")
 	}
 	if mismatch.Expected().Amount() != "100.00" || mismatch.Actual().Amount() != "70.00" {
 		t.Errorf("reported %s expected against %s actual, want 100.00 against 70.00",

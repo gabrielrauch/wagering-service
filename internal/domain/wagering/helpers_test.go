@@ -98,20 +98,10 @@ type cmdOption func(*Command)
 func withReference(id ExternalTransactionID) cmdOption {
 	return func(c *Command) { c.ReferenceExternalTransactionID = id }
 }
-func withExternalID(id ExternalTransactionID) cmdOption {
-	return func(c *Command) { c.ExternalTransactionID = id }
-}
 func withProvider(p Provider) cmdOption { return func(c *Command) { c.Provider = p } }
 func withPlayer(p PlayerID) cmdOption   { return func(c *Command) { c.PlayerID = p } }
 func withRound(r RoundID) cmdOption     { return func(c *Command) { c.RoundID = r } }
-func withGame(g GameID) cmdOption       { return func(c *Command) { c.GameID = g } }
-func withKey(k IdempotencyKey) cmdOption {
-	return func(c *Command) { c.IdempotencyKey = k }
-}
 func withMoney(m money.Money) cmdOption { return func(c *Command) { c.Money = m } }
-func withLedgerEntryID(id LedgerEntryID) cmdOption {
-	return func(c *Command) { c.LedgerEntryID = id }
-}
 
 // command builds a valid submission of the given kind, which options may then
 // spoil in whatever way a test is about.

@@ -476,6 +476,12 @@ func TestJSON(t *testing.T) {
 			{"unknown field", `{"amount":"25.00","currency":"BRL","note":"x"}`, failure.InvalidFieldFormat},
 			{"amount as number", `{"amount":25.00,"currency":"BRL"}`, failure.InvalidFieldFormat},
 			{"not an object", `"25.00 BRL"`, failure.InvalidFieldFormat},
+			// Repeated names are refused rather than resolved. Under
+			// encoding/json v1 the last value wins, so these two would arrive
+			// as 999999.00 and 999 respectively with nothing to say a second
+			// value had been seen at all.
+			{"repeated amount", `{"amount":"1.00","amount":"999999.00","currency":"BRL"}`, failure.InvalidFieldFormat},
+			{"repeated currency", `{"amount":"1.00","currency":"BRL","currency":"USD"}`, failure.InvalidFieldFormat},
 		}
 		for _, tc := range tests {
 			t.Run(tc.name, func(t *testing.T) {

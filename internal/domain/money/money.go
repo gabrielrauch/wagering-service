@@ -49,8 +49,8 @@
 package money
 
 import (
-	"bytes"
-	"encoding/json"
+	"cmp"
+	"encoding/json/v2"
 	"math"
 	"strconv"
 
@@ -189,14 +189,7 @@ func (m Money) Cmp(other Money) (int, error) {
 	if err := m.compatible(other); err != nil {
 		return 0, err
 	}
-	switch {
-	case m.units < other.units:
-		return -1, nil
-	case m.units > other.units:
-		return 1, nil
-	default:
-		return 0, nil
-	}
+	return cmp.Compare(m.units, other.units), nil
 }
 
 // Equal reports whether m and other are the same amount in the same currency.
@@ -332,13 +325,17 @@ func (m Money) MarshalJSON() ([]byte, error) {
 }
 
 // UnmarshalJSON reads {"amount":"25.00","currency":"BRL"} through the same
-// validation [Parse] applies. Unknown fields are refused, so a payload carrying
-// an unexpected key is never silently accepted.
+// validation [Parse] applies. A payload is refused for naming a field this type
+// does not have, and for naming one of them twice.
+//
+// The repeat matters as much as the unknown key. Decoding through encoding/json
+// v1, {"amount":"1.00","amount":"999999.00"} is accepted and the last value
+// wins, so two amounts that differ by six orders of magnitude arrive as one
+// without anything to detect the repeat. v2 rejects duplicate names outright,
+// which is why the decoding goes through it.
 func (m *Money) UnmarshalJSON(data []byte) error {
 	var raw contract
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&raw); err != nil {
+	if err := json.Unmarshal(data, &raw, json.RejectUnknownMembers(true)); err != nil {
 		return failure.Wrap(err, failure.InvalidFieldFormat, "money must be an object with amount and currency")
 	}
 	parsed, err := Parse(raw.Amount, raw.Currency)
