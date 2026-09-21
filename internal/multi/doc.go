@@ -21,16 +21,26 @@
 // fixed cost, around a minute cold and a few seconds against a warm build
 // cache.
 //
-// The scenarios themselves take about twenty seconds. The four that run against
+// The scenarios themselves take about thirty seconds. The four that run against
 // the compose replicas run first and are over in under a second between them;
-// the six that build a world of their own run in parallel, and are bounded by
-// the slowest — the killed consumer, waiting out the visibility timeout on a
-// message its process died holding.
+// the six that build a world of their own run in parallel, so the thirty
+// seconds is the slowest of the six — the killed consumer, waiting out the
+// visibility timeout on a message its process died holding.
 //
-// Measured on this tree: forty-three seconds wall clock with the stack up and
-// the build cache warm, about ninety when Compose has to rebuild the images —
-// which it does on any run where a file the Dockerfile copies has changed. From
-// nothing at all, three minutes.
+// Measured on this tree. Which of these you get depends on one thing — how much
+// Compose and the Go build cache have to redo:
+//
+//   - About forty-five seconds for this package on its own, with the stack up
+//     and the images current. That is the ordinary case.
+//   - Fifty seconds to a minute and a half for `go test ./...`, which runs the
+//     rest of the tree beside it — including the suites that start PostgreSQL
+//     containers of their own, which is most of the spread.
+//   - About ninety seconds whenever Compose rebuilds the images, which it does
+//     on any run after a file the Dockerfile copies has changed. The test files
+//     are among them, so an edit here costs a rebuild.
+//   - About three minutes from nothing at all: no stack, no images, no build
+//     cache. That one is normal rather than a hang, and it is worth saying so
+//     before somebody interrupts it at two.
 //
 // # Two mechanisms, and why there are two
 //
@@ -38,10 +48,12 @@
 // or the compose replicas. Both are here, because the scenarios divide cleanly
 // in two and each half is cheaper and more honest under a different one.
 //
-// Five scenarios need a process to die at a named instant, or need the wait
-// budget to be seconds rather than minutes. Those build a world of their own:
-// a database created and migrated for the scenario, a pair of FIFO queues
-// created for the scenario, and processes this suite starts, arms with
+// Six scenarios need a process to die at a named instant, need the wait budget
+// to be seconds rather than minutes, or need to write something the schema is
+// entitled to refuse. Those build a world of their own: a database created and
+// migrated for the scenario, three FIFO queues created for the scenario —
+// inbound, outbound and the dead letter queue the first one redrives to — and
+// processes this suite starts, arms with
 // FAULT_POINT, kills and replaces. A world is isolated from the compose stack
 // and from every other world, so a publisher that must be one of exactly two is
 // one of exactly two, and a message that must be received by the process that
@@ -54,7 +66,7 @@
 // published ports with a real token from the real Keycloak, and read the two
 // worker replicas' own logs back out of Compose.
 //
-// What the split gives up is stated plainly. The five isolated scenarios do not
+// What the split gives up is stated plainly. The six isolated scenarios do not
 // exercise the container image, the health checks or the compose network; they
 // exercise the same binaries on the host. The four deployment scenarios do not
 // get a private database, so they are careful to identify everything they
@@ -108,13 +120,23 @@
 //     completed_at, and the outbox row's `attempts`, which counts claims and so
 //     counts republications.
 //
-// # What this suite finds today
+// # What this suite found
 //
-// One of the ten scenarios does not pass, and the failure is the service's
-// rather than the suite's: fifty concurrent submissions of one operation under
-// one idempotency key are answered 409 CONFLICT between two and six times, for
-// an operation recorded under exactly the key they sent. The wallet is right
-// either way, which is why nothing before this noticed. See the documentation
-// on TestOneBetSubmittedFiftyTimesAcrossThreeInstancesDebitsOnce for where it
-// comes from.
+// One defect, and it is the best argument for the suite existing. Fifty
+// concurrent submissions of one operation under one idempotency key were
+// answered 409 CONFLICT between one and six times, for an operation recorded
+// under exactly the key they sent — because Wagering.replay's two lookups do
+// not share a snapshot on the write path, which is READ COMMITTED by design.
+//
+// The wallet was right either way. That is why nothing before this noticed, and
+// it is the whole point: this was the first test here to ask whether all fifty
+// callers got a usable ANSWER rather than whether the money came out right.
+//
+// Fixed in c941786, which reads the key off the row the second lookup found
+// instead of inferring whose it is from which index found it. The interleaving
+// is now held deterministically in internal/app/idempotency_test.go, driven by
+// a step on the fake rather than by fifty goroutines racing; this package holds
+// the same contract end to end across three processes that share nothing but a
+// database. Both are worth having, and neither replaces the other. See the
+// documentation on TestOneBetSubmittedFiftyTimesAcrossThreeInstancesDebitsOnce.
 package multi

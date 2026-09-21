@@ -49,11 +49,14 @@ test-integration: ## Run the suites that need real PostgreSQL, SQS and Keycloak
 
 # Nothing has to be started first: the suite brings the compose stack up itself
 # and builds the two binaries it drives, which is idempotent and costs about two
-# seconds against a stack that is already healthy. Budget three and a half
-# minutes from cold and two and a half warm; internal/multi/doc.go breaks that
-# down.
+# seconds against a stack that is already healthy.
+#
+# Fifty seconds to a minute and a half with the stack up and the images current,
+# about ninety whenever Compose has to rebuild them, and about three minutes from
+# nothing at all — no stack, no images, no build cache. The three-minute one is
+# normal rather than a hang. internal/multi/doc.go breaks the numbers down.
 .PHONY: test-multi
-test-multi: ## Run the suite that drives several replicas at once (~3 min, starts the stack)
+test-multi: ## Run the suite that drives several replicas at once (~1 min warm, ~3 min cold)
 	go test -race -tags multi -count=1 -timeout 20m ./...
 
 .PHONY: fmt

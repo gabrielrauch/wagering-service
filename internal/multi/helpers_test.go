@@ -33,18 +33,25 @@ const currency = "BRL"
 // something that is allowed to take a while — a container that is still
 // starting, a queue's visibility timeout, a poll interval — and a budget tuned
 // to a fast laptop is a suite that fails on a loaded one for no finding.
+//
+// Ninety seconds rather than sixty for the three that wait on another process,
+// after one run of `go test -tags multi ./...` failed under a load none of
+// these scenarios produce on their own: six worlds starting at once beside the
+// PostgreSQL containers the rest of the tree's suites bring up. It cost nothing
+// to raise — a budget is an upper bound and not a sleep — and the alternative
+// is a suite whose verdict depends on what else the machine was doing.
 const (
 	// pollInterval is how often anything here looks again.
 	pollInterval = 50 * time.Millisecond
 	// readyBudget bounds a process becoming able to serve.
-	readyBudget = 60 * time.Second
+	readyBudget = 90 * time.Second
 	// settleBudget bounds work reaching the database once it has been asked
 	// for. It covers a redelivery at the visibility timeouts these worlds use.
-	settleBudget = 60 * time.Second
+	settleBudget = 90 * time.Second
 	// shutdownBudget bounds a process stopping when it is asked to.
 	shutdownBudget = 45 * time.Second
 	// faultBudget bounds an armed process reaching the instant it dies at.
-	faultBudget = 60 * time.Second
+	faultBudget = 90 * time.Second
 )
 
 // The clients the realm holds, by the identity each one stands for. Every
