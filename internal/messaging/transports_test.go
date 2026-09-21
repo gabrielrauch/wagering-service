@@ -4,7 +4,6 @@
 package messaging
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -70,6 +69,8 @@ func TestOneOperationOverBothTransportsMovesMoneyOnceAndReplaysOnce(t *testing.T
 				s.logs.await(t, logApplied, 1, settleBudget)
 			}
 
+			finished(t, consumer)
+
 			calls := submitter.submissions()
 			if len(calls) != 1 {
 				t.Fatalf("%d submissions reached the consumer, want 1: %+v", len(calls), calls)
@@ -124,9 +125,6 @@ func TestOneOperationOverBothTransportsMovesMoneyOnceAndReplaysOnce(t *testing.T
 				t.Errorf("inbox = %+v, want one row for %s", inbox, messageID)
 			}
 
-			if err := consumer.Stop(context.Background()); err != nil {
-				t.Fatalf("stop the consumer: %v", err)
-			}
 			empty(t, name, visibility+3*time.Second, "after both transports had submitted")
 		})
 	}

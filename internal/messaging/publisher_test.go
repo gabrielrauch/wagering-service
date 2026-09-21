@@ -31,13 +31,19 @@ import (
 // is a middleware rather than a stand-in: the call still goes to LocalStack and
 // the answer still comes back from it.
 //
-// The contention is real and is arranged to be. The outbox is head-of-line per
-// wallet, so a backlog on one wallet would serialise the two publishers by
-// construction and prove nothing; twenty wallets make twenty rows claimable at
-// once against a batch of ten, so both publishers claim in the same instant and
-// SKIP LOCKED is what keeps them off each other. Both are asserted to have done
-// some of the work, because a run where one of them did all of it would be a
-// test of one publisher wearing two names.
+// The contention is real and is arranged to be, in three ways. The outbox is
+// head-of-line per wallet, so a backlog on ONE wallet would serialise the two
+// publishers by construction and prove nothing — hence twenty wallets, which
+// make twenty rows claimable at once. The batch is two rather than the default
+// ten, so draining them takes twenty turns instead of four and the two
+// publishers are claiming from the same candidate set for the whole of it;
+// SKIP LOCKED is what then keeps them off each other. And both queues are
+// resolved before either publisher starts, so neither gets a head start worth
+// the name.
+//
+// Both publishers are asserted to have done some of the work, because a run
+// where one of them did all of it would be a test of one publisher wearing two
+// names.
 func TestTwoPublishersNeverPutOneEventOnTheQueueTwice(t *testing.T) {
 	t.Parallel()
 
@@ -55,12 +61,16 @@ func TestTwoPublishersNeverPutOneEventOnTheQueueTwice(t *testing.T) {
 
 	name := outbound(t)
 	var one, two wire
-	// Started together, against an outbox that is already full, so that the
-	// first claim each of them makes is made in the same instant as the other's.
-	startPublisher(t, s, openQueueOn(t, name, recordSends(t, &one)), "publisher-one",
-		30*time.Second)
-	startPublisher(t, s, openQueueOn(t, name, recordSends(t, &two)), "publisher-two",
-		30*time.Second)
+	// Both resolved first, then both started, against an outbox that is already
+	// full: the first claim each of them makes is made in the same instant as
+	// the other's.
+	queueOne := openQueueOn(t, name, recordSends(t, &one))
+	queueTwo := openQueueOn(t, name, recordSends(t, &two))
+	const contendedBatch = 2
+	startPublisher(t, s, queueOne,
+		publisherSettings{name: "publisher-one", hold: 30 * time.Second, batch: contendedBatch})
+	startPublisher(t, s, queueTwo,
+		publisherSettings{name: "publisher-two", hold: 30 * time.Second, batch: contendedBatch})
 
 	eventually(t, settleBudget, "every event to be published", func() error {
 		if got := len(s.publishedEvents(t)); got != len(pending) {
@@ -136,8 +146,8 @@ func TestAnExpiredClaimIsTakenUpByAnotherPublisher(t *testing.T) {
 
 	name := outbound(t)
 	var sent wire
-	startPublisher(t, s, openQueueOn(t, name, recordSends(t, &sent)), "publisher-live",
-		30*time.Second)
+	startPublisher(t, s, openQueueOn(t, name, recordSends(t, &sent)),
+		publisherSettings{name: "publisher-live", hold: 30 * time.Second})
 
 	eventually(t, settleBudget, "the abandoned claim to be taken up and published", func() error {
 		published := s.publishedEvents(t)
@@ -202,7 +212,7 @@ func TestPublishedEventsKeepTheirEventIdAcrossRepublication(t *testing.T) {
 	name := outbound(t)
 	var sent wire
 	publisher := startPublisher(t, s, openQueueOn(t, name, recordSends(t, &sent)),
-		"publisher-eventid", 30*time.Second)
+		publisherSettings{name: "publisher-eventid", hold: 30 * time.Second})
 
 	eventually(t, settleBudget, "the wallet's events to be published", func() error {
 		if got := len(s.publishedEvents(t)); got != len(pending) {
@@ -259,8 +269,8 @@ func TestPublishedEventsKeepTheirEventIdAcrossRepublication(t *testing.T) {
 		`claimed_at = NULL, claim_expires_at = NULL, next_attempt_at = $1`, time.Now().UTC())
 
 	var again wire
-	startPublisher(t, s, openQueueOn(t, name, recordSends(t, &again)), "publisher-recovered",
-		30*time.Second)
+	startPublisher(t, s, openQueueOn(t, name, recordSends(t, &again)),
+		publisherSettings{name: "publisher-recovered", hold: 30 * time.Second})
 	eventually(t, settleBudget, "the events to be published a second time", func() error {
 		if got := len(s.publishedEvents(t)); got != len(pending) {
 			return fmt.Errorf("%d of %d events are marked published again", got, len(pending))

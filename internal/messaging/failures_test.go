@@ -122,7 +122,7 @@ func TestATransientFailureLeavesTheMessageVisibleAgain(t *testing.T) {
 
 			raw := body(t, message(messageID, operationOf("BET", external, player, "25.00")))
 			sent := put(t, name, raw, wallet, "dedupe-"+messageID)
-			startConsumer(t, s, queue, submitter, consumerSettings{
+			consumer := startConsumer(t, s, queue, submitter, consumerSettings{
 				name:    consumerName,
 				backoff: workers.Backoff{Initial: backoff, Factor: 1, Max: backoff},
 			})
@@ -190,6 +190,7 @@ func TestATransientFailureLeavesTheMessageVisibleAgain(t *testing.T) {
 			// rather than fatal.
 			clear()
 			s.logs.await(t, logApplied, 1, settleBudget)
+			finished(t, consumer)
 
 			if got, want := s.balance(t, player), minor(t, "75.00"); got != want {
 				t.Errorf("balance = %d minor units, want %d", got, want)

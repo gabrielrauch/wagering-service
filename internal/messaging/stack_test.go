@@ -608,31 +608,56 @@ func startConsumer(
 	return consumer
 }
 
-// startPublisher wires and starts an outbox publisher.
+// finished stops a consumer and insists the stop was clean.
 //
-// The name is the caller's and is deliberately not defaulted: it lands in
-// claimed_by and must be distinct per process, or two publishers reschedule
-// each other's claims. A scenario that runs two of them names both.
+// Everything a scenario asserts about what a consumer DID is asserted after
+// this, and the reason is one ordering: the consumer writes its line about an
+// operation BEFORE it deletes the message, so a suite that read the recorded
+// calls the moment the line appeared would be racing the delete it means to
+// assert on. A stopped consumer has no such gap — Stop ends the polling, drains
+// what is in hand, and returns only once the receivers have come back.
+func finished(t *testing.T, consumer *workers.Consumer) {
+	t.Helper()
+	if err := consumer.Stop(context.Background()); err != nil {
+		t.Fatalf("stop the consumer: %v", err)
+	}
+}
+
+// publisherSettings is what a scenario varies about the publisher it starts.
+type publisherSettings struct {
+	// name lands in claimed_by. It is required and deliberately not defaulted:
+	// it must be distinct per process, or two publishers reschedule each
+	// other's claims.
+	name string
+	// hold is how long a claim stands before the row returns to the pool.
+	hold time.Duration
+	// batch is how many events one turn claims. Zero takes the worker's own
+	// default of ten.
+	batch int
+}
+
+// startPublisher wires and starts an outbox publisher.
 func startPublisher(
-	t *testing.T, s *stack, queue workers.OutboundQueue, name string, hold time.Duration,
+	t *testing.T, s *stack, queue workers.OutboundQueue, settings publisherSettings,
 ) *workers.Publisher {
 	t.Helper()
 	publisher, err := workers.NewPublisher(workers.PublisherConfig{
 		Outbox:   s.claims,
 		Queue:    queue,
 		Clock:    wallClock{},
-		Name:     name,
-		Hold:     hold,
+		Name:     settings.name,
+		Batch:    settings.batch,
+		Hold:     settings.hold,
 		Interval: 100 * time.Millisecond,
 		Logger:   s.logs.logger,
 	})
 	if err != nil {
-		t.Fatalf("wire the publisher %s: %v", name, err)
+		t.Fatalf("wire the publisher %s: %v", settings.name, err)
 	}
 	if err := publisher.Start(t.Context()); err != nil {
-		t.Fatalf("start the publisher %s: %v", name, err)
+		t.Fatalf("start the publisher %s: %v", settings.name, err)
 	}
-	t.Cleanup(func() { stopWorker(t, "publisher "+name, publisher.Stop) })
+	t.Cleanup(func() { stopWorker(t, "publisher "+settings.name, publisher.Stop) })
 	return publisher
 }
 

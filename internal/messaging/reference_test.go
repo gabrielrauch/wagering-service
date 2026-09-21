@@ -5,7 +5,6 @@
 package messaging
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -61,7 +60,7 @@ func TestARefundDeliveredBeforeItsBetIsCarriedForwardWhenTheBetArrives(t *testin
 
 	queue := watch(openQueue(t, name))
 	submitter := follow(s.wagering)
-	startConsumer(t, s, queue, submitter, consumerSettings{name: consumerName})
+	consumer := startConsumer(t, s, queue, submitter, consumerSettings{name: consumerName})
 	startReferenceWorker(t, s)
 
 	put(t, name, body(t, message("msg-refund",
@@ -98,6 +97,8 @@ func TestARefundDeliveredBeforeItsBetIsCarriedForwardWhenTheBetArrives(t *testin
 		}
 		return nil
 	})
+
+	finished(t, consumer)
 
 	settled := s.operationRow(t, refund)
 	staked := s.operationRow(t, bet)
@@ -189,6 +190,8 @@ func TestARefundWhoseBetNeverArrivesIsRejectedWhenTheBudgetRunsOut(t *testing.T)
 			"rather than waiting", waited, ttl)
 	}
 
+	finished(t, consumer)
+
 	settled := s.operationRow(t, refund)
 	if settled.failureCode == nil || *settled.failureCode != failure.ReferenceNotFound.String() {
 		t.Errorf("the refund is coded %v, want %s", settled.failureCode,
@@ -226,8 +229,5 @@ func TestARefundWhoseBetNeverArrivesIsRejectedWhenTheBudgetRunsOut(t *testing.T)
 		t.Errorf("%d submissions, want 1: the worker resumes, it does not resubmit", len(calls))
 	}
 
-	if err := consumer.Stop(context.Background()); err != nil {
-		t.Fatalf("stop the consumer: %v", err)
-	}
 	empty(t, name, visibility+3*time.Second, "after the refund was given up on")
 }

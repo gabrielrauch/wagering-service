@@ -6,7 +6,6 @@
 package messaging
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -63,6 +62,7 @@ func TestTheConsumerAppliesAnOperationAndDeletesTheMessage(t *testing.T) {
 	sent := put(t, name, raw, wallet, "dedupe-"+messageID)
 
 	s.logs.await(t, logApplied, 1, settleBudget)
+	finished(t, consumer)
 
 	// The movement, in every table it touches.
 	if got, want := s.balance(t, player), minor(t, "75.00"); got != want {
@@ -106,9 +106,6 @@ func TestTheConsumerAppliesAnOperationAndDeletesTheMessage(t *testing.T) {
 		t.Errorf("deleted %v, want exactly %s", deleted, sent)
 	}
 
-	if err := consumer.Stop(context.Background()); err != nil {
-		t.Fatalf("stop the consumer: %v", err)
-	}
 	empty(t, name, visibility+3*time.Second, "after the operation was applied")
 }
 
@@ -147,6 +144,7 @@ func TestARedeliveredMessageIsReplayedFromTheInboxAndDeleted(t *testing.T) {
 	// message's id and nothing would be delivered again.
 	second := put(t, name, raw, wallet, "dedupe-second")
 	s.logs.await(t, logApplied, 2, settleBudget)
+	finished(t, consumer)
 
 	if first == second {
 		t.Fatalf("the queue collapsed the two sends into one message %s; there was no "+
@@ -188,9 +186,6 @@ func TestARedeliveredMessageIsReplayedFromTheInboxAndDeleted(t *testing.T) {
 	// the message that carried it is finished with.
 	if deleted := queue.messagesFor(queue.deleted()); len(deleted) != 2 {
 		t.Errorf("deleted %v, want both %s and %s", deleted, first, second)
-	}
-	if err := consumer.Stop(context.Background()); err != nil {
-		t.Fatalf("stop the consumer: %v", err)
 	}
 	empty(t, name, visibility+3*time.Second, "after the duplicate was replayed")
 }
@@ -275,6 +270,7 @@ func TestAMessageIdReusedForADifferentBodyReachesTheDeadLetterQueue(t *testing.T
 			second := put(t, source, forged, wallet, "dedupe-forged")
 
 			dropped := awaitMessages(t, dead, 1, settleBudget, "the reused message id")
+			finished(t, consumer)
 			if len(dropped) != 1 {
 				t.Fatalf("%d messages on the dead-letter queue, want 1: %+v", len(dropped),
 					dropped)
@@ -311,9 +307,6 @@ func TestAMessageIdReusedForADifferentBodyReachesTheDeadLetterQueue(t *testing.T
 				t.Errorf("%d wager transactions for %s, want 1", got, external)
 			}
 
-			if err := consumer.Stop(context.Background()); err != nil {
-				t.Fatalf("stop the consumer: %v", err)
-			}
 			empty(t, source, visibility+3*time.Second,
 				"after the conflicting body was redriven")
 		})
@@ -359,6 +352,7 @@ func TestAnUnreadableMessageReachesTheDeadLetterQueueAfterTheRetryLimit(t *testi
 	sent := put(t, source, unreadable, wallet, "dedupe-unreadable")
 
 	dropped := awaitMessages(t, dead, 1, settleBudget, "the unreadable message")
+	finished(t, consumer)
 	if len(dropped) != 1 || dropped[0].body != unreadable {
 		t.Fatalf("the dead-letter queue holds %+v, want the one unreadable body", dropped)
 	}
@@ -385,8 +379,5 @@ func TestAnUnreadableMessageReachesTheDeadLetterQueueAfterTheRetryLimit(t *testi
 		t.Errorf("balance = %d minor units, want %d untouched", got, want)
 	}
 
-	if err := consumer.Stop(context.Background()); err != nil {
-		t.Fatalf("stop the consumer: %v", err)
-	}
 	empty(t, source, visibility+3*time.Second, "after the unreadable message was redriven")
 }
