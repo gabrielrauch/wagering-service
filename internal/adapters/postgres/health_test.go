@@ -97,7 +97,16 @@ func TestReadinessGivesUpWithinItsTimeout(t *testing.T) {
 	waited := time.Since(started)
 
 	classifies(t, err, app.Retryable)
-	if waited > 2*time.Second {
+	// Bounded on both sides. The ceiling is what catches a check that stopped
+	// applying its own timeout — a tenfold regression lands at two seconds, so a
+	// two-second ceiling would have missed it. The floor is what catches the
+	// opposite mistake: an answer that arrives instantly did not wait for the
+	// pool and is reporting something other than the condition under test.
+	if waited < timeout {
+		t.Fatalf("gave up after %s, before its %s timeout: it did not wait for the pool",
+			waited, timeout)
+	}
+	if waited > 5*timeout {
 		t.Fatalf("gave up after %s, well past its %s timeout", waited, timeout)
 	}
 	<-busy

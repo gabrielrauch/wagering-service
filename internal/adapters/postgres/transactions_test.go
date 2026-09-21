@@ -324,9 +324,12 @@ func TestOneParkedOperationIsClaimedByOneWorker(t *testing.T) {
 		}()
 		<-claimed
 
+		started := make(chan struct{})
+		finished := make(chan time.Time, 1)
 		second := make(chan error, 1)
 		go func() {
 			second <- w.tm.WithinMovement(t.Context(), func(ctx context.Context, r *app.Repos) error {
+				close(started)
 				// Waits on the wallet, which is where the two workers meet:
 				// the lock order says the wallet comes before the row.
 				if _, err := r.Wallets.LockByID(ctx, wallet.ID()); err != nil {
@@ -339,16 +342,34 @@ func TestOneParkedOperationIsClaimedByOneWorker(t *testing.T) {
 				if stored != nil {
 					t.Errorf("two workers claimed operation %s", parked)
 				}
+				finished <- time.Now()
 				return nil
 			})
 		}()
+		<-started
 
+		// Released only once the second worker is genuinely queued behind the
+		// first. Without this the two might never contend at all, and the
+		// assertion above would hold for the uninteresting reason that the
+		// second worker ran after the first had finished.
+		time.Sleep(200 * time.Millisecond)
+		select {
+		case got := <-finished:
+			t.Fatalf("the second worker finished at %s while the first still held the wallet", got)
+		default:
+		}
+
+		releasedAt := time.Now()
 		close(release)
 		if err := <-first; err != nil {
 			t.Fatalf("the first worker failed: %v", err)
 		}
 		if err := <-second; err != nil {
 			t.Fatalf("the second worker failed: %v", err)
+		}
+		if got := <-finished; got.Before(releasedAt) {
+			t.Fatalf("the second worker finished at %s, before the first released at %s",
+				got, releasedAt)
 		}
 	})
 

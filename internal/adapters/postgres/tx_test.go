@@ -85,10 +85,10 @@ func TestTheTransactionManagerCommitsAndRollsBack(t *testing.T) {
 //
 // Reading current_setting rather than inferring the isolation level from
 // behaviour: behaviour proves READ COMMITTED is not REPEATABLE READ and vice
-// versa, which TestASnapshotDoesNotSeeLaterCommits and
-// TestAMovementSeesLaterCommits already do, but it cannot tell REPEATABLE READ
-// from SERIALIZABLE, and the timeouts have no behaviour at all until something
-// blocks.
+// versa, which TestAMovementSeesWhatCommittedWhileItRan and
+// TestAReconciliationReadsOneInstant already do between them, but it cannot
+// tell REPEATABLE READ from SERIALIZABLE, and the timeouts have no behaviour at
+// all until something blocks.
 func TestTheTransactionManagerSetsWhatItPromises(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
@@ -153,6 +153,46 @@ func TestTheTransactionManagerSetsWhatItPromises(t *testing.T) {
 			t.Errorf("lock_timeout leaked out of the transaction as %q, wanted 0", lock)
 		}
 	})
+}
+
+// TestAMovementSeesWhatCommittedWhileItRan is READ COMMITTED, demonstrated.
+//
+// It is the other half of TestAReconciliationReadsOneInstant, and it is not a
+// curiosity about isolation levels: ClaimForUpdate rests on it. The resume
+// worker finds its work with an unlocked SELECT and then re-reads the row under
+// its own lock, and that re-read is only worth making because a change another
+// worker committed in between is visible to it. At REPEATABLE READ the re-read
+// would see exactly what the unlocked SELECT saw, and the second worker would
+// carry forward an operation the first had already settled.
+func TestAMovementSeesWhatCommittedWhileItRan(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	wallet := w.openWallet(t, "player-read-committed", "100.00", "BRL")
+
+	var before, after *wagering.Wallet
+	err := w.tm.WithinMovement(t.Context(), func(ctx context.Context, r *app.Repos) error {
+		var err error
+		// Read without the lock, so that the movement below is not simply
+		// queued behind this transaction — which would prove nothing about what
+		// this one can see.
+		if before, err = r.Wallets.ByID(ctx, wallet.ID()); err != nil {
+			return err
+		}
+		w.apply(t, command(t, wagering.Bet, "player-read-committed", "ext-rc-1", "30.00", "BRL"),
+			at(1))
+		after, err = r.Wallets.ByID(ctx, wallet.ID())
+		return err
+	})
+	if err != nil {
+		t.Fatalf("read across a commit: %v", err)
+	}
+
+	if got := before.Balance().Amount(); got != "100.00" {
+		t.Fatalf("the first read saw %s, wanted 100.00", got)
+	}
+	if got := after.Balance().Amount(); got != "70.00" {
+		t.Fatalf("the second read saw %s, wanted the 70.00 that committed meanwhile", got)
+	}
 }
 
 // TestASnapshotRefusesAWrite proves the second half of READ ONLY.

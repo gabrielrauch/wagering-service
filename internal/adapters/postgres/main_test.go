@@ -24,8 +24,10 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -56,6 +58,18 @@ var (
 	// issue it costs an order of magnitude more than issuing it.
 	admin *pgxpool.Pool
 )
+
+// runID distinguishes this run's databases from those of every other run.
+//
+// A counter alone was not enough, and the way it failed is worth stating: it
+// starts at 1 in every process, and nothing here drops the databases it makes
+// — deliberately, because a database left standing is the one a failing test
+// can be investigated against. Two runs against one persistent cluster
+// therefore asked for the same name twice, which is exactly what
+// `go test ./...` followed by `go test -tags integration ./...` does under
+// TEST_DATABASE_URL. Base 36 keeps the name short enough to stay well inside
+// PostgreSQL's 63-byte identifier limit.
+var runID = strconv.FormatUint(rand.Uint64(), 36)
 
 func TestMain(m *testing.M) {
 	os.Exit(run(m))
@@ -215,7 +229,7 @@ func freshDatabase(t *testing.T, template string) string {
 // rather than supplied, so there is nothing to quote against; a database name
 // cannot be a placeholder in any case.
 func create(template string) (string, error) {
-	name := fmt.Sprintf("wagering_adapter_%d", databases.Add(1))
+	name := fmt.Sprintf("wagering_adapter_%s_%d", runID, databases.Add(1))
 	statement := "CREATE DATABASE " + name
 	if template != "" {
 		statement += " TEMPLATE " + template

@@ -64,9 +64,18 @@ jobs:
       # The adapter suite is behind a build tag because it is slower and needs a
       # cluster it can create databases on. Behind a tag and absent from CI it
       # would be a suite nothing ever runs, which is the same as no suite at
-      # all -- so it runs here, against the service container above. It fails
-      # rather than skips when no cluster is reachable, deliberately: a run that
-      # was asked for and checked nothing must not report success.
+      # all -- so it runs here, against the service container above, as exactly
+      # the command the acceptance checklist names.
+      #
+      # This is the whole of `./...` a second time, so the untagged storage
+      # tests run twice against one cluster. That is why both harnesses name
+      # their databases with a per-RUN identifier rather than a per-process
+      # counter: the counter restarts at 1 in the second run and collided with
+      # the databases the first one left behind.
+      #
+      # The adapter suite fails rather than skips when no cluster is reachable;
+      # the storage suite this command also invokes still skips, which is its
+      # own choice and the reason TEST_DATABASE_URL is set above.
       - name: Integration test
         run: go test -race -tags integration -count=1 ./...
 
