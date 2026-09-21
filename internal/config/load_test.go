@@ -461,15 +461,32 @@ func TestARefusalNeverQuotesTheDSN(t *testing.T) {
 func TestExampleEnvironmentMatchesTheLoader(t *testing.T) {
 	t.Parallel()
 
-	// Not this package's to put in the file, for two different reasons. The
-	// first three are read by the AWS SDK's own credential chain and are in the
-	// file because a local stack does not work without them; HOSTNAME is set by
-	// the container runtime and would be wrong in a file that is copied.
+	// Not this package's to put in the file, for three different reasons.
+	//
+	// The first three are read by the AWS SDK's own credential chain and are in
+	// the file because a local stack does not work without them; HOSTNAME is set
+	// by the container runtime and would be wrong in a file that is copied.
+	//
+	// The last four are the local stack's, and not this service's: nothing in
+	// the API or the worker reads them. The Makefile does — `make dashboards`
+	// prints the first three and `make trace` asks the fourth — taking them from
+	// the environment when it sets them and falling back to the values the file
+	// gives when it does not, and what they describe is what docker-compose.yml
+	// brings up. .env.example keeps them under a heading that says exactly that,
+	// so the file and this list agree about which of the two things a variable
+	// is. They are named one by one rather than matched on a GRAFANA_ prefix,
+	// because a fifth variable should have to argue its own case here instead of
+	// inheriting one.
 	elsewhere := map[string]bool{
 		"AWS_ACCESS_KEY_ID":         true,
 		"AWS_SECRET_ACCESS_KEY":     true,
 		"AWS_EC2_METADATA_DISABLED": true,
 		"HOSTNAME":                  true,
+
+		"GRAFANA_URL":      true,
+		"GRAFANA_USER":     true,
+		"GRAFANA_PASSWORD": true,
+		"TEMPO_URL":        true,
 	}
 
 	example := readExample(t, "../../.env.example")

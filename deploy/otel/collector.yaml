@@ -18,6 +18,19 @@ receivers:
       http: {endpoint: 0.0.0.0:4318}
 
 processors:
+  # No tail sampler, which is the one decision this file is expected to make and
+  # does not. The service records every trace it starts and says why in the
+  # package documentation of internal/fxmod.Telemetry: a head sampler throws
+  # away the traces an operator most wants, because whether a trace is
+  # interesting is known at its END, and the collector is where an end-of-trace
+  # rule belongs.
+  #
+  # This stack keeps all of it, and for a laptop that is the right answer twice
+  # over: the volume is one developer's traffic, and the trace somebody is
+  # demonstrating is never the one a rule would have kept. A deployment adds
+  # tail_sampling here — and the number it is bounding, eight hundred thousand
+  # spans a day from one idle worker replica, is in that same documentation.
+
   # One second, which is short for a collector and deliberate here: this stack
   # exists to be watched while somebody submits a transaction by hand, and a
   # batch that waits for the usual five or ten seconds is a dashboard that
