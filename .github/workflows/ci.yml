@@ -61,6 +61,15 @@ jobs:
       - name: Test
         run: go test -race -count=1 ./...
 
+      # The adapter suite is behind a build tag because it is slower and needs a
+      # cluster it can create databases on. Behind a tag and absent from CI it
+      # would be a suite nothing ever runs, which is the same as no suite at
+      # all -- so it runs here, against the service container above. It fails
+      # rather than skips when no cluster is reachable, deliberately: a run that
+      # was asked for and checked nothing must not report success.
+      - name: Integration test
+        run: go test -race -tags integration -count=1 ./...
+
       - name: Fuzz the parsers briefly
         # The seed corpus runs as part of the tests above. This is a short
         # search for inputs nobody wrote down; `make fuzz` runs it for longer.
