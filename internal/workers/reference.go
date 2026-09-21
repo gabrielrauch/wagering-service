@@ -246,12 +246,17 @@ func (w *ReferenceWorker) run(ctx context.Context) {
 // turn is one call to the resume door, and reports whether it claimed anything.
 //
 // Every turn opens a span, including the ones that claim nothing, and that is
-// worth being deliberate about: a worker polling once a second produces
-// eighty-six thousand spans a day saying "nothing was due". They are cheap
-// because they are short and carry two attributes, they are what makes "the
-// reference worker stopped looking" visible at all, and a deployment that finds
-// them too many has a sampler for exactly this — which is a collector's
-// decision rather than one this loop should make by not reporting.
+// worth being exact about rather than approximate. Resume opens a transaction
+// whether or not anything is due, so one idle turn is SEVEN spans — this one,
+// the use case, the movement, and the four statements inside it — and at the
+// default REFERENCE_WORKER_INTERVAL of one second that is of the order of six
+// hundred thousand a day per replica saying nothing was due.
+//
+// They are kept because they are what makes "the reference worker stopped
+// looking" visible at all, and a deployment that finds them too many has a
+// sampler for exactly this — which is a collector's decision rather than one
+// this loop should make by not reporting. See fxmod.Telemetry, where this
+// service's whole span budget is set out.
 func (w *ReferenceWorker) turn(ctx context.Context) (bool, error) {
 	ctx, resuming := w.telemetry.Start(ctx, telemetry.SpanResume,
 		oteltrace.WithAttributes(attribute.String("worker", w.name)))

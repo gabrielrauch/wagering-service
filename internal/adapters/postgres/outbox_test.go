@@ -9,6 +9,7 @@
 package postgres
 
 import (
+	"bytes"
 	"encoding/json"
 	"maps"
 	"testing"
@@ -98,6 +99,47 @@ func TestAPayloadWithNothingToCarryIsStoredExactlyAsItWasRendered(t *testing.T) 
 			t.Errorf("a payload with nothing to carry was rewritten:\n got %s\nwant %s",
 				stored, anEnvelope)
 		}
+	}
+}
+
+// TestTheTraceIsWrittenLastSoTheLiveValueWins pins the collision policy.
+//
+// jsonb resolves a duplicate key to the LAST one — verified against PostgreSQL
+// 16: `'{"$trace":"A","$trace":"B"}'::jsonb ->> '$trace'` is "B". So the member
+// written last is the member that survives, and the one that should survive is
+// the one this process just injected rather than something that arrived inside
+// a document. That is the same rule besideTheBody applies to the message
+// attributes, and two collision policies that contradicted each other would be
+// the kind of thing that stops being unreachable.
+//
+// It is unreachable today — app.Envelope.MarshalJSON marshals a fixed struct of
+// camelCase tags — which is exactly why the position needs a test rather than a
+// comment: nothing else in this tree would notice it moving.
+func TestTheTraceIsWrittenLastSoTheLiveValueWins(t *testing.T) {
+	t.Parallel()
+
+	const live = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	carried := map[string]string{"traceparent": live}
+
+	// A document that already carries the member, which today's envelope never
+	// does. What matters is which of the two a jsonb column would keep.
+	envelope := `{"eventId":"e-1","` + traceMember + `":{"traceparent":"STALE"},"version":1}`
+	stored, err := withTrace([]byte(envelope), carried)
+	if err != nil {
+		t.Fatalf("carry the trace: %v", err)
+	}
+
+	first := bytes.Index(stored, []byte(`"`+traceMember+`"`))
+	last := bytes.LastIndex(stored, []byte(`"`+traceMember+`"`))
+	if first == last {
+		t.Fatalf("the fixture did not produce two members to choose between: %s", stored)
+	}
+	if !bytes.Contains(stored[last:], []byte(live)) {
+		t.Errorf("the LAST %s member is not the live one, so jsonb would keep the stale "+
+			"one:\n%s", traceMember, stored)
+	}
+	if bytes.Contains(stored[last:], []byte("STALE")) {
+		t.Errorf("the live trace was written before the stale one:\n%s", stored)
 	}
 }
 

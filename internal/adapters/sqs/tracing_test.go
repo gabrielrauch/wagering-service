@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
 	"github.com/aws/smithy-go/middleware"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
@@ -14,13 +15,21 @@ import (
 	"github.com/gabrielrauch/wagering-service/internal/telemetry"
 )
 
-// handling is a stub for the rest of the SDK's middleware stack.
-type handling struct{ err error }
+// handling is a stub for the rest of the SDK's middleware stack, answering with
+// the request id the SDK's own middleware would have set.
+type handling struct {
+	err       error
+	requestID string
+}
 
 func (h handling) HandleInitialize(
 	context.Context, middleware.InitializeInput,
 ) (middleware.InitializeOutput, middleware.Metadata, error) {
-	return middleware.InitializeOutput{}, middleware.Metadata{}, h.err
+	var metadata middleware.Metadata
+	if h.requestID != "" {
+		awsmiddleware.SetRequestIDMetadata(&metadata, h.requestID)
+	}
+	return middleware.InitializeOutput{}, metadata, h.err
 }
 
 // TestACallAgainstTheQueueIsOneSpanNamingTheOperation pins what this package's
@@ -42,14 +51,26 @@ func TestACallAgainstTheQueueIsOneSpanNamingTheOperation(t *testing.T) {
 		name string
 		// failed is what the rest of the stack reports.
 		failed error
+		// requestID is AWS's own identifier for the call, empty when the
+		// request never reached it.
+		requestID string
 		// class is the app.Class the span must end under, or "" for a call that
 		// succeeded.
 		class string
 	}{
-		{name: "a call the service answered", failed: nil},
+		{name: "a call the service answered", failed: nil, requestID: "req-answered"},
 		{
-			name:   "a call the service refused",
-			failed: errors.New("the queue is not answering"),
+			name:      "a call the service refused",
+			failed:    errors.New("the queue is not answering"),
+			class:     string(app.Unretryable),
+			requestID: "req-refused",
+		},
+		{
+			// A call that never reached AWS carries no request id, and an
+			// attribute with an empty value is worse than an absent one: it is
+			// a value somebody can search for and find only the failures.
+			name:   "a call that never reached AWS",
+			failed: errors.New("no credentials"),
 			class:  string(app.Unretryable),
 		},
 	}
@@ -66,7 +87,8 @@ func TestACallAgainstTheQueueIsOneSpanNamingTheOperation(t *testing.T) {
 			}
 
 			ctx := middleware.WithOperationName(t.Context(), "SendMessageBatch")
-			_, _, got := span(reporting)(ctx, middleware.InitializeInput{}, handling{err: c.failed})
+			_, _, got := span(reporting)(ctx, middleware.InitializeInput{},
+				handling{err: c.failed, requestID: c.requestID})
 			if !errors.Is(got, c.failed) {
 				t.Fatalf("the middleware changed the call's answer to %v", got)
 			}
@@ -89,6 +111,12 @@ func TestACallAgainstTheQueueIsOneSpanNamingTheOperation(t *testing.T) {
 			}
 			if got := ended[0].Status().Description; got != c.class {
 				t.Errorf("the span ended under %q, wanted %q", got, c.class)
+			}
+			// AWS's own identifier for the call, which is what a support case
+			// is opened with — present on a refusal as well as on a success,
+			// and absent rather than empty when the request never reached AWS.
+			if got := attributeOf(ended[0], "aws.request_id"); got != c.requestID {
+				t.Errorf("aws.request_id is %q, wanted %q", got, c.requestID)
 			}
 			// The failure's own words are never on the span, for the reason
 			// telemetry.Telemetry.Failed gives: a class is a published

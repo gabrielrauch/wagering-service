@@ -53,13 +53,18 @@ const appendOutbox = `INSERT INTO wagering.outbox ` +
 // # Why the publisher never sends it
 //
 // The claim strips it: see claimOutbox, which returns `payload - '$trace'` as
-// the body and the member itself as a separate value. So the bytes that reach
-// the queue are exactly the envelope, byte for byte, as they were before this
-// existed — the published contract is unchanged and a downstream consumer
-// reading the body strictly is not broken by a member it has never heard of.
-// What reaches the consumer instead is the message ATTRIBUTES, which is where
-// the task this implements says trace context belongs and where
-// internal/adapters/sqs was already built to carry it.
+// the body and the member itself as a separate value. What reaches the queue is
+// therefore jsonb's rendering of the envelope and nothing else — the same
+// rendering it was before this existed, member for member and value for value,
+// which is the strongest true statement about it. It is NOT the bytes that were
+// written: jsonb normalises key order and spacing, which [ClaimedEvent.Payload]
+// says in its own words and which nothing may hash and expect to recognise.
+//
+// The published contract is unchanged, and a downstream consumer reading the
+// body strictly is not broken by a member it has never heard of. What reaches
+// the consumer instead is the message ATTRIBUTES, which is where the task this
+// implements says trace context belongs and where internal/adapters/sqs was
+// already built to carry it.
 //
 // # Why a dollar sign
 //
@@ -137,11 +142,25 @@ func (o outbox) Append(ctx context.Context, envelopes []app.Envelope) error {
 //
 // Nothing to carry writes nothing, so a process with telemetry switched off
 // stores exactly what it stored before this existed.
+//
+// # Why the member goes LAST
+//
+// Because jsonb resolves a duplicate key to the last one, so the member written
+// last is the member that survives — and the one that should survive is the one
+// this process just injected, not something that arrived inside a document.
+// That is the same rule [besideTheBody] applies to the message attributes, and
+// two collision policies that contradicted each other would be the kind of
+// thing that stops being unreachable.
+//
+// It IS unreachable today: [app.Envelope.MarshalJSON] marshals a fixed struct
+// whose members are camelCase tags, and the only free-form part of it is nested
+// under "data". The policy is stated anyway, because "unreachable" is a
+// property of today's envelope and not of this function.
 func withTrace(payload []byte, carried map[string]string) ([]byte, error) {
 	if len(carried) == 0 {
 		return payload, nil
 	}
-	if len(payload) < 2 || payload[0] != '{' {
+	if len(payload) < 2 || payload[0] != '{' || payload[len(payload)-1] != '}' {
 		// Unreachable: Envelope.MarshalJSON writes an object of eight members.
 		// Asserted anyway, because the alternative to noticing is a payload
 		// column that fails outbox_payload_is_an_object at the last statement
@@ -152,21 +171,21 @@ func withTrace(payload []byte, carried map[string]string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The member goes first so that the rest of the document is copied
-	// untouched. jsonb normalises the order at rest anyway; what matters here
-	// is that no byte of the envelope is rewritten.
+	// Everything but the closing brace is copied untouched, so no byte of the
+	// envelope is rewritten.
 	spliced := make([]byte, 0, len(payload)+len(trace)+len(traceMember)+4)
-	spliced = append(spliced, '{', '"')
-	spliced = append(spliced, traceMember...)
-	spliced = append(spliced, '"', ':')
-	spliced = append(spliced, trace...)
-	if payload[1] != '}' {
+	spliced = append(spliced, payload[:len(payload)-1]...)
+	if len(payload) > 2 {
 		// The separator is conditional because an EMPTY object has nothing to
-		// separate from, and "{"$trace":{…},}" is not JSON — it is a payload
+		// separate from, and `{,"$trace":{…}}` is not JSON — it is a payload
 		// column that fails at the last statement of a command that had
 		// otherwise succeeded. An envelope is never empty, which is exactly
 		// why this would have been found by nothing.
 		spliced = append(spliced, ',')
 	}
-	return append(spliced, payload[1:]...), nil
+	spliced = append(spliced, '"')
+	spliced = append(spliced, traceMember...)
+	spliced = append(spliced, '"', ':')
+	spliced = append(spliced, trace...)
+	return append(spliced, '}'), nil
 }

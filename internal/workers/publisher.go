@@ -331,6 +331,22 @@ func (p *Publisher) run(ctx context.Context) {
 // Published counts the entries the queue accepted, not the rows the outbox then
 // marked. A mark that fails leaves the row claimed until the hold expires, so it
 // cannot come back round and spin; an event that never reached the queue can.
+//
+// # Every turn opens a span, including the ones that claim nothing
+//
+// The same property [ReferenceWorker.turn] has, and it is worth the same
+// sentence rather than being left for somebody to find in a bill. An idle
+// publisher at the default PUBLISHER_INTERVAL of one second produces two spans
+// a second — this one and the claim's statement — which is of the order of a
+// hundred and seventy thousand a day per replica saying there was nothing to
+// publish.
+//
+// They are kept because a publisher that stopped claiming is otherwise
+// invisible in a trace backend, and because the alternative — opening a span
+// only for a turn that found work — makes "the outbox stopped draining" and
+// "the outbox is empty" the same picture. What bounds them is a sampler at the
+// collector, which is where that decision belongs and where the whole of this
+// service's span budget is reasoned about: see fxmod.Telemetry.
 func (p *Publisher) turn(ctx context.Context) (claimed, published int, err error) {
 	ctx, sending := p.telemetry.Start(ctx, telemetry.SpanPublishBatch,
 		oteltrace.WithAttributes(attribute.String(telemetry.KeyPublisher, p.name)))
@@ -405,7 +421,7 @@ func (p *Publisher) turn(ctx context.Context) (claimed, published int, err error
 	for i, result := range results {
 		if result.Sent() {
 			sent++
-			p.telemetry.RecordPublishAttempt(ctx, p.name, telemetry.OutcomePublished)
+			p.telemetry.RecordPublishAttempt(ctx, telemetry.OutcomePublished)
 			spans[i].End()
 			p.mark(ctx, batch[i], done)
 			continue
@@ -423,7 +439,7 @@ func (p *Publisher) turn(ctx context.Context) (claimed, published int, err error
 // [telemetry.Telemetry.Failed] gives. Which event it was is already on the
 // span; why it was refused is in the line [Publisher.reschedule] writes.
 func (p *Publisher) refused(ctx context.Context, span oteltrace.Span, cause error) {
-	p.telemetry.RecordPublishAttempt(ctx, p.name, telemetry.OutcomeRefused)
+	p.telemetry.RecordPublishAttempt(ctx, telemetry.OutcomeRefused)
 	p.telemetry.Failed(span, string(app.ClassOf(cause)))
 	span.End()
 }

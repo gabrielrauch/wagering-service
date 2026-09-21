@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -438,5 +439,39 @@ func TestAWalletThatDisagreesWithItsLedgerIsCounted(t *testing.T) {
 				t.Errorf("%s counted %d, wanted %d", telemetry.MetricDivergences, got, c.want)
 			}
 		})
+	}
+}
+
+// TestTheRouteReachesTheRequestMetricsAndNotOnlyTheSpan pins the second half of
+// naming a route, which is easy to write and easy to forget.
+//
+// otelhttp records http.server.request.duration from the labeler it puts in the
+// context plus what it can derive from the request, and the route is not among
+// those: it runs before any mux has matched one. A span attribute does not
+// reach a metric, so without the labeler every endpoint collapses into one
+// series — the measurement still exists, and "which route is slow" has no
+// answer.
+func TestTheRouteReachesTheRequestMetricsAndNotOnlyTheSpan(t *testing.T) {
+	t.Parallel()
+	x := newTracedHarness(t)
+
+	labeler := &otelhttp.Labeler{}
+	ctx, span := x.telemetry.Start(otelhttp.ContextWithLabeler(t.Context(), labeler),
+		telemetry.SpanRequest)
+	r := httptest.NewRequestWithContext(ctx, http.MethodGet,
+		"/wallets/0199c0de-0000-7000-8000-000000000009", nil)
+	r.Header.Set("Authorization", "Bearer "+testCredential)
+	x.api.ServeHTTP(httptest.NewRecorder(), r)
+	span.End()
+
+	var routes []string
+	for _, attr := range labeler.Get() {
+		if string(attr.Key) == "http.route" {
+			routes = append(routes, attr.Value.String())
+		}
+	}
+	if len(routes) != 1 || routes[0] != "/wallets/{walletId}" {
+		t.Errorf("the request's metrics are labelled %v, wanted one http.route of "+
+			"/wallets/{walletId}", routes)
 	}
 }

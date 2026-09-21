@@ -47,8 +47,12 @@ const (
 	// operation was submitted under still reaches the publisher — which is the
 	// whole reason it was stored. See traceMember in outbox.go.
 	//
-	// The cast on the operand is not decoration: jsonb has both `- text` and
-	// `- integer`, and an untyped literal makes the operator ambiguous.
+	// The cast on the operand states intent and is not required to resolve the
+	// operator. jsonb has `- text`, `- integer` and `- text[]`, and PostgreSQL
+	// resolves an unknown literal to the preferred string type, so the bare
+	// form removes a KEY and not an array element — `'{"1":"x"}'::jsonb - '1'`
+	// is `{}`. The cast is kept because a reader should not have to know that
+	// rule to be sure which operator this is.
 	claimOutbox = `UPDATE wagering.outbox SET ` +
 		`claimed_by = $1, claimed_at = $2, claim_expires_at = $3, attempts = attempts + 1 ` +
 		`WHERE event_id IN (` +

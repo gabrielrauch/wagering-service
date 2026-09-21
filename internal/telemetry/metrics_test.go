@@ -130,23 +130,19 @@ func TestTheMetricCatalogueIsWhatADashboardIsBuiltFrom(t *testing.T) {
 			value:      1,
 		},
 		{
-			name: "an event the queue took",
-			record: func(r *recorded) {
-				r.RecordPublishAttempt(t.Context(), "publisher-1", OutcomePublished)
-			},
+			name:       "an event the queue took",
+			record:     func(r *recorded) { r.RecordPublishAttempt(t.Context(), OutcomePublished) },
 			instrument: MetricPublishAttempts,
 			unit:       "{attempt}",
-			attributes: map[string]string{"publisher": "publisher-1", "outcome": "published"},
+			attributes: map[string]string{"outcome": "published"},
 			value:      1,
 		},
 		{
-			name: "an event the queue refused",
-			record: func(r *recorded) {
-				r.RecordPublishAttempt(t.Context(), "publisher-1", OutcomeRefused)
-			},
+			name:       "an event the queue refused",
+			record:     func(r *recorded) { r.RecordPublishAttempt(t.Context(), OutcomeRefused) },
 			instrument: MetricPublishAttempts,
 			unit:       "{attempt}",
-			attributes: map[string]string{"publisher": "publisher-1", "outcome": "refused"},
+			attributes: map[string]string{"outcome": "refused"},
 			value:      1,
 		},
 		{
@@ -345,7 +341,7 @@ func TestDisabledTelemetryRecordsNothingAndRefusesNothing(t *testing.T) {
 		t_.RecordDeadLetter(ctx, "consumer")
 		t_.RecordLockTimeout(ctx, Movement)
 		t_.RecordVersionConflict(ctx, Movement)
-		t_.RecordPublishAttempt(ctx, "publisher-1", OutcomePublished)
+		t_.RecordPublishAttempt(ctx, OutcomePublished)
 		t_.RecordDivergence(ctx)
 
 		if carried := t_.Inject(ctx); carried != nil {

@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strings"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	semconv "go.opentelemetry.io/otel/semconv/v1.38.0"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -147,9 +148,23 @@ func dispatched(h http.Handler) http.Handler {
 		if rw, ok := w.(*routed); ok {
 			rw.matched = true
 		}
+		route := routeOf(r.Pattern)
 		if span := trace.SpanFromContext(r.Context()); span.IsRecording() {
 			span.SetName(r.Pattern)
-			span.SetAttributes(semconv.HTTPRoute(routeOf(r.Pattern)))
+			span.SetAttributes(semconv.HTTPRoute(route))
+		}
+		// And on the request's METRICS, which is a separate act. otelhttp
+		// records http.server.request.duration from the labeler it put in the
+		// context plus the attributes it can derive from the request itself —
+		// and the route is not among those, because otelhttp runs before any
+		// mux has matched one. Without this line every endpoint collapses into
+		// one series and "which route is slow" has no answer.
+		//
+		// It is the one place this package touches otelhttp, and the labeler is
+		// the only supported way in: a handler cannot reach the instrument, and
+		// the composition root cannot reach the route.
+		if labeler, found := otelhttp.LabelerFromContext(r.Context()); found {
+			labeler.Add(semconv.HTTPRoute(route))
 		}
 		h.ServeHTTP(w, r)
 	})

@@ -3,6 +3,7 @@ package sqs
 import (
 	"context"
 
+	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
 	"github.com/aws/smithy-go/middleware"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -11,8 +12,12 @@ import (
 	"github.com/gabrielrauch/wagering-service/internal/telemetry"
 )
 
-// The service name every call this package makes is against.
-const rpcService = "SQS"
+// The service name every call this package makes is against, and the attribute
+// carrying AWS's own identifier for one call.
+const (
+	rpcService   = "SQS"
+	keyRequestID = "aws.request_id"
+)
 
 // traced puts one client span around each call against SQS.
 //
@@ -64,6 +69,17 @@ func span(t *telemetry.Telemetry) func(
 		defer call.End()
 
 		out, metadata, err := next.HandleInitialize(ctx, in)
+		// The one thing the contrib module would have given us that the lines
+		// above do not: AWS's own identifier for the call, which is what a
+		// support case is opened with. It is set on the response's metadata by
+		// the SDK's own middleware, so it is there whether the call succeeded
+		// or was refused — and absent when the request never reached AWS at
+		// all, which [telemetry.Some] turns into no attribute rather than an
+		// empty one.
+		if requestID, ok := awsmiddleware.GetRequestIDMetadata(metadata); ok {
+			call.SetAttributes(telemetry.Some(
+				attribute.String(keyRequestID, requestID))...)
+		}
 		if err != nil {
 			// The class and not the message, for the reason
 			// [telemetry.Telemetry.Failed] gives. This package already turns an

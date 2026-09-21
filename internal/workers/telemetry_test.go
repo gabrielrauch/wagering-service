@@ -3,6 +3,7 @@ package workers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -259,12 +260,12 @@ func TestEveryEventOfferedToTheQueueIsCountedByWhatBecameOfIt(t *testing.T) {
 	outbox.settled(t, 2)
 
 	if got := w.counted(t, telemetry.MetricPublishAttempts, map[string]string{
-		"publisher": "publisher-1", "outcome": telemetry.OutcomeRefused,
+		"outcome": telemetry.OutcomeRefused,
 	}); got != 1 {
 		t.Errorf("%s counted %d refused, wanted 1", telemetry.MetricPublishAttempts, got)
 	}
 	if got := w.counted(t, telemetry.MetricPublishAttempts, map[string]string{
-		"publisher": "publisher-1", "outcome": telemetry.OutcomePublished,
+		"outcome": telemetry.OutcomePublished,
 	}); got != 1 {
 		t.Errorf("%s counted %d published, wanted 1", telemetry.MetricPublishAttempts, got)
 	}
@@ -346,16 +347,33 @@ func TestAReplayedMessageIsCountedAsAnInboxDuplicate(t *testing.T) {
 	}
 }
 
-// TestWhatBecameOfAMessageIsCounted pins the two queue numbers a dashboard
-// alerts on.
+// TestWhatBecameOfAMessageIsCounted pins the queue numbers a dashboard alerts
+// on, and — for every one of them — the paths on which they must NOT move.
 //
-// They are counted apart because they are different incidents. A rising retry
-// rate is a database or a lock under pressure and it recovers; a message on its
-// last delivery is work about to leave the system, and it is the one an
-// operator has to be paged for. A single "failures" counter would average the
-// second into the first.
+// The second half is the half that was missing, and its absence was not
+// academic: with only positive cases, moving RecordDeadLetter out of its
+// lastDelivery guard passed the whole suite, and every poisoned message would
+// have counted as a message about to leave the system. A counter that fires on
+// every path is worse than one that never fires, because it is a page that
+// stops meaning anything.
+//
+// So each case states what every instrument must hold, including the zeroes.
+// The three are different incidents and have to stay that way: a rising retry
+// rate is a database under pressure and it recovers, a message on its last
+// delivery is work about to be lost, and an inbox duplicate is the queue
+// redelivering something already applied.
 func TestWhatBecameOfAMessageIsCounted(t *testing.T) {
 	t.Parallel()
+
+	const consumer = "wager-consumer"
+	retries := map[string]string{"consumer": consumer, "class": string(app.Retryable)}
+	deadLetters := map[string]string{"consumer": consumer}
+	duplicates := map[string]string{"consumer": consumer}
+	applied := map[string]string{
+		"source": telemetry.SourceQueue, "kind": "BET",
+		"status": "PROCESSED", "failureCode": telemetry.NoFailureCode,
+	}
+	replays := map[string]string{"source": telemetry.SourceQueue, "kind": "BET"}
 
 	cases := []struct {
 		name string
@@ -365,8 +383,9 @@ func TestWhatBecameOfAMessageIsCounted(t *testing.T) {
 		body func(*testing.T) []byte
 		// answer is what the application layer says.
 		answer func(context.Context, int, app.SubmitOperation) (app.OperationResult, error)
-		metric string
-		want   map[string]string
+		// counts is every instrument this case has an opinion about, including
+		// the ones that must not have moved.
+		counts []count
 	}{
 		{
 			name:       "a transient failure, handed back for another delivery",
@@ -375,15 +394,48 @@ func TestWhatBecameOfAMessageIsCounted(t *testing.T) {
 			answer: func(context.Context, int, app.SubmitOperation) (app.OperationResult, error) {
 				return app.OperationResult{}, app.AsRetryable(errUnavailable)
 			},
-			metric: telemetry.MetricQueueRetries,
-			want:   map[string]string{"consumer": "wager-consumer", "class": string(app.Retryable)},
+			counts: []count{
+				{telemetry.MetricQueueRetries, retries, 1},
+				{telemetry.MetricQueueDeadLetters, deadLetters, 0},
+				{telemetry.MetricInboxDuplicates, duplicates, 0},
+				{telemetry.MetricTransactions, applied, 0},
+			},
 		},
 		{
 			name:       "a body nobody can read, on its last delivery",
 			deliveries: testMaxReceives,
 			body:       func(*testing.T) []byte { return []byte("{") },
-			metric:     telemetry.MetricQueueDeadLetters,
-			want:       map[string]string{"consumer": "wager-consumer"},
+			counts: []count{
+				{telemetry.MetricQueueDeadLetters, deadLetters, 1},
+				{telemetry.MetricQueueRetries, retries, 0},
+				{telemetry.MetricInboxDuplicates, duplicates, 0},
+				{telemetry.MetricTransactions, applied, 0},
+			},
+		},
+		{
+			name: "the same body, with deliveries still to come",
+			// The message is just as poisoned and is left for the redrive
+			// policy exactly as above. What it is NOT is a dead letter: the
+			// queue will deliver it four more times, and counting it now would
+			// make the number an operator pages on five times per message.
+			deliveries: testMaxReceives - 1,
+			body:       func(*testing.T) []byte { return []byte("{") },
+			counts: []count{
+				{telemetry.MetricQueueDeadLetters, deadLetters, 0},
+				{telemetry.MetricQueueRetries, retries, 0},
+			},
+		},
+		{
+			name:       "an operation applied for the first time",
+			deliveries: 1,
+			body:       func(t *testing.T) []byte { return validBody(t, nil) },
+			counts: []count{
+				{telemetry.MetricTransactions, applied, 1},
+				{telemetry.MetricInboxDuplicates, duplicates, 0},
+				{telemetry.MetricReplays, replays, 0},
+				{telemetry.MetricQueueRetries, retries, 0},
+				{telemetry.MetricQueueDeadLetters, deadLetters, 0},
+			},
 		},
 	}
 
@@ -398,13 +450,56 @@ func TestWhatBecameOfAMessageIsCounted(t *testing.T) {
 				Queue:           queue,
 				Wagering:        &fakeSubmitter{answer: c.answer},
 				Telemetry:       w.Telemetry,
-				Name:            "wager-consumer",
+				Name:            consumer,
 				MaxReceiveCount: testMaxReceives,
 			})
 			queue.handled(t)
 
-			if got := w.counted(t, c.metric, c.want); got != 1 {
-				t.Errorf("%s counted %d under %v, wanted 1", c.metric, got, c.want)
+			for _, want := range c.counts {
+				if got := w.counted(t, want.instrument, want.attributes); got != want.want {
+					t.Errorf("%s counted %d under %v, wanted %d",
+						want.instrument, got, want.attributes, want.want)
+				}
+			}
+		})
+	}
+}
+
+// count is one instrument, one attribute set, and what it must hold — including
+// nought, which is what half of these assertions are for.
+type count struct {
+	instrument string
+	attributes map[string]string
+	want       int64
+}
+
+// TestAPoisonedMessageIsLeftForTheRedrivePolicyWhicheverDeliveryItIs keeps the
+// case above from being vacuous.
+//
+// "The dead-letter counter did not move" is only worth asserting if the message
+// was genuinely poisoned, so this asserts the disposition itself: not deleted,
+// not hidden, left exactly where it was for the redrive policy to decide.
+func TestAPoisonedMessageIsLeftForTheRedrivePolicyWhicheverDeliveryItIs(t *testing.T) {
+	t.Parallel()
+
+	for _, deliveries := range []int{1, testMaxReceives - 1, testMaxReceives} {
+		t.Run(fmt.Sprintf("delivery %d", deliveries), func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+			w := watch(t)
+
+			queue := newFakeQueue([]sqs.Message{message("handle-1", []byte("{"), deliveries)})
+			consumerOver(t, ctx, ConsumerConfig{
+				Queue: queue, Wagering: &fakeSubmitter{}, Telemetry: w.Telemetry,
+				MaxReceiveCount: testMaxReceives,
+			})
+			queue.handled(t)
+
+			if got := queue.deletedHandles(); len(got) != 0 {
+				t.Errorf("a message nobody can read was deleted: %v", got)
+			}
+			if got := queue.changes(); len(got) != 0 {
+				t.Errorf("a message nobody can read had its visibility changed: %v", got)
 			}
 		})
 	}

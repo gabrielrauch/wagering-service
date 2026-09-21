@@ -76,6 +76,39 @@ import (
 // disabled process makes no network call and writes no error, where a process
 // pointed at a collector that is not answering keeps running and reports each
 // failed export through [otelErrors].
+//
+// # Sampling: there is none here, and what that costs
+//
+// The provider is built with no WithSampler, so it is OpenTelemetry's default —
+// ParentBased(AlwaysSample). Every trace this service starts is recorded, and a
+// trace arriving with a sampled traceparent is honoured.
+//
+// That is a deliberate deferral rather than an oversight, and the number it
+// defers is large enough to write down. An IDLE worker replica, at the defaults
+// in .env.example, exports of the order of eight hundred thousand spans a day:
+//
+//   - the reference loop, REFERENCE_WORKER_INTERVAL=1s, seven spans a turn —
+//     app.Wagering.Resume opens a transaction whether or not anything is due,
+//     so a turn that found nothing is the turn, the use case, the movement and
+//     four statements — about six hundred thousand a day;
+//   - the outbox loop, PUBLISHER_INTERVAL=1s, two spans a turn, about a hundred
+//     and seventy thousand a day;
+//   - the consumer's long polls, four receivers at twenty seconds, about
+//     seventeen thousand a day.
+//
+// An idle API replica exports none: the only spans it opens are per request,
+// and the two health endpoints are filtered out before otelhttp sees them —
+// see [notAProbe].
+//
+// Sampling is not done here for the reason it is usually not: a head sampler in
+// the process throws away the traces an operator most wants, because whether a
+// trace is interesting is known at its END. The collector is where that
+// decision belongs — tail sampling keeps the errors and the slow ones and drops
+// the rest — and the collector is not this repository's. What this package owes
+// that decision is the arithmetic above, so that whoever configures it knows
+// what they are bounding. The three intervals are the other knob and they are
+// environment variables, so a deployment that wants fewer spans and no
+// collector rule can slow the loops down instead.
 func Telemetry() fx.Option {
 	return fx.Module("telemetry",
 		fx.Provide(
@@ -134,16 +167,17 @@ func newLogger(lc fx.Lifecycle, cfg config.Telemetry) *slog.Logger {
 	logger := slog.New(telemetry.Correlate(handler)).
 		With(slog.String("service", cfg.ServiceName))
 
-	lc.Append(fx.Hook{OnStop: (&telemetry_{logger: logger, budget: cfg.ShutdownTimeout}).flush})
+	lc.Append(fx.Hook{OnStop: (&lastWord{logger: logger, budget: cfg.ShutdownTimeout}).flush})
 	return logger
 }
 
-// telemetry_ is what this process has to hand back before it exits.
+// lastWord is what this process says on its way out, and the budget it says it
+// under.
 //
-// The trailing underscore is the one concession this package makes to the
-// package it is wiring: internal/telemetry is imported here under its own name,
-// and a type called telemetry would shadow it for the rest of the file.
-type telemetry_ struct {
+// Named for what it does rather than for what it is about, which is also how it
+// avoids colliding with the internal/telemetry package this file imports under
+// its own name.
+type lastWord struct {
 	logger *slog.Logger
 	budget time.Duration
 }
@@ -164,7 +198,7 @@ type telemetry_ struct {
 // budget derived from it would be no budget at all and the last word of a
 // failed deployment would be the one thing not written. Values are kept, for
 // the reason [stopContext] keeps them.
-func (t *telemetry_) flush(ctx context.Context) error {
+func (t *lastWord) flush(ctx context.Context) error {
 	ctx, cancel := stopContext(ctx, t.budget)
 	defer cancel()
 
@@ -371,7 +405,7 @@ func reportDisabled(logger *slog.Logger, cfg config.Telemetry, what string) {
 // collector is not work, and a deployment that exited non-zero over it would be
 // a deployment that fails when its observability does.
 //
-// The budget replaces the caller's cancellation for the reason [telemetry_.flush]
+// The budget replaces the caller's cancellation for the reason [lastWord.flush]
 // gives: this runs last, including on the rollback after a start-up timeout,
 // where the context it would inherit has already expired.
 func shutdownWithin(

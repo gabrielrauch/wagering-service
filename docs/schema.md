@@ -411,10 +411,16 @@ the publisher runs minutes later, in another process, with no memory of the requ
 adapter therefore writes the W3C trace context into the payload under `$trace` — the only
 place a value can be added without a migration — and the claim below takes it back out. A
 `$`-prefixed name cannot collide with an envelope member, every one of which is a camelCase
-identifier, and it reads in `psql` as "this is not part of the document". A row written by a
-process with telemetry switched off has no such member. **Nothing published ever carries it**:
-the claim returns `payload - '$trace'` as the body, so the bytes on the queue are the envelope
-exactly as they were before any of this existed.
+identifier, and it reads in `psql` as "this is not part of the document". The member is
+written **last**, because `jsonb` resolves a duplicate key to the last one and the value that
+should survive is the one the writing process just injected. A row written by a process with
+telemetry switched off has no such member.
+
+**Nothing published ever carries it**: the claim returns `payload - '$trace'` as the body, so
+what goes on the queue is `jsonb`'s rendering of the envelope and nothing else — textually
+identical to the same envelope stored without the member, amounts included. It is not the
+bytes that were *written*: `jsonb` normalises key order and spacing, so nothing may hash what
+comes back and expect to recognise the write.
 
 **The claim query.** This is the supported way to take work:
 
@@ -447,8 +453,11 @@ scheduled. `SKIP LOCKED` keeps publishers off each other. A claim expires by **w
 so work abandoned by a crashed publisher returns to the pool visibly rather than waiting on
 a connection that may never close. See **ADR-0008**.
 
-The cast on `- '$trace'` is not decoration: `jsonb` has both `- text` and `- integer`, and an
-untyped literal makes the operator ambiguous.
+The cast on `- '$trace'` states intent and is not required to resolve the operator. `jsonb`
+has `- text`, `- integer` and `- text[]`, and PostgreSQL resolves an unknown literal to the
+preferred string type — so the bare form removes a *key*, not an array element, and
+`'{"1":"x"}'::jsonb - '1'` is `{}`. The cast is kept because a reader should not have to
+know that rule to be sure which operator this is.
 
 Cross-aggregate ordering is not guaranteed and is not needed.
 

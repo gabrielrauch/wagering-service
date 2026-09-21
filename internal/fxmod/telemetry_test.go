@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"maps"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"sync"
@@ -276,5 +278,45 @@ func TestTheDisabledTelemetryIsWhatAComponentGivenNoneUses(t *testing.T) {
 	t.Parallel()
 	if telemetry.Or(nil) != telemetry.Disabled() {
 		t.Error("a component given no telemetry does not get the disabled one")
+	}
+}
+
+// TestOnlyTheProbesAreKeptOutOfTheTraces pins the filter [newServer] hands
+// otelhttp.
+//
+// It is asserted in both directions, because a filter is exactly the shape that
+// passes a one-sided test: inverted, it traces every probe and nothing else,
+// and every assertion about a route's span would still hold on a suite that
+// only ever checked routes.
+//
+// An orchestrator polls the two health endpoints every few seconds per replica,
+// for ever, and each poll would be a trace containing one span saying a probe
+// answered — more spans than this service's real traffic on a quiet deployment,
+// looked up by nobody. A probe that FAILS is visible in the readiness body, in
+// the line the check writes, and in the orchestrator's own events.
+func TestOnlyTheProbesAreKeptOutOfTheTraces(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]bool{
+		"/health/live":                   false,
+		"/health/ready":                  false,
+		"/wagering/transactions":         true,
+		"/wallets":                       true,
+		"/wallets/0199c0de/ledger":       true,
+		"/health":                        true,
+		"/healthy":                       true,
+		"/wallets/health/live":           true,
+		"/":                              true,
+		"/providers/acme/wagering/x/y/z": true,
+	}
+
+	for path, traced := range cases {
+		t.Run(path, func(t *testing.T) {
+			t.Parallel()
+			r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, path, nil)
+			if got := notAProbe(r); got != traced {
+				t.Errorf("notAProbe(%q) = %v, wanted %v", path, got, traced)
+			}
+		})
 	}
 }

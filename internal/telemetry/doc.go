@@ -26,6 +26,30 @@
 // to implement, and no possibility of a component that silently stops
 // reporting because a nil check was written the other way round.
 //
+// # What that costs when it is switched off, which is not nothing
+//
+// "Records into nothing" reads like "costs nothing" and is not, so the measured
+// figures are here rather than left to be assumed (see disabled_test.go, an
+// arm64 laptop, Go 1.27):
+//
+//   - [Telemetry.Start] and End: 46ns, 48 B, 1 allocation. No span OBJECT is
+//     built — that part of the reading is right — but the context carrying the
+//     no-op span is.
+//   - [Telemetry.RecordOperation]: 259ns, 568 B, 5 allocations. This is the
+//     expensive one and the reason for the section: metric.WithAttributes
+//     builds an attribute.Set EAGERLY, at the call site, before any instrument
+//     has had the chance to discard it. A no-op meter cannot save you from
+//     work done before it is called.
+//   - [Telemetry.Inject]: 24ns, 48 B, 1 allocation — a carrier map built per
+//     outbox append, before discovering there is nothing to put in it.
+//
+// None of that is worth engineering away. The smallest thing any of these sits
+// beside is a PostgreSQL round trip, which is four orders of magnitude larger,
+// and the alternatives — a flag at every call site, or lazily built attribute
+// sets — cost more in ways this package exists to avoid. It is written down so
+// that nobody puts one of these inside a tight loop on the strength of a
+// sentence that was only half true.
+//
 // # What must never be in a span or a log line
 //
 // Three rules, and they are enforced here rather than remembered at each site:

@@ -62,6 +62,17 @@ const (
 	MetricOutboxLag = "wagering.outbox.lag"
 	// MetricPublishAttempts counts events offered to the queue, by what became
 	// of each.
+	//
+	// It does NOT name the publisher, although every span and every log line
+	// about a publish does. A publisher's name must be distinct per process and
+	// falls back to HOSTNAME, which on Kubernetes is a pod name with a random
+	// suffix and on ECS a container id — both of which change on every rollout
+	// and every restart. As a metric attribute that is an unbounded label: the
+	// series count grows by two per pod lifetime for ever, and Prometheus does
+	// not reclaim them inside its retention. The question this counter answers
+	// — are publishes being refused, and at what rate — does not need to be
+	// per-process, and the question that does (which replica) is answered where
+	// per-process identity is cheap.
 	MetricPublishAttempts = "wagering.outbox.publish_attempts"
 
 	// MetricDivergences counts reconciliations that found a wallet's stored
@@ -299,14 +310,14 @@ func (t *Telemetry) RecordVersionConflict(ctx context.Context, transaction strin
 
 // RecordPublishAttempt counts one event offered to the outbound queue.
 // outcome is [OutcomePublished] or [OutcomeRefused].
-func (t *Telemetry) RecordPublishAttempt(ctx context.Context, publisher, outcome string) {
+//
+// It takes no publisher, deliberately. See [MetricPublishAttempts].
+func (t *Telemetry) RecordPublishAttempt(ctx context.Context, outcome string) {
 	if t == nil {
 		return
 	}
-	t.metrics.publishAttempts.Add(ctx, 1, metric.WithAttributes(
-		attribute.String(KeyPublisher, publisher),
-		attribute.String(KeyOutcome, outcome),
-	))
+	t.metrics.publishAttempts.Add(ctx, 1,
+		metric.WithAttributes(attribute.String(KeyOutcome, outcome)))
 }
 
 // RecordDivergence counts a reconciliation that found a wallet disagreeing with
