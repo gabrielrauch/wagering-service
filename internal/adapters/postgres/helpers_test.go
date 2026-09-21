@@ -4,7 +4,10 @@ package postgres
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -60,6 +63,9 @@ type world struct {
 	tm    *TxManager
 	app   *pgxpool.Pool
 	owner *pgxpool.Pool
+	// dsn names this test's database, so that a scenario needing a second pool
+	// onto it can open one rather than share the sixteen connections above.
+	dsn string
 }
 
 // newWorld gives a test a freshly migrated database and a manager on it.
@@ -85,7 +91,7 @@ func newWorld(t *testing.T) *world {
 	if err != nil {
 		t.Fatalf("new transaction manager: %v", err)
 	}
-	return &world{tm: tm, app: pool, owner: owner}
+	return &world{tm: tm, app: pool, owner: owner, dsn: dsn}
 }
 
 // processor is the domain processor the fixtures apply operations with. The
@@ -445,4 +451,372 @@ func (w *world) rowOf(t *testing.T, id wagering.TransactionID) storedRow {
 func (w *world) scheduleOf(t *testing.T, id wagering.TransactionID) time.Time {
 	t.Helper()
 	return timeFrom(w.rowOf(t, id).scheduled)
+}
+
+// wideManager opens a second application pool on this world's database, and a
+// manager over it.
+//
+// Two things about it are deliberately not the world's own. The pool is as wide
+// as the scenario's concurrency, so that fifty submissions are fifty
+// connections rather than fifty goroutines taking turns on sixteen — which
+// would make this suite's pool the serialisation point and leave the database's
+// nothing to do. And the lock timeout bounds a queue rather than a hand-off:
+// the last of fifty waiters on one wallet row waits for the forty-nine in front
+// of it, so the two seconds that are generous for one waiter are not a bound on
+// the same thing at all.
+func (w *world) wideManager(t *testing.T, conns int32, lock time.Duration) *TxManager {
+	t.Helper()
+	tm, err := NewTxManager(TxConfig{
+		Pool:             newAppPool(t, w.dsn, conns),
+		LockTimeout:      lock,
+		StatementTimeout: testStatementTimeout,
+	})
+	if err != nil {
+		t.Fatalf("new transaction manager: %v", err)
+	}
+	return tm
+}
+
+// tickingClock is the clock the use cases read, moved by hand.
+//
+// Settable rather than fixed, because a sequence of operations on one wallet
+// has to be stamped with a sequence of instants: wallet_clock_moves_forward
+// refuses a balance change that does not move updated_at strictly forward, so a
+// clock answering the same instant for a bet and the refund that returns it
+// would have the schema refuse the second for a reason that has nothing to do
+// with what is under test.
+//
+// The mutex is not decoration. Submit samples the clock inside the movement
+// transaction, and the scenarios here call it from fifty goroutines at once.
+type tickingClock struct {
+	mu sync.Mutex
+	at time.Time
+}
+
+// newClock starts a clock at an instant.
+func newClock(at time.Time) *tickingClock { return &tickingClock{at: at} }
+
+// Now answers whatever the clock has been set to.
+func (c *tickingClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.at
+}
+
+// moveTo sets the instant every operation from here on is stamped with.
+func (c *tickingClock) moveTo(at time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.at = at
+}
+
+// useCases is the real application layer, wired onto one test's database.
+//
+// Nothing in it stands in for anything: app.NewWagering and app.NewWallets over
+// a real TxManager, the domain's own processor and a real reference policy.
+// That is the whole point of the scenarios that use it — every other test in
+// this package drives a port directly, which proves each port behaves and
+// proves nothing about what a command does end to end.
+type useCases struct {
+	wagers  *app.Wagering
+	wallets *app.Wallets
+	clock   *tickingClock
+}
+
+// wire builds the application layer on this world's manager, clocked at now.
+func (w *world) wire(t *testing.T, now time.Time) useCases {
+	t.Helper()
+	return wireOnto(t, w.tm, mintedIDs{}, now)
+}
+
+// wireOnto builds the same application layer over a manager and an identifier
+// source the caller supplies: a pool wide enough for fifty transactions at
+// once, or a source that cancels the request as it hands over an event id.
+func wireOnto(t *testing.T, tm app.TxManager, ids app.IDs, now time.Time) useCases {
+	t.Helper()
+	clock := newClock(now)
+	wagers, err := app.NewWagering(app.WageringDeps{
+		Tx:        tm,
+		Processor: processor(t),
+		Clock:     clock,
+		IDs:       ids,
+		Backoff:   app.BackoffPolicy{Initial: time.Second, Factor: 2, Max: time.Minute},
+		Defects:   discardDefects{},
+	})
+	if err != nil {
+		t.Fatalf("wire the wagering service: %v", err)
+	}
+	wallets, err := app.NewWallets(tm, clock, ids, nil)
+	if err != nil {
+		t.Fatalf("wire the wallets service: %v", err)
+	}
+	return useCases{wagers: wagers, wallets: wallets, clock: clock}
+}
+
+// servicePrincipal is this system acting for itself: the only identity that may
+// open a wallet, read one or resume parked work.
+func servicePrincipal(t *testing.T) app.Principal {
+	t.Helper()
+	principal, err := app.NewServicePrincipal("service-subject")
+	if err != nil {
+		t.Fatalf("service principal: %v", err)
+	}
+	return principal
+}
+
+// providerPrincipal is the provider every submission here is sent as. It may
+// not open a wallet, which is why the fixtures above take the other one.
+func providerPrincipal(t *testing.T) app.Principal {
+	t.Helper()
+	principal, err := app.NewProviderPrincipal("acme", "provider-subject")
+	if err != nil {
+		t.Fatalf("provider principal: %v", err)
+	}
+	return principal
+}
+
+// open creates a wallet through the real use case.
+//
+// As the service rather than as the provider whose operations follow: a
+// provider may not open a wallet, and a fixture that quietly used an identity
+// with more authority than the scenario has would be proving the door open with
+// a key the test never has to hold.
+func (u useCases) open(t *testing.T, player, amount string) app.WalletView {
+	t.Helper()
+	view, _, err := u.wallets.Open(t.Context(), app.OpenWalletCommand{
+		Principal:     servicePrincipal(t),
+		Correlation:   "correlation-open-" + player,
+		PlayerID:      player,
+		InitialAmount: amount,
+		Currency:      "BRL",
+	})
+	if err != nil {
+		t.Fatalf("open a %s wallet for %q: %v", amount, player, err)
+	}
+	return view
+}
+
+// balanceOf reads a wallet's balance through the use case, as the decimal
+// string a caller would be given.
+func (u useCases) balanceOf(t *testing.T, id wagering.WalletID) string {
+	t.Helper()
+	view, err := u.wallets.ByID(t.Context(), servicePrincipal(t), id)
+	if err != nil {
+		t.Fatalf("read wallet %s: %v", id, err)
+	}
+	return view.Balance.Amount()
+}
+
+// submission is one operation as a provider sends it: still strings, still
+// unparsed, exactly what a transport hands over.
+//
+// Separate from [command], which builds the domain value the port-level
+// fixtures apply directly. A scenario goes in the front door, so the use case
+// does the parsing and the identifier minting — which is half of what these
+// tests exist to exercise. The currency is BRL because every fixture in this
+// package uses it, and a fourth string parameter saying so at every call site
+// would say nothing.
+func submission(
+	t *testing.T,
+	kind wagering.Kind,
+	player, external, key, amount string,
+) app.SubmitOperation {
+	t.Helper()
+	return app.SubmitOperation{
+		Principal:   providerPrincipal(t),
+		Correlation: "correlation-" + external,
+		Fields: app.OperationFields{
+			Provider:              "acme",
+			ExternalTransactionID: external,
+			IdempotencyKey:        key,
+			PlayerID:              player,
+			RoundID:               "round-1",
+			GameID:                "game-1",
+			Kind:                  kind.String(),
+			Amount:                amount,
+			Currency:              "BRL",
+		},
+	}
+}
+
+// against points a submission at the operation it acts on.
+func against(s app.SubmitOperation, reference string) app.SubmitOperation {
+	s.Fields.ReferenceExternalTransactionID = reference
+	return s
+}
+
+// carrying attaches the queue message a submission arrived on, which is what
+// puts an inbox row in the command's write set.
+//
+// The body hash is a real SHA-256 of the message id rather than a made-up
+// string, because wagering.sha256_hex refuses anything that is not sixty-four
+// lowercase hex characters — the schema holds the fixtures to the same shape it
+// holds the service to.
+func carrying(s app.SubmitOperation, messageID string) app.SubmitOperation {
+	digest := sha256.Sum256([]byte(messageID))
+	s.Inbox = &app.InboxMessage{
+		Consumer:  "wagering-consumer",
+		MessageID: messageID,
+		BodyHash:  hex.EncodeToString(digest[:]),
+	}
+	return s
+}
+
+// footprint is everything one wallet has left behind in the database.
+//
+// It is compared whole rather than field by field, so that a test meaning "the
+// database is exactly where it was" says so in one assertion instead of six
+// that could each be forgotten. Inbox is not wallet-scoped and counts every row
+// in the database, which is this test's alone.
+type footprint struct {
+	Balance      int64
+	Version      int64
+	Transactions int
+	Entries      int
+	Events       int
+	Inbox        int
+}
+
+// footprintOf reads that footprint, as the owner, so that nothing about what
+// the application may see can hide a row from it.
+func (w *world) footprintOf(t *testing.T, id wagering.WalletID) footprint {
+	t.Helper()
+	var f footprint
+	err := w.owner.QueryRow(t.Context(),
+		`SELECT w.balance_minor, w.version, `+
+			`(SELECT count(*) FROM wagering.wager_transaction WHERE wallet_id = w.id), `+
+			`(SELECT count(*) FROM wagering.wallet_ledger_entry WHERE wallet_id = w.id), `+
+			`(SELECT count(*) FROM wagering.outbox WHERE aggregate_id = w.id), `+
+			`(SELECT count(*) FROM wagering.inbox) `+
+			`FROM wagering.wallet w WHERE w.id = $1`, uuidOf(id)).
+		Scan(&f.Balance, &f.Version, &f.Transactions, &f.Entries, &f.Events, &f.Inbox)
+	if err != nil {
+		t.Fatalf("read what wallet %s has left behind: %v", id, err)
+	}
+	return f
+}
+
+// debitsOf counts the ledger entries that took money out of a wallet. The
+// opening of a funded wallet is a credit, so a scenario's own debits are
+// countable without discounting the fixture that set it up.
+func (w *world) debitsOf(t *testing.T, id wagering.WalletID) int {
+	t.Helper()
+	return w.count(t,
+		`SELECT count(*) FROM wagering.wallet_ledger_entry `+
+			`WHERE wallet_id = $1 AND direction = 'DEBIT'`, uuidOf(id))
+}
+
+// holdWallet takes a wallet's movement lock and holds it until the returned
+// function is called, reporting through released what it was holding for.
+//
+// It is the barrier the concurrency scenarios are released from. Starting
+// goroutines together is not enough on its own: the first to arrive would take
+// the lock, finish and commit while the rest were still being scheduled, and
+// the contention the test is written for would never happen. With the lock
+// already held every submission queues on it, and every one of them is
+// therefore in flight at the same instant — which is what makes "each of them
+// started before the lock was released, and none of them answered before" a
+// statement about concurrency rather than about timing.
+func (w *world) holdWallet(t *testing.T, player string) (release func() time.Time) {
+	t.Helper()
+	held := make(chan struct{})
+	let := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- w.tm.WithinMovement(t.Context(), func(ctx context.Context, r *app.Repos) error {
+			wallet, err := r.Wallets.LockForMovement(ctx, wagering.WalletKey{
+				PlayerID: mustPlayer(t, player),
+				Currency: mustMoney(t, "0.00", "BRL").Currency(),
+			})
+			if err != nil {
+				return err
+			}
+			if wallet == nil {
+				return errors.New("there is no wallet to hold")
+			}
+			close(held)
+			<-let
+			return nil
+		})
+	}()
+	<-held
+	return func() time.Time {
+		// Read before the lock goes, so that "answered after this" cannot be
+		// satisfied by a submission that was never blocked.
+		at := time.Now()
+		close(let)
+		if err := <-done; err != nil {
+			t.Errorf("hold %q's wallet: %v", player, err)
+		}
+		return at
+	}
+}
+
+// attempt is one submission's result and the window it ran in.
+type attempt struct {
+	result     app.OperationResult
+	err        error
+	startedAt  time.Time
+	finishedAt time.Time
+}
+
+// racing submits every one of these at once, a goroutine each, released
+// together, and returns the function that collects what they came to.
+//
+// The barrier is the point of it. Every goroutine waits at one channel and none
+// of them is running while the others are still being started, so a submission
+// cannot finish before another has begun — which a loop that started them one
+// at a time permits, and which is the shape of concurrency test that passes
+// whether or not anything contended.
+//
+// Collecting is a second call rather than part of this one so that the caller
+// can do something while they are all in flight: hold the wallet lock they are
+// queued on, and let go of it on its own terms.
+func (u useCases) racing(t *testing.T, submissions []app.SubmitOperation) func() []attempt {
+	t.Helper()
+	var ready, done sync.WaitGroup
+	ready.Add(len(submissions))
+	done.Add(len(submissions))
+	start := make(chan struct{})
+	attempts := make([]attempt, len(submissions))
+	for i, s := range submissions {
+		go func() {
+			defer done.Done()
+			ready.Done()
+			<-start
+			a := attempt{startedAt: time.Now()}
+			a.result, a.err = u.wagers.Submit(t.Context(), s)
+			a.finishedAt = time.Now()
+			attempts[i] = a
+		}()
+	}
+	// Released only once every goroutine is at the line.
+	ready.Wait()
+	close(start)
+	return func() []attempt {
+		done.Wait()
+		return attempts
+	}
+}
+
+// submit sends one operation and asserts what it came to.
+//
+// It is the fixture for the operations a scenario needs settled before the one
+// it is actually about — a bet that a refund can return, a refund that a second
+// reversal can be refused against.
+func (u useCases) submit(
+	t *testing.T,
+	s app.SubmitOperation,
+	want wagering.Status,
+) app.OperationResult {
+	t.Helper()
+	result, err := u.wagers.Submit(t.Context(), s)
+	if err != nil {
+		t.Fatalf("submit %s %q: %v", s.Fields.Kind, s.Fields.ExternalTransactionID, err)
+	}
+	if result.Status != want {
+		t.Fatalf("%s %q came to %s under %q, wanted %s", s.Fields.Kind,
+			s.Fields.ExternalTransactionID, result.Status, result.FailureCode, want)
+	}
+	return result
 }
