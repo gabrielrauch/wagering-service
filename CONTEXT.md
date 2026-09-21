@@ -30,7 +30,10 @@ _Avoid_: Movement, entry, event, request
 
 **Operation**:
 A wagering instruction submitted by a provider. Always external; internal wallet opening is not an operation.
-_Avoid_: Command, request, message
+_Avoid_: Request, message
+
+**Command**:
+An instruction the system has checked and turned into its own typed values, ready to be applied. An Operation is what a provider asked for; a Command is that request in the form the model works with, which is why opening a wallet has a Command but is not an Operation.
 
 **Opening**:
 The internal wager transaction that records a wallet's starting balance. Produced only when a wallet is created with money in it.
@@ -89,6 +92,18 @@ The provider-chosen identifier that binds repeated submissions to a single wager
 **Payload Hash**:
 A fingerprint of an operation's business fields, used to detect that one idempotency key has been reused for a different operation.
 
+**Replay**:
+Returning the outcome an operation already reached, because the same submission arrived again. Nothing new is recorded.
+_Avoid_: Retry, duplicate, resend
+
+**Retry**:
+A provider sending a submission again after a failure that recorded nothing. Unlike a Replay, there is no stored outcome to answer from.
+_Avoid_: Resend, reattempt
+
+**Conflict**:
+A submission refused because it contradicts one already recorded. Nothing new is persisted, and sending it again unchanged will be refused again.
+_Avoid_: Duplicate, collision, clash
+
 **Failure Code**:
 The stable, documented reason an operation was not applied, or that stored state was found to be wrong. Distinguishes what a provider can correct from what is settled.
 _Avoid_: Error code, reason, status
@@ -101,12 +116,22 @@ A refusal settled by a business rule. It is recorded and published, and binds th
 _Avoid_: Permanent failure, hard failure
 
 **Audit Failure**:
-A finding that stored state is wrong, rather than a refusal of anything submitted. It is definitive — there is no payload to repair — but it settles no wager transaction, because no operation was in flight for it to settle.
+A finding that stored state is wrong, rather than a refusal of anything submitted. There is no payload to repair and no idempotency key in play, so it invites no retry — but it is not a Definitive Failure either: nothing is recorded, nothing is published, and no wager transaction is settled, because none was in flight. What makes a failure an audit failure is where it was found, not which Failure Code it carries.
 _Avoid_: Corruption error, system failure
 
 **Wait Budget**:
 How long and how often an operation may wait for a reference before the wait is abandoned and the operation settled.
 _Avoid_: Retry limit, timeout
+
+**Resume**:
+Carrying an operation that is waiting for a reference forward. Never a new operation; the same one, continued.
+_Avoid_: Retry, replay, reprocess
+
+## Access
+
+**Principal**:
+The authenticated identity an operation is submitted under: either a provider acting as itself, or the service acting for itself.
+_Avoid_: Caller, user, client, actor
 
 ## Audit
 
@@ -123,11 +148,15 @@ A balance change a wallet is asked to make: which entry and wager transaction it
 _Avoid_: Transfer, adjustment, posting
 
 **Reconciliation**:
-Checking a wallet's stored balance against the balance its ledger implies. Reports disagreement; never corrects it.
+Checking a wallet's ledger against the wallet: that every entry belongs to it, that no wager transaction has two entries, that every entry is in its currency, and that credits less debits equal the balance it holds. Reports what it finds, each finding under its own name; never corrects it.
 _Avoid_: Audit, verification, balancing
 
 **Direction**:
 Whether a ledger entry took money out of a wallet or put money into it.
+
+**Cursor**:
+An opaque position in a ledger, from which the next page continues.
+_Avoid_: Offset, page token, bookmark
 
 ## Messaging
 
@@ -140,8 +169,20 @@ The record of events that have happened and are waiting to be published, and of 
 _Avoid_: Queue, publish log, event store
 
 **Claim**:
-A publisher's temporary hold on an event it is about to publish. A claim expires on its own, so work abandoned by a publisher that stopped is taken up by another rather than waiting forever.
+Taking exclusive responsibility for a piece of outstanding work, so that nothing else takes it at the same time. The two kinds end differently, and that difference is what the word has to carry: a publisher's claim on an outbox event is stored and expires by the clock, so work abandoned by a publisher that stopped is taken up by another, while a worker's claim on a waiting operation lasts only as long as the transaction that took it and is gone the moment that ends.
 _Avoid_: Lock, lease, reservation
+
+**Envelope**:
+The published form of an event: its identity, what it is about, what caused it and when it happened, wrapped around the event itself.
+_Avoid_: Wrapper, header, message
+
+**Correlation**:
+The thread tying together everything done on behalf of one request.
+_Avoid_: Trace id, request id
+
+**Causation**:
+The single thing that caused this one.
+_Avoid_: Parent, trigger, source
 
 **Aggregate Sequence**:
 An event's position in the history of the wallet it concerns. Contiguous, so a consumer can tell a gap from an ending, and can refuse to act on events that arrived out of order. A position is never reused and the numbering never restarts, so it keeps its meaning for a consumer even after the events themselves have been discarded.

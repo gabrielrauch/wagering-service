@@ -39,6 +39,21 @@ linters:
         - all
   exclusions:
     generated: lax
+    rules:
+      # `nilnil` and the port contract disagree, and the port contract wins.
+      #
+      # Every reader in internal/app/ports.go answers "the row is not there" with
+      # (nil, nil), and says why: absence is an answer each caller already has a
+      # branch for, so putting it in the error channel would force every one of
+      # them to tell a missing row apart from a database that is down. That is a
+      # decision the package argues for in prose, not an oversight, and the
+      # adapters implementing those ports inherit it.
+      #
+      # It stays enabled for internal/domain, which makes no such promise: a
+      # constructor there returning (nil, nil) really is a mistake.
+      - linters:
+          - nilnil
+        path: ^internal/(app|storage)/
 
 formatters:
   enable:

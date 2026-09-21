@@ -33,6 +33,13 @@ on a submission. They are definitive — there is no payload to repair — but t
 nothing, because no operation was in flight. See ADR-0006; the axis exists so that
 "definitive" keeps meaning exactly one thing here.
 
+The axis marks codes, not findings, and the two are not the same set. Reconciliation reads
+stored state and can report under an ordinary catalogue code — two ledger entries for one
+transaction is `INVALID_FIELD_FORMAT`, which is correctable — so the application layer decides
+that such a finding is an audit finding from where it was found rather than from the code it
+carries, and says so in its class. `Code.Audit()` stays a property of codes and stays the gate
+`Reject` uses. See ADR-0013.
+
 ## Considered and rejected
 
 Returning everything as an `error` and letting the caller decide what to persist. Simpler

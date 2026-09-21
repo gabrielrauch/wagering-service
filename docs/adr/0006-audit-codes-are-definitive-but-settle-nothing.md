@@ -47,6 +47,22 @@ Nothing in the catalogue describes it. The nearest by shape, `INVALID_FIELD_FORM
 correctable — which would report a corrupt ledger as something a provider may repair and
 resubmit.
 
+  > **Amended by ADR-0013.** The pairing rejected here now exists, deliberately, for a
+  > neighbouring finding. `Reconcile` reports structural corruption as well as a balance that
+  > does not add up — a duplicated ledger entry, an entry belonging to another wallet, one in
+  > the wrong currency — and those keep their own codes rather than being stamped with this
+  > one, so a duplicate leaves `Wallets.Reconcile` as `Class=AUDIT`,
+  > `Code=INVALID_FIELD_FORMAT`, `Field=transactionId`.
+  >
+  > What answers the objection above is the **class**, set explicitly rather than derived from
+  > the code: a caller acting on `Class` is told this is an operator's finding and never that
+  > a provider may resubmit. A caller reading the code alone is not, and `failure.Correctable`
+  > on such an error returns `true` — which is why ADR-0013 states the guard rule.
+  >
+  > The decision recorded here is untouched. `LEDGER_BALANCE_MISMATCH` is still the only code
+  > that carries "this is about stored state" in the code itself, it is still what the balance
+  > disagreement reports under, and it is still refused by `Reject`.
+
 ## Consequences
 
 - Adding a code now means answering two questions rather than one. `correctable` and

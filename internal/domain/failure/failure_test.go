@@ -272,3 +272,55 @@ func TestCodeOfAndCorrectableRejectForeignErrors(t *testing.T) {
 		t.Error("a nil error reports as correctable")
 	}
 }
+
+// Message is the refusal's own words, without the code and the field that Error
+// renders in front of them. It exists so a caller that states those itself does
+// not print them twice.
+func TestMessageIsTheRefusalWithoutItsRenderedHead(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name        string
+		err         *Error
+		wantMessage string
+		wantError   string
+	}{
+		{
+			name:        "code, field and message",
+			err:         New(InsufficientFunds, "balance 10.00 is below 25.00").WithField("amount"),
+			wantMessage: "balance 10.00 is below 25.00",
+			wantError:   "INSUFFICIENT_FUNDS: amount: balance 10.00 is below 25.00",
+		},
+		{
+			name:        "code and message",
+			err:         New(InsufficientFunds, "balance 10.00 is below 25.00"),
+			wantMessage: "balance 10.00 is below 25.00",
+			wantError:   "INSUFFICIENT_FUNDS: balance 10.00 is below 25.00",
+		},
+		{
+			name:        "code alone",
+			err:         New(InsufficientFunds, ""),
+			wantMessage: "",
+			wantError:   "INSUFFICIENT_FUNDS",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tc.err.Message(); got != tc.wantMessage {
+				t.Errorf("Message() = %q, want %q", got, tc.wantMessage)
+			}
+			if got := tc.err.Error(); got != tc.wantError {
+				t.Errorf("Error() = %q, want %q", got, tc.wantError)
+			}
+		})
+	}
+}
+
+// A nil *Error renders nothing rather than panicking, which is the same
+// courtesy WithField already extends.
+func TestMessageOnANilErrorIsEmpty(t *testing.T) {
+	t.Parallel()
+	var e *Error
+	if got := e.Message(); got != "" {
+		t.Errorf("Message() = %q, want %q", got, "")
+	}
+}
