@@ -117,7 +117,7 @@ func TestOneOperationWithAndWithoutAnInboxIdentityMovesMoneyOnceAndReplaysOnce(
 			// replay a replay rather than a second operation that happens to
 			// look alike.
 			if first.TransactionID != second.TransactionID {
-				t.Errorf("the two transports named operations %s and %s, want one",
+				t.Errorf("the two submissions named operations %s and %s, want one",
 					first.TransactionID, second.TransactionID)
 			}
 			if first.Status != wagering.Processed || second.Status != wagering.Processed {
@@ -148,7 +148,7 @@ func TestOneOperationWithAndWithoutAnInboxIdentityMovesMoneyOnceAndReplaysOnce(
 				t.Errorf("inbox = %+v, want one row for %s", inbox, messageID)
 			}
 
-			empty(t, name, visibility+3*time.Second, "after both transports had submitted")
+			empty(t, name, visibility+3*time.Second, "after both submissions had been made")
 		})
 	}
 }

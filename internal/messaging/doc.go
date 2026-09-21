@@ -52,6 +52,21 @@
 // only on the final balance would pass with that behaviour deleted, which is
 // the failure this suite was written after.
 //
+// # What this suite cannot catch
+//
+// One thing, and it is worth naming at the top rather than leaving to be
+// inferred. Nothing here drives the HTTP adapter: the submission that does not
+// arrive on the queue reaches app.Wagering.Submit directly, so the handler's
+// own half — the Idempotency-Key HEADER, the strict decode of a body that
+// deliberately has no such member, the correlation it derives — is not
+// exercised. The bug class that leaves open is the HTTP door and the queue
+// envelope disagreeing about where the idempotency key lives, or a member
+// renamed on one side only. internal/integration drives that door over a real
+// listener with a token a real Keycloak issued; reaching it from here would
+// mean something standing in at the credential gate, which is the substitute
+// this tree's brief refuses. See the documentation on
+// TestOneOperationWithAndWithoutAnInboxIdentityMovesMoneyOnceAndReplaysOnce.
+//
 // This file carries no build tag so that the package exists for `go build` and
 // `go vet` without one. Everything else here is behind `integration`.
 package messaging
