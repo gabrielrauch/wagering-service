@@ -10,9 +10,12 @@ import (
 
 	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/gabrielrauch/wagering-service/internal/app"
 	"github.com/gabrielrauch/wagering-service/internal/domain/wagering"
+	"github.com/gabrielrauch/wagering-service/internal/telemetry"
 )
 
 // TestTheTransactionManagerCommitsAndRollsBack pins the whole of the callback
@@ -106,11 +109,14 @@ func TestTheTransactionManagerSetsWhatItPromises(t *testing.T) {
 		`(SELECT setting FROM pg_settings WHERE name = 'lock_timeout'), ` +
 		`(SELECT setting FROM pg_settings WHERE name = 'statement_timeout')`
 
-	read := func(t *testing.T, options pgx.TxOptions) (isolation, readOnly, lock, statement string) {
+	read := func(
+		t *testing.T, span, kind string, options pgx.TxOptions,
+	) (isolation, readOnly, lock, statement string) {
 		t.Helper()
-		err := w.tm.within(t.Context(), options, func(ctx context.Context, tx pgx.Tx) error {
-			return tx.QueryRow(ctx, settings).Scan(&isolation, &readOnly, &lock, &statement)
-		})
+		err := w.tm.within(t.Context(), span, kind, options,
+			func(ctx context.Context, tx pgx.Tx) error {
+				return tx.QueryRow(ctx, settings).Scan(&isolation, &readOnly, &lock, &statement)
+			})
 		if err != nil {
 			t.Fatalf("read the transaction's settings: %v", err)
 		}
@@ -118,7 +124,7 @@ func TestTheTransactionManagerSetsWhatItPromises(t *testing.T) {
 	}
 
 	t.Run("a movement", func(t *testing.T) {
-		isolation, readOnly, lock, statement := read(t, movementOptions)
+		isolation, readOnly, lock, statement := read(t, telemetry.SpanMovement, telemetry.Movement, movementOptions)
 		if isolation != "read committed" {
 			t.Errorf("isolation %q, wanted read committed", isolation)
 		}
@@ -134,7 +140,7 @@ func TestTheTransactionManagerSetsWhatItPromises(t *testing.T) {
 	})
 
 	t.Run("a snapshot", func(t *testing.T) {
-		isolation, readOnly, lock, statement := read(t, snapshotOptions)
+		isolation, readOnly, lock, statement := read(t, telemetry.SpanSnapshot, telemetry.Snapshot, snapshotOptions)
 		if isolation != "repeatable read" {
 			t.Errorf("isolation %q, wanted repeatable read", isolation)
 		}
@@ -215,11 +221,12 @@ func TestASnapshotRefusesAWrite(t *testing.T) {
 	w := newWorld(t)
 	wallet := w.openWallet(t, "player-readonly", "100.00", "BRL")
 
-	err := w.tm.within(t.Context(), snapshotOptions, func(ctx context.Context, tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `UPDATE wagering.wallet SET balance_minor = 1 WHERE id = $1`,
-			uuidOf(wallet.ID()))
-		return err
-	})
+	err := w.tm.within(t.Context(), telemetry.SpanSnapshot, telemetry.Snapshot, snapshotOptions,
+		func(ctx context.Context, tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `UPDATE wagering.wallet SET balance_minor = 1 WHERE id = $1`,
+				uuidOf(wallet.ID()))
+			return err
+		})
 	// By SQLSTATE rather than by rule name, because no rule refused it: the
 	// transaction's access mode did, before any constraint was consulted.
 	refusedWith(t, err, pgerrcode.ReadOnlySQLTransaction)
@@ -289,4 +296,215 @@ func newWallet(t *testing.T, player, amount, currency string) (*wagering.Wallet,
 		t.Fatalf("build a wallet: %v", err)
 	}
 	return wallet, outcome
+}
+
+// TestTheTwoWaysATransactionLosesARaceAreCountedApart pins the contention
+// numbers, and the distinction between them.
+//
+// A lock timeout is the wallet lock WORKING: two commands met on one wallet and
+// the second waited longer than DATABASE_LOCK_TIMEOUT allows. It is ordinary,
+// it is tuned with that variable, and an operator watches the rate.
+//
+// A version conflict is the lock NOT having been held. The application layer
+// takes it before it computes anything, so a write refused for a stale version
+// means something reached a movement another way — and that number should be
+// zero. Averaged into one "contention" counter the second is invisible, which
+// is the whole reason they are two instruments.
+func TestTheTwoWaysATransactionLosesARaceAreCountedApart(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a lock somebody else is holding", func(t *testing.T) {
+		t.Parallel()
+		w := newWorld(t)
+		reporting, reader := countedTelemetry(t)
+		manager := tracedManager(t, w, reporting)
+		wallet := w.openWallet(t, "player-counted-busy", "100.00", "BRL")
+
+		held := make(chan struct{})
+		release := make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			done <- manager.WithinMovement(t.Context(), func(ctx context.Context, r *app.Repos) error {
+				if _, err := r.Wallets.LockByID(ctx, wallet.ID()); err != nil {
+					return err
+				}
+				close(held)
+				<-release
+				return nil
+			})
+		}()
+		<-held
+
+		err := manager.WithinMovement(t.Context(), func(ctx context.Context, r *app.Repos) error {
+			_, err := r.Wallets.LockByID(ctx, wallet.ID())
+			return err
+		})
+		close(release)
+		if holderErr := <-done; holderErr != nil {
+			t.Fatalf("the holder failed: %v", holderErr)
+		}
+		classifies(t, err, app.Retryable)
+
+		if got := sumOf(t, reader, telemetry.MetricLockTimeouts,
+			map[string]string{"transaction": telemetry.Movement}); got != 1 {
+			t.Errorf("%s counted %d, wanted the timeout", telemetry.MetricLockTimeouts, got)
+		}
+		if got := sumOf(t, reader, telemetry.MetricVersionConflicts,
+			map[string]string{"transaction": telemetry.Movement}); got != 0 {
+			t.Errorf("%s counted %d for a lock timeout", telemetry.MetricVersionConflicts, got)
+		}
+	})
+
+	t.Run("a wallet that moved under the movement", func(t *testing.T) {
+		t.Parallel()
+		w := newWorld(t)
+		reporting, reader := countedTelemetry(t)
+		manager := tracedManager(t, w, reporting)
+		w.openWallet(t, "player-counted-stale", "100.00", "BRL")
+
+		// Read outside any lock, which is the whole of the mistake being made.
+		key := wagering.WalletKey{
+			PlayerID: mustPlayer(t, "player-counted-stale"),
+			Currency: mustMoney(t, "0.00", "BRL").Currency(),
+		}
+		var stale *wagering.Wallet
+		if err := manager.WithinSnapshot(t.Context(),
+			func(ctx context.Context, r *app.ReadRepos) error {
+				var err error
+				stale, err = r.Wallets.ByKey(ctx, key)
+				return err
+			}); err != nil || stale == nil {
+			t.Fatalf("read the wallet: %v", err)
+		}
+
+		// Somebody else moves it properly, through the lock.
+		w.apply(t, command(t, wagering.Bet, "player-counted-stale", "ext-w", "10.00", "BRL"), at(1))
+
+		cmd := command(t, wagering.Bet, "player-counted-stale", "ext-l", "20.00", "BRL")
+		err := manager.WithinMovement(t.Context(), func(ctx context.Context, r *app.Repos) error {
+			tx, err := wagering.NewExternalTransaction(cmd, stale.ID(), at(2))
+			if err != nil {
+				return err
+			}
+			if err := r.Transactions.Record(ctx, tx, "stale"); err != nil {
+				return err
+			}
+			outcome, err := processor(t).Continue(tx, cmd, stale, nil, at(2))
+			if err != nil {
+				return err
+			}
+			return r.Settle(ctx, outcome, time.Time{})
+		})
+		if !errors.Is(err, ErrLostUpdate) {
+			t.Fatalf("settled a stale movement with %v, wanted a lost update", err)
+		}
+
+		if got := sumOf(t, reader, telemetry.MetricVersionConflicts,
+			map[string]string{"transaction": telemetry.Movement}); got != 1 {
+			t.Errorf("%s counted %d, wanted the conflict", telemetry.MetricVersionConflicts, got)
+		}
+		if got := sumOf(t, reader, telemetry.MetricLockTimeouts,
+			map[string]string{"transaction": telemetry.Movement}); got != 0 {
+			t.Errorf("%s counted %d for a version conflict", telemetry.MetricLockTimeouts, got)
+		}
+	})
+}
+
+// TestAnOrdinaryFailureIsNotContention pins the other half of the two counters.
+//
+// A transaction fails for many reasons and almost none of them are contention:
+// a constraint refused the write, the callback gave up, the connection went
+// away. Counting any of those as a lock timeout would make the number an
+// operator tunes DATABASE_LOCK_TIMEOUT from into a general failure rate, and
+// the tuning would be nonsense.
+func TestAnOrdinaryFailureIsNotContention(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	reporting, reader := countedTelemetry(t)
+	manager := tracedManager(t, w, reporting)
+
+	refused := errors.New("the callback gave up")
+	err := manager.WithinMovement(t.Context(), func(context.Context, *app.Repos) error {
+		return refused
+	})
+	if !errors.Is(err, refused) {
+		t.Fatalf("the callback's error came back as %v", err)
+	}
+
+	for _, instrument := range []string{
+		telemetry.MetricLockTimeouts, telemetry.MetricVersionConflicts,
+	} {
+		if got := sumOf(t, reader, instrument,
+			map[string]string{"transaction": telemetry.Movement}); got != 0 {
+			t.Errorf("%s counted %d for a failure that was not contention", instrument, got)
+		}
+	}
+}
+
+// countedTelemetry is a telemetry whose measurements are kept in memory.
+func countedTelemetry(t *testing.T) (*telemetry.Telemetry, *sdkmetric.ManualReader) {
+	t.Helper()
+	reader := sdkmetric.NewManualReader()
+	reporting, err := telemetry.New(telemetry.Config{
+		MeterProvider: sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)),
+	})
+	if err != nil {
+		t.Fatalf("build the telemetry: %v", err)
+	}
+	return reporting, reader
+}
+
+// tracedManager is this world's manager, reporting through the telemetry given.
+func tracedManager(t *testing.T, w *world, reporting *telemetry.Telemetry) *TxManager {
+	t.Helper()
+	manager, err := NewTxManager(TxConfig{
+		Pool:             w.app,
+		LockTimeout:      testLockTimeout,
+		StatementTimeout: testStatementTimeout,
+		Telemetry:        reporting,
+	})
+	if err != nil {
+		t.Fatalf("new transaction manager: %v", err)
+	}
+	return manager
+}
+
+// sumOf is what one counter holds under exactly these attributes, and nought
+// when no point carries them.
+func sumOf(
+	t *testing.T, reader *sdkmetric.ManualReader, name string, want map[string]string,
+) int64 {
+	t.Helper()
+	var into metricdata.ResourceMetrics
+	if err := reader.Collect(t.Context(), &into); err != nil {
+		t.Fatalf("collect the measurements: %v", err)
+	}
+	for _, scope := range into.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			if m.Name != name {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok {
+				t.Fatalf("%s is a %T, wanted an int64 sum", name, m.Data)
+			}
+			for _, point := range sum.DataPoints {
+				attributes := point.Attributes.ToSlice()
+				if len(attributes) != len(want) {
+					continue
+				}
+				matched := true
+				for _, attr := range attributes {
+					if value, named := want[string(attr.Key)]; !named ||
+						attr.Value.String() != value {
+						matched = false
+					}
+				}
+				if matched {
+					return point.Value
+				}
+			}
+		}
+	}
+	return 0
 }

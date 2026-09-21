@@ -9,8 +9,10 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/gabrielrauch/wagering-service/internal/app"
+	"github.com/gabrielrauch/wagering-service/internal/telemetry"
 )
 
 // errNegativeVersion reports a stored version that cannot be one: the schema
@@ -40,6 +42,7 @@ type TxManager struct {
 	pool             *pgxpool.Pool
 	lockTimeout      time.Duration
 	statementTimeout time.Duration
+	telemetry        *telemetry.Telemetry
 }
 
 // TxConfig is what a transaction manager is built from.
@@ -58,6 +61,15 @@ type TxConfig struct {
 	LockTimeout time.Duration
 	// StatementTimeout bounds how long a statement may run once it is running.
 	StatementTimeout time.Duration
+	// Telemetry is where the transaction is reported. Optional: nil is
+	// [telemetry.Disabled], which records nothing and changes nothing else.
+	//
+	// It is the one dependency here that is not refused when absent, and the
+	// reason is what refusing it would cost: every test that builds a manager
+	// by hand, and every one that will, would have to supply telemetry in order
+	// to compile. A transaction that is not traced is still a transaction; a
+	// transaction nobody wrote a test for is not.
+	Telemetry *telemetry.Telemetry
 }
 
 // NewTxManager wires the transaction manager.
@@ -80,6 +92,7 @@ func NewTxManager(cfg TxConfig) (*TxManager, error) {
 		pool:             cfg.Pool,
 		lockTimeout:      cfg.LockTimeout,
 		statementTimeout: cfg.StatementTimeout,
+		telemetry:        telemetry.Or(cfg.Telemetry),
 	}, nil
 }
 
@@ -112,17 +125,18 @@ func (m *TxManager) WithinMovement(
 	ctx context.Context,
 	fn func(context.Context, *app.Repos) error,
 ) error {
-	return m.within(ctx, movementOptions, func(ctx context.Context, tx pgx.Tx) error {
-		w := &writer{tx: tx}
-		return fn(ctx, &app.Repos{
-			Wallets:      wallets{tx: tx},
-			Transactions: transactions{tx: tx},
-			Inbox:        inbox{tx: tx},
-			Outbox:       outbox{tx: tx},
-			Open:         w.open,
-			Settle:       w.settle,
+	return m.within(ctx, telemetry.SpanMovement, telemetry.Movement, movementOptions,
+		func(ctx context.Context, tx pgx.Tx) error {
+			w := &writer{tx: tx}
+			return fn(ctx, &app.Repos{
+				Wallets:      wallets{tx: tx},
+				Transactions: transactions{tx: tx},
+				Inbox:        inbox{tx: tx},
+				Outbox:       outbox{tx: tx, telemetry: m.telemetry},
+				Open:         w.open,
+				Settle:       w.settle,
+			})
 		})
-	})
 }
 
 // WithinSnapshot runs fn in a REPEATABLE READ, READ ONLY transaction.
@@ -130,13 +144,14 @@ func (m *TxManager) WithinSnapshot(
 	ctx context.Context,
 	fn func(context.Context, *app.ReadRepos) error,
 ) error {
-	return m.within(ctx, snapshotOptions, func(ctx context.Context, tx pgx.Tx) error {
-		return fn(ctx, &app.ReadRepos{
-			Wallets:      wallets{tx: tx},
-			Transactions: transactions{tx: tx},
-			Ledger:       ledger{tx: tx},
+	return m.within(ctx, telemetry.SpanSnapshot, telemetry.Snapshot, snapshotOptions,
+		func(ctx context.Context, tx pgx.Tx) error {
+			return fn(ctx, &app.ReadRepos{
+				Wallets:      wallets{tx: tx},
+				Transactions: transactions{tx: tx},
+				Ledger:       ledger{tx: tx},
+			})
 		})
-	})
 }
 
 // applyTimeouts is one round trip that bounds every statement the transaction
@@ -149,7 +164,56 @@ func (m *TxManager) WithinSnapshot(
 const applyTimeouts = `SELECT set_config('lock_timeout', $1, true), ` +
 	`set_config('statement_timeout', $2, true)`
 
-// within opens a transaction, runs body, and commits or rolls back.
+// within is the transaction with its span around it, and is where the two ways
+// a transaction loses a race are counted.
+//
+// The span is a child of whatever the caller is doing — a request, a message, a
+// resume turn — so the SQL a command ran is a level of the same trace rather
+// than a trace of its own. It is opened here rather than around each statement
+// because the transaction is the unit that has a meaning: a reader looking at a
+// slow submission wants to know how long the wallet lock was held, not how
+// long eight statements each took.
+//
+// It carries a CLASS and never a message. app.ErrForeignOperation travels
+// through this manager, and a span is read by whoever can read the trace — see
+// [telemetry.Telemetry.Failed], which has no door that takes an error.
+func (m *TxManager) within(
+	ctx context.Context,
+	span, kind string,
+	options pgx.TxOptions,
+	body func(context.Context, pgx.Tx) error,
+) error {
+	ctx, transaction := m.telemetry.Start(ctx, span, trace.WithSpanKind(trace.SpanKindClient))
+	defer transaction.End()
+
+	err := m.run(ctx, options, body)
+	if err != nil {
+		m.contention(ctx, kind, err)
+		m.telemetry.Failed(transaction, string(app.ClassOf(err)),
+			telemetry.Class(string(app.ClassOf(err))))
+	}
+	return err
+}
+
+// contention counts the two ways a transaction loses a race, which are told
+// apart because they mean opposite things about this service.
+//
+// A lock timeout is the wallet lock WORKING and the wait being longer than
+// DATABASE_LOCK_TIMEOUT allows — ordinary contention, tuned with that variable.
+// A version conflict is the lock NOT having been held, which should be
+// unreachable: the application layer takes it before it computes anything, so
+// the write being refused means something reached a movement another way. One
+// is a number an operator watches; the other is a number that should be zero.
+func (m *TxManager) contention(ctx context.Context, kind string, err error) {
+	switch {
+	case errors.Is(err, ErrLostUpdate):
+		m.telemetry.RecordVersionConflict(ctx, kind)
+	case lockTimeout(err):
+		m.telemetry.RecordLockTimeout(ctx, kind)
+	}
+}
+
+// run opens a transaction, runs body, and commits or rolls back.
 //
 // The rollback is deferred, which covers three exits with one statement: an
 // error from body, a panic, and a commit that failed. A panic therefore rolls
@@ -182,7 +246,7 @@ const applyTimeouts = `SELECT set_config('lock_timeout', $1, true), ` +
 // A movement with no such key would make this classification wrong, and there
 // is none: every write this manager commits is reached through a door that
 // claims one first.
-func (m *TxManager) within(
+func (m *TxManager) run(
 	ctx context.Context,
 	options pgx.TxOptions,
 	body func(context.Context, pgx.Tx) error,

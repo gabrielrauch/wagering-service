@@ -85,9 +85,11 @@ func checkAttributeName(name string) error {
 // encodeAttributes turns a flat set of names and values into what SQS carries.
 //
 // Nothing here interprets a name. This package exists to carry trace context
-// across the queue, not to understand it, and a tracing integration that knows
-// what a traceparent means is a later task's — what has to exist now is the
-// carriage, so that adding the meaning later is not also a change to the wire.
+// across the queue and not to understand it: what a traceparent MEANS is the
+// propagator's, which internal/workers hands the whole set to on the way in and
+// takes the whole set from on the way out. Keeping the meaning out of here is
+// what let the carriage be built before the tracing was, and it is why adding
+// the tracing was not also a change to the wire.
 func encodeAttributes(attributes map[string]string) map[string]types.MessageAttributeValue {
 	if len(attributes) == 0 {
 		// nil rather than an empty map: SQS treats an empty attribute map as

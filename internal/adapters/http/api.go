@@ -9,6 +9,7 @@ import (
 
 	"github.com/gabrielrauch/wagering-service/internal/app"
 	"github.com/gabrielrauch/wagering-service/internal/domain/wagering"
+	"github.com/gabrielrauch/wagering-service/internal/telemetry"
 )
 
 // WageringService is the part of the application's write path this adapter
@@ -93,6 +94,16 @@ type Config struct {
 	// credential refusals happened — exists to be visible on the inside, and an
 	// absent logger does not degrade that, it deletes it.
 	Logger *slog.Logger
+	// Telemetry is where a request is traced and an operation counted.
+	// Optional: nil is [telemetry.Disabled], which records nothing and changes
+	// nothing else.
+	//
+	// Optional where the logger is required, and the asymmetry is deliberate.
+	// The logger carries distinctions a caller is deliberately not told, so an
+	// API built without one would be answering 404 to a foreign read with
+	// nowhere for the difference to survive; telemetry carries none — every
+	// attribute it sets is either in the response or in a log line already.
+	Telemetry *telemetry.Telemetry
 }
 
 // API routes and answers every request this service serves. It implements
@@ -105,6 +116,7 @@ type API struct {
 	readinessTimeout time.Duration
 	maxBody          int64
 	logger           *slog.Logger
+	telemetry        *telemetry.Telemetry
 	mux              *http.ServeMux
 }
 
@@ -142,6 +154,7 @@ func New(cfg Config) (*API, error) {
 		readinessTimeout: cfg.ReadinessTimeout,
 		maxBody:          cfg.MaxBodyBytes,
 		logger:           cfg.Logger,
+		telemetry:        telemetry.Or(cfg.Telemetry),
 	}
 	api.mux = api.routes()
 	return api, nil
@@ -156,6 +169,11 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	correlation, replaced, err := correlationOf(r)
 	r = r.WithContext(withCorrelation(r.Context(), correlation))
 	w.Header().Set(correlationHeader, correlation)
+	// On the span before anything can refuse the request, for the same reason
+	// the header is set before anything can: the correlation is how a caller
+	// and an operator talk about a request afterwards, and a request that was
+	// refused is the one they talk about.
+	describe(r, telemetry.Correlation(correlation))
 	if replaced {
 		// Not visible to the caller beyond the header not matching what it
 		// sent, so it is said here or nowhere.

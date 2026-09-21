@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -25,6 +26,8 @@ const (
 	defaultLogLevel           = slog.LevelInfo
 	defaultLogFormat          = LogJSON
 	defaultTelemetryShutdown  = 5 * time.Second
+	defaultExportTimeout      = 10 * time.Second
+	defaultMetricInterval     = 30 * time.Second
 	defaultStartTimeout       = 30 * time.Second
 	defaultStopTimeout        = 60 * time.Second
 	defaultMaxConns           = 10
@@ -358,6 +361,42 @@ func (r *reader) list(key string) []string {
 	return items
 }
 
+// endpoint reads an optional URL naming something this process will talk to.
+//
+// It is checked here rather than left to the exporter, and the reason is what
+// the exporter does with a bad one: an OTLP exporter is built lazily and
+// connects in the background, so a typo in the scheme is a process that starts,
+// reports itself healthy and exports nothing, for ever, with one line about it
+// somewhere in the start-up log. Refused here it is a start-up failure with the
+// variable named, which is what every other wrong value in this package gets.
+//
+// The scheme is what decides whether the export is encrypted — that is the
+// OTLP specification's rule, not this package's — so a scheme that is neither
+// http nor https is refused rather than defaulted. Defaulting it either way
+// would be this package deciding whether telemetry crosses a network in
+// plaintext.
+func (r *reader) endpoint(key string) string {
+	raw, ok := r.value(key)
+	if !ok {
+		return ""
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		r.refuse(key, "%q is not a URL", raw)
+		return ""
+	}
+	switch {
+	case parsed.Scheme != "http" && parsed.Scheme != "https":
+		r.refuse(key, "%q must name a scheme, http or https, because the scheme is what "+
+			"decides whether the export is encrypted", raw)
+		return ""
+	case parsed.Host == "":
+		r.refuse(key, "%q names no host", raw)
+		return ""
+	}
+	return raw
+}
+
 // level reads a log level in slog's own spelling, which admits the four names
 // and an offset such as INFO+2.
 func (r *reader) level(key string, fallback slog.Level) slog.Level {
@@ -405,6 +444,10 @@ func (r *reader) telemetry() Telemetry {
 		LogLevel:        r.level("LOG_LEVEL", defaultLogLevel),
 		LogFormat:       r.format("LOG_FORMAT", defaultLogFormat),
 		ShutdownTimeout: r.duration("TELEMETRY_SHUTDOWN_TIMEOUT", defaultTelemetryShutdown),
+		Disabled:        r.flag("OTEL_SDK_DISABLED", false),
+		OTLPEndpoint:    r.endpoint("OTEL_EXPORTER_OTLP_ENDPOINT"),
+		ExportTimeout:   r.duration("TELEMETRY_EXPORT_TIMEOUT", defaultExportTimeout),
+		MetricInterval:  r.duration("TELEMETRY_METRIC_INTERVAL", defaultMetricInterval),
 	}
 }
 

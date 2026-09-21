@@ -9,10 +9,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	oteltrace "go.opentelemetry.io/otel/trace"
+
 	"github.com/gabrielrauch/wagering-service/internal/adapters/sqs"
 	"github.com/gabrielrauch/wagering-service/internal/app"
 	"github.com/gabrielrauch/wagering-service/internal/domain/wagering"
 	"github.com/gabrielrauch/wagering-service/internal/faults"
+	"github.com/gabrielrauch/wagering-service/internal/telemetry"
 )
 
 // What a [ConsumerConfig] leaves open.
@@ -113,6 +117,10 @@ type ConsumerConfig struct {
 	// invisible otherwise, and an absent logger does not degrade that report,
 	// it deletes it.
 	Logger *slog.Logger
+	// Telemetry is where a message is traced and counted. Optional: nil is
+	// [telemetry.Disabled], and a consumer built without it behaves exactly as
+	// it did before there was any.
+	Telemetry *telemetry.Telemetry
 }
 
 // Consumer takes wager operations off the inbound queue and applies them.
@@ -135,6 +143,7 @@ type Consumer struct {
 	drain       time.Duration
 	maxReceives int
 	logger      *slog.Logger
+	telemetry   *telemetry.Telemetry
 
 	mu        sync.Mutex
 	started   bool
@@ -203,6 +212,7 @@ func NewConsumer(cfg ConsumerConfig) (*Consumer, error) {
 		drain:       orDefaultDuration(cfg.DrainTimeout, defaultDrainTimeout),
 		maxReceives: cfg.MaxReceiveCount,
 		logger:      cfg.Logger,
+		telemetry:   telemetry.Or(cfg.Telemetry),
 		held:        heldMessages{handles: make(map[string]struct{})},
 	}, nil
 }
@@ -434,27 +444,64 @@ func (c *Consumer) handleBatch(ctx context.Context, messages []sqs.Message) {
 		if ctx.Err() != nil {
 			return
 		}
-		decided, in := c.handle(ctx, message)
+		held, span := c.consuming(ctx, message)
+		decided, in := c.handle(held, message)
 		switch decided {
 		case settled:
-			c.acknowledge(ctx, message)
+			c.acknowledge(held, message)
+			span.End()
 			continue
 		case deferred:
-			c.hide(ctx, message, in)
+			c.hide(held, message, in)
+			span.End()
 			for _, behind := range messages[i+1:] {
+				// Under the receiver's context and not this message's span:
+				// they are being hidden BECAUSE of it, not by it, and a span
+				// that swallowed nine unrelated wallets would say this message
+				// did nine things.
 				c.hide(ctx, behind, in)
 			}
 		case poisoned:
 			c.held.done(message.ReceiptHandle)
+			span.End()
 			for _, behind := range messages[i+1:] {
 				c.held.done(behind.ReceiptHandle)
 			}
 		case abandoned:
 			// Left held, along with everything behind it. Stop is what gives
 			// them back, and it gives them back at once.
+			c.telemetry.Failed(span, "ABANDONED")
+			span.End()
 		}
 		return
 	}
+}
+
+// consuming opens the span one message is handled under, joining the trace it
+// arrived carrying.
+//
+// The parent comes out of the MESSAGE ATTRIBUTES rather than out of the body.
+// That is where trace context rides — see the package's own trace.go, which
+// says why — and it means a message this service published, consumed
+// downstream, is in the same trace as the request that caused it. A message
+// nobody traced starts a trace here, which is what a producer outside this
+// system leaves behind.
+//
+// The queue's own delivery id and the delivery count are on the span from the
+// start, because they are the two facts that survive a body that will not
+// parse. Everything else is added as it becomes known.
+func (c *Consumer) consuming(
+	ctx context.Context, m sqs.Message,
+) (context.Context, oteltrace.Span) {
+	return c.telemetry.Start(
+		c.telemetry.Extract(ctx, m.Attributes),
+		telemetry.SpanConsume,
+		oteltrace.WithSpanKind(oteltrace.SpanKindConsumer),
+		oteltrace.WithAttributes(
+			attribute.String(telemetry.KeyConsumer, c.name),
+			attribute.String("queueMessageId", m.MessageID),
+			attribute.Int("receiveCount", m.ReceiveCount),
+		))
 }
 
 // handle applies one message and says what should become of it.
@@ -462,18 +509,38 @@ func (c *Consumer) handleBatch(ctx context.Context, messages []sqs.Message) {
 // The returned duration is meaningful only for [deferred], where it is how long
 // the message is hidden for.
 func (c *Consumer) handle(ctx context.Context, m sqs.Message) (disposition, time.Duration) {
+	span := oteltrace.SpanFromContext(ctx)
 	e, err := parseEnvelope(m.Body)
 	if err != nil {
 		c.poison(ctx, m, "", err)
 		return poisoned, 0
 	}
+	span.SetAttributes(telemetry.MessageID(e.MessageID))
+
 	submission, err := c.submission(ctx, e, m)
 	if err != nil {
 		c.poison(ctx, m, e.MessageID, err)
 		return poisoned, 0
 	}
+	span.SetAttributes(telemetry.Some(
+		telemetry.Correlation(submission.Correlation),
+		telemetry.ProviderID(e.Data.Provider),
+		telemetry.Kind(e.Data.Kind),
+	)...)
 
-	result, err := c.wagering.Submit(ctx, submission)
+	// The use case is a span of its own inside the message's, so a trace reads
+	// message, submission, transaction, statement — the same four levels the
+	// HTTP path produces for the same operation. Ending it before the message
+	// is decided about is deliberate: what happens next is the queue's
+	// business, not the application layer's.
+	useCase, call := c.telemetry.Start(ctx, telemetry.SpanSubmit,
+		oteltrace.WithSpanKind(oteltrace.SpanKindInternal))
+	started := time.Now()
+	result, err := c.wagering.Submit(useCase, submission)
+	if err != nil {
+		c.telemetry.Failed(call, string(app.ClassOf(err)))
+	}
+	call.End()
 	if err == nil {
 		// The transaction has committed. Everything from here on is outside it,
 		// which is why the fault point is exactly here: a process killed
@@ -481,6 +548,7 @@ func (c *Consumer) handle(ctx context.Context, m sqs.Message) (disposition, time
 		// must not apply it twice, and the inbox row that committed with the
 		// work is what makes that true.
 		faults.Hit(faults.AfterCommitBeforeAck)
+		c.counted(ctx, span, result, time.Since(started))
 		c.applied(ctx, m, submission, result)
 		return settled, 0
 	}
@@ -497,6 +565,8 @@ func (c *Consumer) handle(ctx context.Context, m sqs.Message) (disposition, time
 		return poisoned, 0
 	}
 	in := wholeSeconds(c.backoff.after(m.ReceiveCount))
+	c.telemetry.RecordQueueRetry(ctx, c.name, string(class))
+	c.telemetry.Failed(span, string(class), telemetry.Class(string(class)))
 	c.logger.WarnContext(ctx, "the operation could not be applied and will be delivered again",
 		c.about(m, submission.Correlation,
 			slog.String("messageId", e.MessageID),
@@ -504,6 +574,35 @@ func (c *Consumer) handle(ctx context.Context, m sqs.Message) (disposition, time
 			slog.Duration("hiddenFor", in),
 			slog.String("error", err.Error()))...)
 	return deferred, in
+}
+
+// counted records what one applied message came to.
+//
+// A replay is counted twice and the two counts are different questions. The
+// operation count says what this service did; the inbox duplicate says the
+// QUEUE delivered a message it had already delivered, which is a fact about the
+// queue's configuration and this consumer's drains rather than about providers
+// — see [telemetry.Telemetry.RecordInboxDuplicate].
+func (c *Consumer) counted(
+	ctx context.Context, span oteltrace.Span, result app.OperationResult, took time.Duration,
+) {
+	span.SetAttributes(
+		telemetry.TransactionID(result.TransactionID.String()),
+		telemetry.Status(result.Status.String()),
+		telemetry.FailureCode(result.FailureCode.String()),
+		telemetry.Replay(result.IdempotentReplay),
+	)
+	c.telemetry.RecordOperation(ctx, telemetry.Operation{
+		Source:      telemetry.SourceQueue,
+		Kind:        result.Kind.String(),
+		Status:      result.Status.String(),
+		FailureCode: result.FailureCode.String(),
+		Replay:      result.IdempotentReplay,
+		Took:        took,
+	})
+	if result.IdempotentReplay {
+		c.telemetry.RecordInboxDuplicate(ctx, c.name)
+	}
 }
 
 // transient reports whether a class of failure is worth another delivery.
@@ -617,11 +716,14 @@ func (c *Consumer) hide(ctx context.Context, m sqs.Message, in time.Duration) {
 // mechanism that is meant to decide, and leaving the message alone is what lets
 // it.
 func (c *Consumer) poison(ctx context.Context, m sqs.Message, messageID string, cause error) {
+	class := app.ClassOf(cause)
+	c.telemetry.Failed(oteltrace.SpanFromContext(ctx), string(class), telemetry.Class(string(class)))
 	attrs := c.about(m, "",
 		slog.String("messageId", messageID),
-		slog.String("class", string(app.ClassOf(cause))),
+		slog.String("class", string(class)),
 		slog.String("error", cause.Error()))
 	if c.lastDelivery(m) {
+		c.telemetry.RecordDeadLetter(ctx, c.name)
 		c.logger.ErrorContext(ctx,
 			"the message cannot be handled and this was its last delivery before the dead-letter queue",
 			attrs...)

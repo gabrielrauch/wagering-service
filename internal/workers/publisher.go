@@ -6,13 +6,18 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"sync"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"github.com/gabrielrauch/wagering-service/internal/adapters/postgres"
 	"github.com/gabrielrauch/wagering-service/internal/adapters/sqs"
 	"github.com/gabrielrauch/wagering-service/internal/app"
 	"github.com/gabrielrauch/wagering-service/internal/faults"
+	"github.com/gabrielrauch/wagering-service/internal/telemetry"
 )
 
 // What a [PublisherConfig] leaves open.
@@ -88,6 +93,10 @@ type PublisherConfig struct {
 	DrainTimeout time.Duration
 	// Logger is where the publisher reports what it did. Required.
 	Logger *slog.Logger
+	// Telemetry is where a publish is traced and counted. Optional: nil is
+	// [telemetry.Disabled], and a publisher built without it behaves exactly as
+	// it did before there was any.
+	Telemetry *telemetry.Telemetry
 }
 
 // Publisher moves events from the outbox onto the outbound queue.
@@ -106,16 +115,17 @@ type PublisherConfig struct {
 // republishes when it comes back, and the deduplication id being the event id is
 // what keeps that from becoming a second event on the wire.
 type Publisher struct {
-	outbox   OutboxClaims
-	queue    OutboundQueue
-	clock    app.Clock
-	name     string
-	batch    int
-	hold     time.Duration
-	interval time.Duration
-	drain    time.Duration
-	backoff  Backoff
-	logger   *slog.Logger
+	outbox    OutboxClaims
+	queue     OutboundQueue
+	clock     app.Clock
+	name      string
+	batch     int
+	hold      time.Duration
+	interval  time.Duration
+	drain     time.Duration
+	backoff   Backoff
+	logger    *slog.Logger
+	telemetry *telemetry.Telemetry
 
 	mu      sync.Mutex
 	started bool
@@ -167,16 +177,17 @@ func NewPublisher(cfg PublisherConfig) (*Publisher, error) {
 	}
 
 	return &Publisher{
-		outbox:   cfg.Outbox,
-		queue:    cfg.Queue,
-		clock:    cfg.Clock,
-		name:     cfg.Name,
-		batch:    orDefault(cfg.Batch, defaultClaimBatch),
-		hold:     orDefaultDuration(cfg.Hold, defaultClaimHold),
-		interval: orDefaultDuration(cfg.Interval, defaultPollInterval),
-		drain:    orDefaultDuration(cfg.DrainTimeout, defaultDrainTimeout),
-		backoff:  backoff,
-		logger:   cfg.Logger,
+		outbox:    cfg.Outbox,
+		queue:     cfg.Queue,
+		clock:     cfg.Clock,
+		name:      cfg.Name,
+		batch:     orDefault(cfg.Batch, defaultClaimBatch),
+		hold:      orDefaultDuration(cfg.Hold, defaultClaimHold),
+		interval:  orDefaultDuration(cfg.Interval, defaultPollInterval),
+		drain:     orDefaultDuration(cfg.DrainTimeout, defaultDrainTimeout),
+		backoff:   backoff,
+		logger:    cfg.Logger,
+		telemetry: telemetry.Or(cfg.Telemetry),
 	}, nil
 }
 
@@ -321,6 +332,10 @@ func (p *Publisher) run(ctx context.Context) {
 // marked. A mark that fails leaves the row claimed until the hold expires, so it
 // cannot come back round and spin; an event that never reached the queue can.
 func (p *Publisher) turn(ctx context.Context) (claimed, published int, err error) {
+	ctx, sending := p.telemetry.Start(ctx, telemetry.SpanPublishBatch,
+		oteltrace.WithAttributes(attribute.String(telemetry.KeyPublisher, p.name)))
+	defer sending.End()
+
 	at := p.clock.Now()
 	batch, err := p.outbox.Claim(ctx, postgres.ClaimRequest{
 		By:    p.name,
@@ -329,6 +344,7 @@ func (p *Publisher) turn(ctx context.Context) (claimed, published int, err error
 		Hold:  p.hold,
 	})
 	if err != nil {
+		p.telemetry.Failed(sending, string(app.ClassOf(err)))
 		if ctx.Err() == nil {
 			p.logger.ErrorContext(ctx, "could not claim outbox events",
 				slog.String("publisher", p.name),
@@ -340,22 +356,26 @@ func (p *Publisher) turn(ctx context.Context) (claimed, published int, err error
 	if len(batch) == 0 {
 		return 0, 0, nil
 	}
+	sending.SetAttributes(attribute.Int(telemetry.KeyEvents, len(batch)))
 
 	// The claim is held and nothing has been sent. A process killed here must
 	// not hold the event hostage; the claim expiring by wall clock is what
 	// makes that true.
 	faults.Hit(faults.AfterClaimBeforePublish)
 
-	results, err := p.queue.SendBatch(ctx, outboundOf(batch))
+	messages, spans := p.outbound(ctx, batch)
+	results, err := p.queue.SendBatch(ctx, messages)
 	if err != nil {
 		// Nothing was attempted at all — the adapter reports per entry
 		// otherwise — so every event goes back with the same cause, and the
 		// turn reports nothing published so that the loop slows down.
+		p.telemetry.Failed(sending, string(app.ClassOf(err)))
 		p.logger.ErrorContext(ctx, "could not send a batch of events",
 			slog.String("publisher", p.name),
 			slog.Int("events", len(batch)),
 			slog.String("class", string(app.ClassOf(err))),
 			slog.String("error", err.Error()))
+		p.refuseAll(ctx, spans, err)
 		p.rescheduleAll(ctx, batch, err)
 		return len(batch), 0, nil
 	}
@@ -364,12 +384,14 @@ func (p *Publisher) turn(ctx context.Context) (claimed, published int, err error
 		// result per message. Asserting it anyway, because the alternative to
 		// noticing is marking an event published on the strength of another
 		// event's result.
+		mismatch := errors.New("workers: the send reported a different number of results")
+		p.telemetry.Failed(sending, string(app.Unretryable))
 		p.logger.ErrorContext(ctx, "the queue answered for a different number of events",
 			slog.String("publisher", p.name),
 			slog.Int("events", len(batch)),
 			slog.Int("results", len(results)))
-		p.rescheduleAll(ctx, batch,
-			errors.New("workers: the send reported a different number of results"))
+		p.refuseAll(ctx, spans, mismatch)
+		p.rescheduleAll(ctx, batch, mismatch)
 		return len(batch), 0, nil
 	}
 
@@ -383,12 +405,35 @@ func (p *Publisher) turn(ctx context.Context) (claimed, published int, err error
 	for i, result := range results {
 		if result.Sent() {
 			sent++
+			p.telemetry.RecordPublishAttempt(ctx, p.name, telemetry.OutcomePublished)
+			spans[i].End()
 			p.mark(ctx, batch[i], done)
 			continue
 		}
+		p.refused(ctx, spans[i], result.Err)
 		p.reschedule(ctx, batch[i], done, result.Err)
 	}
 	return len(batch), sent, nil
+}
+
+// refused ends one event's span as a publication that did not happen, and
+// counts it.
+//
+// The class and never the message, for the reason
+// [telemetry.Telemetry.Failed] gives. Which event it was is already on the
+// span; why it was refused is in the line [Publisher.reschedule] writes.
+func (p *Publisher) refused(ctx context.Context, span oteltrace.Span, cause error) {
+	p.telemetry.RecordPublishAttempt(ctx, p.name, telemetry.OutcomeRefused)
+	p.telemetry.Failed(span, string(app.ClassOf(cause)))
+	span.End()
+}
+
+// refuseAll ends every event's span for the two failures that are about the
+// call rather than about any one event.
+func (p *Publisher) refuseAll(ctx context.Context, spans []oteltrace.Span, cause error) {
+	for _, span := range spans {
+		p.refused(ctx, span, cause)
+	}
 }
 
 // mark records one event as published.
@@ -498,29 +543,88 @@ func (p *Publisher) about(event postgres.ClaimedEvent, extra ...slog.Attr) []any
 	return attrs
 }
 
-// outboundOf is the batch as the queue takes it.
+// outbound is the batch as the queue takes it, with one span per event.
 //
 // The body is the stored payload, byte for byte. The outbox row's payload IS the
-// envelope — it is written as one object and read back as one — so there is
-// nothing here to assemble and nothing to re-render: jsonb has already
-// normalised the key order and the spacing, and re-marshalling would publish a
-// third spelling of a document this service has two of already.
+// envelope — the claim returns it with the adapter's own trace member already
+// removed, see postgres.claimOutbox — so there is nothing here to assemble and
+// nothing to re-render: jsonb has already normalised the key order and the
+// spacing, and re-marshalling would publish a third spelling of a document this
+// service has two of already.
 //
 // The group is the aggregate id and the deduplication id is the event id. That
 // pairing is the whole of the outbound contract: the group is what orders a
 // wallet's events for a consumer rebuilding its history, and the deduplication
 // id is what makes a republication the same event rather than a second one.
-func outboundOf(claimed []postgres.ClaimedEvent) []sqs.Outbound {
+//
+// # Why each event gets a span of its own, and where its parent is
+//
+// This is the join the whole trace rests on. The event was produced by a
+// command that ran minutes ago, in another process, under a trace that ended
+// when that request was answered; the outbox row carried that trace across, and
+// the span opened here is a CHILD of it. So the traceparent that goes into the
+// message attributes belongs to the operation's trace, and a consumer that
+// continues from it is in the same trace as the HTTP request that started
+// everything — which is the requirement, one trace and not two correlated by an
+// attribute.
+//
+// The batch turn is a LINK rather than the parent. A turn sends up to ten
+// events belonging to up to ten different traces, so it cannot be the parent of
+// all of them, and making it the parent of any would be choosing which
+// operation the batch belongs to. The link is reachable from either end.
+//
+// An event with no carried trace — written before this existed, or by a process
+// with telemetry switched off — gets a span under the batch's own trace, which
+// is the honest answer: there is no earlier trace to join.
+func (p *Publisher) outbound(
+	ctx context.Context, claimed []postgres.ClaimedEvent,
+) ([]sqs.Outbound, []oteltrace.Span) {
 	messages := make([]sqs.Outbound, len(claimed))
+	spans := make([]oteltrace.Span, len(claimed))
 	for i, event := range claimed {
+		attributes := traceOf(event.Payload)
+		eventCtx, span := p.telemetry.Start(
+			p.telemetry.Extract(ctx, event.Trace),
+			telemetry.SpanPublishEvent,
+			oteltrace.WithSpanKind(oteltrace.SpanKindProducer),
+			telemetry.Link(ctx),
+			oteltrace.WithAttributes(telemetry.Some(
+				telemetry.EventID(event.EventID.String()),
+				telemetry.WalletID(event.AggregateID.String()),
+				telemetry.Correlation(attributes[correlationAttribute]),
+				attribute.String(telemetry.KeyPublisher, p.name),
+			)...))
+		spans[i] = span
+
 		messages[i] = sqs.Outbound{
 			Body:            event.Payload,
 			GroupID:         event.AggregateID.String(),
 			DeduplicationID: event.EventID.String(),
-			Attributes:      traceOf(event.Payload),
+			Attributes:      besideTheBody(attributes, p.telemetry.Inject(eventCtx)),
 		}
 	}
-	return messages
+	return messages, spans
+}
+
+// besideTheBody is what rides in the message attributes: the envelope's own
+// thread, and the trace context of the span that is sending it.
+//
+// The trace context is written last and wins a collision, which cannot happen —
+// "traceparent" is not a member of the envelope — and is stated because the
+// other order would let a stored document decide what a live span said about
+// itself.
+//
+// Nothing at all answers nil rather than an empty map, because the queue
+// adapter treats an empty attribute set as absent and sending one would put an
+// empty object in every request for nothing.
+func besideTheBody(stored, carried map[string]string) map[string]string {
+	if len(stored) == 0 && len(carried) == 0 {
+		return nil
+	}
+	attributes := make(map[string]string, len(stored)+len(carried))
+	maps.Copy(attributes, stored)
+	maps.Copy(attributes, carried)
+	return attributes
 }
 
 // storedTrace is the part of a stored envelope the publisher reads for itself.
@@ -543,16 +647,16 @@ type storedTrace struct {
 // having to open the body to follow a thread — which is a worse morning for
 // somebody, not a lost event.
 func traceOf(payload []byte) map[string]string {
-	var trace storedTrace
-	if err := json.Unmarshal(payload, &trace); err != nil {
+	var stored storedTrace
+	if err := json.Unmarshal(payload, &stored); err != nil {
 		return nil
 	}
 	attributes := make(map[string]string, 2)
-	if trace.CorrelationID != "" {
-		attributes[correlationAttribute] = trace.CorrelationID
+	if stored.CorrelationID != "" {
+		attributes[correlationAttribute] = stored.CorrelationID
 	}
-	if trace.CausationID != "" {
-		attributes[causationAttribute] = trace.CausationID
+	if stored.CausationID != "" {
+		attributes[causationAttribute] = stored.CausationID
 	}
 	if len(attributes) == 0 {
 		return nil

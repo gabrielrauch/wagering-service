@@ -7,6 +7,7 @@ import (
 	"github.com/gabrielrauch/wagering-service/internal/app"
 	"github.com/gabrielrauch/wagering-service/internal/domain/failure"
 	"github.com/gabrielrauch/wagering-service/internal/domain/wagering"
+	"github.com/gabrielrauch/wagering-service/internal/telemetry"
 )
 
 // openWallet creates a wallet for a player in a currency.
@@ -23,16 +24,30 @@ func (a *API) openWallet(w http.ResponseWriter, r *http.Request, principal app.P
 		return
 	}
 
-	view, opening, err := a.wallets.Open(r.Context(), app.OpenWalletCommand{
+	// The player is NOT named on the span. It is the one identifier in this
+	// request that is a person rather than a record, the attribute list this
+	// service traces by does not have it, and a wallet id names the same wallet
+	// without naming whose it is.
+	ctx, done := a.usecase(r, telemetry.SpanOpenWallet)
+	view, opening, err := a.wallets.Open(ctx, app.OpenWalletCommand{
 		Principal:     principal,
 		Correlation:   correlationFrom(r.Context()),
 		PlayerID:      body.PlayerID,
 		InitialAmount: body.InitialBalance.Amount,
 		Currency:      body.InitialBalance.Currency,
 	})
+	took := done(err)
 	if err != nil {
 		a.fail(w, r, err)
 		return
+	}
+	describe(r, telemetry.WalletID(view.ID.String()))
+	if opening != nil {
+		// A wallet opened with money in it performs an operation, and it is
+		// counted like every other one: it moves a balance and writes a ledger
+		// entry, so leaving it out would make the ledger and the counter
+		// disagree by exactly the openings.
+		a.applied(ctx, *opening, took)
 	}
 
 	rendered := walletOf(view)
@@ -51,7 +66,11 @@ func (a *API) readWallet(w http.ResponseWriter, r *http.Request, principal app.P
 		a.fail(w, r, err)
 		return
 	}
-	view, err := a.wallets.ByID(r.Context(), principal, id)
+	describe(r, telemetry.WalletID(id.String()))
+
+	ctx, done := a.usecase(r, telemetry.SpanWalletByID)
+	view, err := a.wallets.ByID(ctx, principal, id)
+	done(err)
 	if err != nil {
 		a.fail(w, r, err)
 		return
@@ -76,11 +95,15 @@ func (a *API) readLedger(w http.ResponseWriter, r *http.Request, principal app.P
 		a.fail(w, r, err)
 		return
 	}
-	page, err := a.wallets.Ledger(r.Context(), principal, app.LedgerQuery{
+	describe(r, telemetry.WalletID(id.String()))
+
+	ctx, done := a.usecase(r, telemetry.SpanLedger)
+	page, err := a.wallets.Ledger(ctx, principal, app.LedgerQuery{
 		WalletID: id,
 		Cursor:   r.URL.Query().Get("cursor"),
 		Limit:    limit,
 	})
+	done(err)
 	if err != nil {
 		a.fail(w, r, err)
 		return
@@ -101,10 +124,21 @@ func (a *API) reconcileWallet(w http.ResponseWriter, r *http.Request, principal 
 		a.fail(w, r, err)
 		return
 	}
-	report, err := a.wallets.Reconcile(r.Context(), principal, id)
+	describe(r, telemetry.WalletID(id.String()))
+
+	ctx, done := a.usecase(r, telemetry.SpanReconcile)
+	report, err := a.wallets.Reconcile(ctx, principal, id)
+	done(err)
 	if err != nil {
 		a.fail(w, r, err)
 		return
+	}
+	if !report.Consistent {
+		// Counted and never amounted. The difference is money — the one signed
+		// amount in this system — and the report the caller is holding carries
+		// it; the metric exists to be alerted on, and an alert needs to know
+		// that a wallet diverged and not by how much.
+		a.telemetry.RecordDivergence(ctx)
 	}
 	a.writeJSON(w, r, http.StatusOK, reconciliationOf(report))
 }

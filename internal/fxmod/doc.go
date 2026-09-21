@@ -12,7 +12,9 @@
 //
 //   - config supplies the checked [config.Config] and hands each module the
 //     part of it that module reads.
-//   - telemetry is the logger, and the place the OpenTelemetry SDK plugs into.
+//   - telemetry is the logger and the OpenTelemetry SDK: the trace and meter
+//     providers, the propagator, and the [telemetry.Telemetry] every other
+//     component reports through.
 //   - postgres is the pool, the transaction manager, the outbox claims and the
 //     readiness probe.
 //   - sqs is the client and the two queues, each resolved at start-up.
@@ -66,21 +68,26 @@
 //
 // Fx runs OnStop hooks in the reverse of the order they were appended, and this
 // package relies on that deliberately rather than hand-rolling a sequence.
-// Three facts make the append order something nobody has to maintain, and it is
+// Four facts make the append order something nobody has to maintain, and it is
 // worth being exact about which, because the obvious argument — that every
 // hook-appending constructor takes the logger — is not true: four of them do
 // not.
 //
-//  1. Only four things here append an OnStop hook at all: [newLogger],
-//     [newPool], the three run* invokes and [serve]. The constructors that do
-//     not take the logger — [newDatabaseHealth], [newInboundQueue],
-//     [newOutboundQueue], [newAuthenticator] — append OnStart and nothing else,
-//     and Fx skips a nil OnStop, so where they sit cannot matter.
+//  1. Six things here append an OnStop hook at all: [newLogger], the SDK's two
+//     providers, [newPool], the three run* invokes and [serve]. The
+//     constructors that do not take the logger — [newDatabaseHealth],
+//     [newInboundQueue], [newOutboundQueue], [newAuthenticator] — append
+//     OnStart and nothing else, and Fx skips a nil OnStop, so where they sit
+//     cannot matter.
 //  2. [newLogger] is forced during fx.New by fx.WithLogger, before any invoke
 //     runs and before any other constructor is asked for. Its hook is therefore
 //     the first appended and the last run, unconditionally — a stronger
 //     guarantee than depending on it would give.
-//  3. Everything that appends an OnStop hook after that is built FROM the pool:
+//  3. The SDK's two providers come next, and [Telemetry] argues their position
+//     in full: [newPool] takes the [telemetry.Telemetry] they are reached
+//     through, so they are built before it, and [installTelemetry] keeps that
+//     from depending on who happens to hold the dependency.
+//  4. Everything that appends an OnStop hook after that is built FROM the pool:
 //     the loops through the application services and the outbox claims, the
 //     server through the API. A constructor cannot run before the constructors
 //     it depends on, so [newPool] runs before all of them and its hook runs
@@ -96,7 +103,8 @@
 //
 //	the server drains, or the loops stop and give their work back
 //	  -> the pool closes
-//	    -> telemetry is flushed
+//	    -> the spans and the measurements are flushed
+//	      -> the last line is written
 //
 // Each of those is the only order that works. A pool closed while a publisher
 // is still releasing its claims leaves those rows held until their hold expires,
@@ -110,10 +118,13 @@
 // Stop that returns an error is a non-zero exit code, and a drain that ran out
 // of time should not look like a clean deployment.
 //
-// # What telemetry is, today
+// # What telemetry is
 //
-// The logger and the flush hook's position. The OpenTelemetry SDK is a later
-// step, and this package deliberately does not invent a shape for it: there is
-// no exporter interface here, no provider abstraction, and nothing to implement.
-// What is here is where it goes — see [Telemetry] and [telemetry.flush].
+// The logger, the OpenTelemetry SDK, and the position of the hooks that hand
+// both back. The SDK is built here and nowhere else: every component in this
+// tree takes a [telemetry.Telemetry] and describes its own work through it, and
+// which providers carry that — the real exporters, or OpenTelemetry's no-ops
+// when there is nowhere to export to — is this package's decision and is made
+// from the environment. See [Telemetry], which is also where the shutdown
+// ordering is argued in full.
 package fxmod

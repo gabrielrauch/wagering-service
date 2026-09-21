@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"encoding/json"
+
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -36,6 +38,17 @@ const (
 	// FOR UPDATE SKIP LOCKED keeps publishers off each other: a row another
 	// publisher is claiming in this instant is passed over rather than waited
 	// for. The order matches outbox_due_idx.
+	//
+	// The payload comes back WITHOUT the trace member the adapter wrote into
+	// it, and the member comes back beside it. That split is what keeps the
+	// published contract exactly what it was: the body a publisher sends is the
+	// envelope and nothing else, so a downstream consumer reading it strictly
+	// is not broken by a member it has never heard of, while the trace the
+	// operation was submitted under still reaches the publisher — which is the
+	// whole reason it was stored. See traceMember in outbox.go.
+	//
+	// The cast on the operand is not decoration: jsonb has both `- text` and
+	// `- integer`, and an untyped literal makes the operator ambiguous.
 	claimOutbox = `UPDATE wagering.outbox SET ` +
 		`claimed_by = $1, claimed_at = $2, claim_expires_at = $3, attempts = attempts + 1 ` +
 		`WHERE event_id IN (` +
@@ -47,7 +60,24 @@ const (
 		`AND p.aggregate_sequence < o.aggregate_sequence) ` +
 		`ORDER BY o.next_attempt_at, o.sequence FOR UPDATE SKIP LOCKED LIMIT $4) ` +
 		`RETURNING event_id, aggregate_id, aggregate_sequence, event_type, event_version, ` +
-		`payload, attempts`
+		`payload - '` + traceMember + `'::text, payload -> '` + traceMember + `', ` +
+		`occurred_at, attempts`
+
+	// How far behind the outbox is: when the oldest thing nobody has published
+	// yet happened.
+	//
+	// min() over a partial index rather than a column of its own. The only
+	// index that covers `published_at IS NULL` is outbox_due_idx, so this scans
+	// the UNPUBLISHED rows and nothing else — which is the backlog, and is
+	// normally near zero. It is asked once per metric collection interval
+	// rather than once per turn, because it exists to be a gauge and not a
+	// decision.
+	//
+	// NULL when there is nothing waiting, which the caller reports as no lag
+	// rather than as zero seconds of it; the two are the same number and
+	// different facts, and only one of them should be distinguishable from a
+	// query that failed.
+	oldestUnpublished = `SELECT min(occurred_at) FROM wagering.outbox WHERE published_at IS NULL`
 
 	// The claim is released along with the publication, so a published row
 	// carries no stale holder for an operator to wonder about.
@@ -97,6 +127,16 @@ type ClaimedEvent struct {
 	EventType         string
 	EventVersion      int
 	Payload           []byte
+	// Trace is the trace context the command that produced this event ran
+	// under, as the propagator wrote it — a traceparent, and whatever else was
+	// being carried. Empty for an event written by a process with telemetry
+	// switched off, and for every event written before this existed.
+	//
+	// It is not in Payload and never was on the wire: see traceMember.
+	Trace map[string]string
+	// OccurredAt is when the event happened, which is what the outbox lag is
+	// measured from.
+	OccurredAt time.Time
 	// Attempts counts this claim, so the first delivery reports one. A
 	// publisher deciding how long to back off reads it as "how many times has
 	// this been tried", which is the number it wants.
@@ -171,10 +211,20 @@ func (c *OutboxClaims) Claim(ctx context.Context, req ClaimRequest) ([]ClaimedEv
 		var (
 			event        ClaimedEvent
 			id, walletID pgtype.UUID
+			carried      []byte
 		)
 		if err := rows.Scan(&id, &walletID, &event.AggregateSequence, &event.EventType,
-			&event.EventVersion, &event.Payload, &event.Attempts); err != nil {
+			&event.EventVersion, &event.Payload, &carried, &event.OccurredAt,
+			&event.Attempts); err != nil {
 			return nil, fail(what, err)
+		}
+		if len(carried) > 0 {
+			// A member this process cannot read is dropped rather than failing
+			// the claim. The consequence is an event published outside the
+			// trace it belonged to, which is a worse morning for somebody; a
+			// refusal here would be a wallet's whole event stream stopped over
+			// a telemetry field.
+			_ = json.Unmarshal(carried, &event.Trace)
 		}
 		event.EventID = idFrom[app.EventID](id)
 		event.AggregateID = idFrom[wagering.WalletID](walletID)
@@ -184,6 +234,29 @@ func (c *OutboxClaims) Claim(ctx context.Context, req ClaimRequest) ([]ClaimedEv
 		return nil, fail(what, err)
 	}
 	return claimed, nil
+}
+
+// OldestUnpublished reports when the oldest event nobody has published yet
+// happened, and whether there was one.
+//
+// It is the outbox lag, before it is turned into a duration. The instant rather
+// than the age, because the age depends on a clock and this package has no
+// opinion about which one — the caller reads the same clock everything else in
+// its process reads, and a query that returned an age would have used the
+// database's.
+//
+// A false is an empty outbox and not an error. It is reported apart from a
+// failure deliberately: a gauge that recorded zero for both would say the
+// backlog is clear at the exact moment the database has stopped answering.
+func (c *OutboxClaims) OldestUnpublished(ctx context.Context) (time.Time, bool, error) {
+	var oldest pgtype.Timestamptz
+	if err := c.pool.QueryRow(ctx, oldestUnpublished).Scan(&oldest); err != nil {
+		return time.Time{}, false, fail("read the outbox lag", err)
+	}
+	if !oldest.Valid {
+		return time.Time{}, false, nil
+	}
+	return oldest.Time, true, nil
 }
 
 // MarkPublished records that one event has been sent and releases its claim,

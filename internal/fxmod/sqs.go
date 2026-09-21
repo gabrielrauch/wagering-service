@@ -11,6 +11,7 @@ import (
 	"github.com/gabrielrauch/wagering-service/internal/adapters/sqs"
 	"github.com/gabrielrauch/wagering-service/internal/app"
 	"github.com/gabrielrauch/wagering-service/internal/config"
+	"github.com/gabrielrauch/wagering-service/internal/telemetry"
 )
 
 // The two queues, as two types.
@@ -92,11 +93,15 @@ func SQS() fx.Option {
 // there because that chain reaches the instance metadata service on an EC2
 // host, and an address that is black-holed rather than refused would otherwise
 // hang start-up with nothing to report.
-func newSQSClient(cfg config.SQS) (*awssqs.Client, error) {
+func newSQSClient(cfg config.SQS, reporting *telemetry.Telemetry) (*awssqs.Client, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.ClientTimeout)
 	defer cancel()
 
-	return sqs.NewClient(ctx, sqs.ClientConfig{Region: cfg.Region, Endpoint: cfg.Endpoint})
+	return sqs.NewClient(ctx, sqs.ClientConfig{
+		Region:    cfg.Region,
+		Endpoint:  cfg.Endpoint,
+		Telemetry: reporting,
+	})
 }
 
 // newInboundQueue wires the queue the consumer receives on, and makes resolving

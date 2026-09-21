@@ -324,6 +324,57 @@ func TestTheWorkerStartsAndStopsAgainstTheRealStack(t *testing.T) {
 	}
 }
 
+// TestTheSDKIsShutDownAfterThePoolOnTheRealGraph is the ordering assertion made
+// against everything, rather than against the stand-in the unit test uses.
+//
+// The unit test proves the mechanism: a hook appended by a module declared
+// after the telemetry module runs before the SDK's. This one proves it holds
+// with the real graph in front of it — three loops, a pool, two queues and
+// whatever order Fx happened to build them in.
+//
+// The collector is a port nothing is listening on, deliberately. otlptracegrpc
+// dials lazily, so the exports fail in the background and are reported as
+// warnings, and the process starts, works and stops anyway — which is the other
+// half of what this test is for: telemetry must never be the reason a
+// deployment fails.
+func TestTheSDKIsShutDownAfterThePoolOnTheRealGraph(t *testing.T) {
+	requireDatabase(t)
+	requireQueues(t)
+
+	cfg := loaded(t, map[string]string{
+		"OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:1",
+		// Short, because two providers are flushed against a collector that
+		// will never answer and the budget is what bounds the wait.
+		"TELEMETRY_SHUTDOWN_TIMEOUT": "1s",
+		"SQS_VISIBILITY_TIMEOUT":     "3s",
+	})
+	recorded := &hooks{}
+
+	app := fxtest.New(t, Worker(cfg), fx.WithLogger(recorded.logger))
+	app.RequireStart()
+	app.RequireStop()
+
+	closed := recorded.ranStop(t, "newPool")
+	flushed := recorded.ranStop(t, "newLogger")
+	for _, provider := range []string{"newTracerProvider", "newMeterProvider"} {
+		at := recorded.ranStop(t, provider)
+		if at < closed {
+			t.Errorf("%s was shut down before the pool closed; the shutdown was %v",
+				provider, recorded.shutdown())
+		}
+		if at > flushed {
+			t.Errorf("%s was shut down after the last line was written; the shutdown was %v",
+				provider, recorded.shutdown())
+		}
+	}
+	// A flush that could not reach the collector is a warning and not a failed
+	// hook: a deployment must not exit non-zero because its observability did.
+	for _, failure := range recorded.failures() {
+		t.Errorf("a hook failed against an unreachable collector: %s: %v",
+			failure.caller, failure.err)
+	}
+}
+
 // TestTheAPIStartsAndStopsAgainstTheRealStack is the start-and-stop proof for
 // cmd/api.
 //

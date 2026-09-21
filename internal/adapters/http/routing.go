@@ -1,6 +1,12 @@
 package httpapi
 
-import "net/http"
+import (
+	"net/http"
+	"strings"
+
+	semconv "go.opentelemetry.io/otel/semconv/v1.38.0"
+	"go.opentelemetry.io/otel/trace"
+)
 
 // routes registers every pattern this service answers.
 //
@@ -119,11 +125,44 @@ func (w *routed) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 // dispatched marks the writer as belonging to a route that matched, which is
 // the whole of how [routed] tells a handler's 404 from the mux's.
+//
+// It also names the request's span, and this is the only place that can. The
+// span is opened by otelhttp before the mux has matched anything, so the only
+// name available to it is the method and the raw path — and the raw path
+// carries wallet ids, transaction ids and external transaction ids, which would
+// make one span name per wallet and a trace backend that indexes names into a
+// list nobody can read. Here the PATTERN is known, so the span is renamed to
+// the route: "GET /wallets/{walletId}", one name per route, for ever.
+//
+// The pattern is the span name unaltered, because net/http writes it as
+// "GET /wallets/{walletId}" — method, space, template — which is already
+// OpenTelemetry's own convention for naming an HTTP server span. Composing the
+// method in front of it was the first version of this line and produced
+// "GET GET /wallets/{walletId}".
+//
+// A request that reaches no route keeps [telemetry.SpanRequest], which is the
+// honest answer: nothing matched, so there is no route to name.
 func dispatched(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if rw, ok := w.(*routed); ok {
 			rw.matched = true
 		}
+		if span := trace.SpanFromContext(r.Context()); span.IsRecording() {
+			span.SetName(r.Pattern)
+			span.SetAttributes(semconv.HTTPRoute(routeOf(r.Pattern)))
+		}
 		h.ServeHTTP(w, r)
 	})
+}
+
+// routeOf is the path template out of a registered pattern.
+//
+// net/http writes a pattern as "[METHOD ][HOST]/path", and http.route is the
+// path alone: it is what a dashboard groups by, and a route that carried the
+// method would be two series for one endpoint answered two ways.
+func routeOf(pattern string) string {
+	if _, path, found := strings.Cut(pattern, " "); found {
+		return path
+	}
+	return pattern
 }

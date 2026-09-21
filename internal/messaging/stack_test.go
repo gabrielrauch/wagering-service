@@ -20,6 +20,7 @@ import (
 	"github.com/gabrielrauch/wagering-service/internal/adapters/sqs"
 	"github.com/gabrielrauch/wagering-service/internal/app"
 	"github.com/gabrielrauch/wagering-service/internal/domain/wagering"
+	"github.com/gabrielrauch/wagering-service/internal/telemetry"
 	"github.com/gabrielrauch/wagering-service/internal/workers"
 )
 
@@ -80,6 +81,9 @@ type stackOptions struct {
 	// varied by exactly one scenario, which needs the wait to END rather than
 	// to outlast a shutdown.
 	lockTimeout time.Duration
+	// telemetry is where a command reports, and is nil for every scenario that
+	// is not about the trace. See [withTelemetry].
+	telemetry *telemetry.Telemetry
 }
 
 type stackOption func(*stackOptions)
@@ -100,6 +104,17 @@ func withReferenceSchedule(p app.BackoffPolicy) stackOption {
 // before PostgreSQL refuses it.
 func withLockTimeout(d time.Duration) stackOption {
 	return func(o *stackOptions) { o.lockTimeout = d }
+}
+
+// withTelemetry gives the transaction manager somewhere to report, which is
+// what puts the trace context into the outbox rows a command writes.
+//
+// Nil for every other scenario here, and that is the point of it being an
+// option: a suite about ordering, idempotency and drains should not be
+// producing spans nobody reads, and the one scenario that IS about the trace
+// says so by asking for this.
+func withTelemetry(reporting *telemetry.Telemetry) stackOption {
+	return func(o *stackOptions) { o.telemetry = reporting }
 }
 
 // newStack wires the service onto a freshly migrated database.
@@ -151,6 +166,7 @@ func newStack(t *testing.T, opts ...stackOption) *stack {
 		Pool:             pool,
 		LockTimeout:      settings.lockTimeout,
 		StatementTimeout: stackStatementTimeout,
+		Telemetry:        settings.telemetry,
 	})
 	if err != nil {
 		t.Fatalf("new transaction manager: %v", err)
@@ -647,6 +663,9 @@ type publisherSettings struct {
 	// batch is how many events one turn claims. Zero takes the worker's own
 	// default of ten.
 	batch int
+	// telemetry is where a publish reports. Nil for every scenario that is not
+	// about the trace.
+	telemetry *telemetry.Telemetry
 }
 
 // startPublisher wires and starts an outbox publisher.
@@ -655,14 +674,15 @@ func startPublisher(
 ) *workers.Publisher {
 	t.Helper()
 	publisher, err := workers.NewPublisher(workers.PublisherConfig{
-		Outbox:   s.claims,
-		Queue:    queue,
-		Clock:    wallClock{},
-		Name:     settings.name,
-		Batch:    settings.batch,
-		Hold:     settings.hold,
-		Interval: 100 * time.Millisecond,
-		Logger:   s.logs.logger,
+		Outbox:    s.claims,
+		Queue:     queue,
+		Clock:     wallClock{},
+		Name:      settings.name,
+		Batch:     settings.batch,
+		Hold:      settings.hold,
+		Interval:  100 * time.Millisecond,
+		Logger:    s.logs.logger,
+		Telemetry: settings.telemetry,
 	})
 	if err != nil {
 		t.Fatalf("wire the publisher %s: %v", settings.name, err)

@@ -8,8 +8,12 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	oteltrace "go.opentelemetry.io/otel/trace"
+
 	"github.com/gabrielrauch/wagering-service/internal/app"
 	"github.com/gabrielrauch/wagering-service/internal/faults"
+	"github.com/gabrielrauch/wagering-service/internal/telemetry"
 )
 
 // What a [ReferenceConfig] leaves open.
@@ -53,6 +57,10 @@ type ReferenceConfig struct {
 	DrainTimeout time.Duration
 	// Logger is where the worker reports what it did. Required.
 	Logger *slog.Logger
+	// Telemetry is where a resume turn is traced and counted. Optional: nil is
+	// [telemetry.Disabled], and a worker built without it behaves exactly as it
+	// did before there was any.
+	Telemetry *telemetry.Telemetry
 }
 
 // ReferenceWorker carries operations that are waiting for a reference forward.
@@ -85,6 +93,7 @@ type ReferenceWorker struct {
 	drain     time.Duration
 	backoff   Backoff
 	logger    *slog.Logger
+	telemetry *telemetry.Telemetry
 
 	mu      sync.Mutex
 	started bool
@@ -138,6 +147,7 @@ func NewReferenceWorker(cfg ReferenceConfig) (*ReferenceWorker, error) {
 		drain:     orDefaultDuration(cfg.DrainTimeout, defaultDrainTimeout),
 		backoff:   backoff,
 		logger:    cfg.Logger,
+		telemetry: telemetry.Or(cfg.Telemetry),
 	}, nil
 }
 
@@ -234,8 +244,30 @@ func (w *ReferenceWorker) run(ctx context.Context) {
 }
 
 // turn is one call to the resume door, and reports whether it claimed anything.
+//
+// Every turn opens a span, including the ones that claim nothing, and that is
+// worth being deliberate about: a worker polling once a second produces
+// eighty-six thousand spans a day saying "nothing was due". They are cheap
+// because they are short and carry two attributes, they are what makes "the
+// reference worker stopped looking" visible at all, and a deployment that finds
+// them too many has a sampler for exactly this — which is a collector's
+// decision rather than one this loop should make by not reporting.
 func (w *ReferenceWorker) turn(ctx context.Context) (bool, error) {
-	outcome, err := w.wagering.Resume(ctx, w.principal)
+	ctx, resuming := w.telemetry.Start(ctx, telemetry.SpanResume,
+		oteltrace.WithAttributes(attribute.String("worker", w.name)))
+	defer resuming.End()
+
+	// The use case is a span of its own inside the turn's, so a resumed
+	// operation reads turn, resume, transaction, statement — the same shape the
+	// other two doors produce. The turn is what says how often this worker
+	// looked; the call is what says how long the application layer took.
+	useCase, call := w.telemetry.Start(ctx, telemetry.SpanResumeUseCase,
+		oteltrace.WithSpanKind(oteltrace.SpanKindInternal))
+	outcome, err := w.wagering.Resume(useCase, w.principal)
+	if err != nil {
+		w.telemetry.Failed(call, string(app.ClassOf(err)))
+	}
+	call.End()
 	if err != nil {
 		if ctx.Err() != nil {
 			// The worker is stopping. Reported as a failure so the loop stops
@@ -244,6 +276,7 @@ func (w *ReferenceWorker) turn(ctx context.Context) (bool, error) {
 			return false, err
 		}
 		class := app.ClassOf(err)
+		w.telemetry.Failed(resuming, string(class), telemetry.Class(string(class)))
 		attrs := []any{
 			slog.String("worker", w.name),
 			slog.String("class", string(class)),
@@ -269,8 +302,44 @@ func (w *ReferenceWorker) turn(ctx context.Context) (bool, error) {
 	// with its next attempt written. A process killed here must find the
 	// operation again when it comes back.
 	faults.Hit(faults.AfterPendingCommit)
+	w.counted(ctx, resuming, outcome)
 	w.report(ctx, outcome)
 	return true, nil
+}
+
+// counted records what one claimed turn came to.
+//
+// An operation that was RESCHEDULED is not counted as a transaction, and that
+// is the distinction the whole metric rests on: it has reached no answer, it
+// will be looked at again, and counting it would count one operation once per
+// attempt — twenty times, on this service's own default budget. What is counted
+// is a turn that settled something, which happens exactly once per operation.
+//
+// The duration is left at zero. A resume turn's latency is the worker's poll
+// interval plus a transaction, and the interval is a setting rather than a
+// measurement; putting it in the same histogram as a provider's request would
+// make "how long does an operation take" answer a question nobody asked.
+func (w *ReferenceWorker) counted(
+	ctx context.Context, span oteltrace.Span, outcome app.ResumeOutcome,
+) {
+	span.SetAttributes(
+		telemetry.TransactionID(outcome.Result.TransactionID.String()),
+		telemetry.Kind(outcome.Result.Kind.String()),
+		telemetry.Status(outcome.Result.Status.String()),
+		telemetry.FailureCode(outcome.Result.FailureCode.String()),
+		attribute.Bool("rescheduled", outcome.Rescheduled),
+		attribute.Int("woke", outcome.Woke),
+	)
+	if outcome.Rescheduled {
+		return
+	}
+	w.telemetry.RecordOperation(ctx, telemetry.Operation{
+		Source:      telemetry.SourceReference,
+		Kind:        outcome.Result.Kind.String(),
+		Status:      outcome.Result.Status.String(),
+		FailureCode: outcome.Result.FailureCode.String(),
+		Replay:      outcome.Result.IdempotentReplay,
+	})
 }
 
 // report says what one claimed turn came to.

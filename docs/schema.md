@@ -405,6 +405,17 @@ financial aggregate, and it is the natural FIFO group key for a queue.
 Payload is `jsonb`. Money crosses this boundary as a string (`"25.00"`), so there is no
 number for jsonb's handling to touch, and an operator can query it.
 
+**`$trace` is in the payload and is not part of the event.** An operation submitted over HTTP
+and the event it causes have to be one trace, and the outbox is the handover that breaks it:
+the publisher runs minutes later, in another process, with no memory of the request. The
+adapter therefore writes the W3C trace context into the payload under `$trace` — the only
+place a value can be added without a migration — and the claim below takes it back out. A
+`$`-prefixed name cannot collide with an envelope member, every one of which is a camelCase
+identifier, and it reads in `psql` as "this is not part of the document". A row written by a
+process with telemetry switched off has no such member. **Nothing published ever carries it**:
+the claim returns `payload - '$trace'` as the body, so the bytes on the queue are the envelope
+exactly as they were before any of this existed.
+
 **The claim query.** This is the supported way to take work:
 
 ```sql
@@ -426,7 +437,8 @@ WHERE event_id IN (
     FOR UPDATE SKIP LOCKED
     LIMIT $4
 )
-RETURNING event_id, aggregate_id, aggregate_sequence, event_type, payload;
+RETURNING event_id, aggregate_id, aggregate_sequence, event_type, event_version,
+          payload - '$trace'::text, payload -> '$trace', occurred_at, attempts;
 ```
 
 The `NOT EXISTS` is the head-of-line rule: a wallet's second event is not claimable until
@@ -435,7 +447,21 @@ scheduled. `SKIP LOCKED` keeps publishers off each other. A claim expires by **w
 so work abandoned by a crashed publisher returns to the pool visibly rather than waiting on
 a connection that may never close. See **ADR-0008**.
 
+The cast on `- '$trace'` is not decoration: `jsonb` has both `- text` and `- integer`, and an
+untyped literal makes the operator ambiguous.
+
 Cross-aggregate ordering is not guaranteed and is not needed.
+
+**The outbox lag.** How far behind the outbox is, asked once per metric collection interval:
+
+```sql
+SELECT min(occurred_at) FROM wagering.outbox WHERE published_at IS NULL;
+```
+
+It rides on `outbox_due_idx`, which is partial on `published_at IS NULL`, so it scans the
+backlog and nothing else. `NULL` means nothing is waiting, which is reported as *no lag*
+rather than as zero seconds of it — a gauge that reported zero for both would say the outbox
+is clear at the exact moment the database has stopped answering.
 
 ### `failure_code`, `settling_failure_code`, `event_type`
 

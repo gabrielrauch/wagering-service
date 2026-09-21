@@ -9,9 +9,13 @@ package workers
 // envelope's own member names, so that the attribute and the field a reader
 // eventually finds in the body are spelled the same way.
 //
-// This is carriage and nothing more. Wiring these to a tracer is a later task,
-// and a worker that invented a span here would be deciding that task's contract
-// for it.
+// They are the envelope's own two members and nothing else. The W3C trace
+// context rides beside them under the names the propagator writes —
+// "traceparent" and whatever else is being carried — and those names are not
+// restated here, because nothing in this package reads them: the propagator is
+// handed the whole attribute set and takes what it recognises. See
+// [Consumer.consuming], which extracts, and [Publisher.outbound], which
+// injects.
 const (
 	correlationAttribute = "correlationId"
 	causationAttribute   = "causationId"

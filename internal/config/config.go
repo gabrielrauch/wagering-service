@@ -49,18 +49,51 @@ const (
 
 // Telemetry is where this process reports what it is doing.
 type Telemetry struct {
-	// ServiceName names this service in every log line and, once the OpenTelemetry
-	// SDK lands, in the resource attributes of every span and metric.
+	// ServiceName names this service in every log line and in the resource
+	// attributes of every span and every measurement.
 	ServiceName string
 	// LogLevel is the lowest level that is written.
 	LogLevel slog.Level
 	// LogFormat is JSON or text.
 	LogFormat LogFormat
 	// ShutdownTimeout bounds the last thing the process does. It is the budget
-	// a telemetry flush runs under, and a flush that is not bounded holds a
+	// the telemetry flush runs under, and a flush that is not bounded holds a
 	// deployment open on an exporter that is not answering.
 	ShutdownTimeout time.Duration
+
+	// Disabled switches the OpenTelemetry SDK off, whatever else is set.
+	//
+	// It is OTEL_SDK_DISABLED, which is the specification's own name for this,
+	// so that an operator who knows OpenTelemetry does not have to learn a
+	// second spelling for the one variable they are most likely to reach for.
+	Disabled bool
+	// OTLPEndpoint is the collector spans and measurements are exported to, as
+	// a URL — http://host:4317 for plaintext gRPC, https:// for TLS.
+	//
+	// Empty means nothing is exported, and that is a deliberate departure from
+	// the specification, which defaults it to http://localhost:4317. A default
+	// of "somewhere" makes a laptop, a unit test and a CI runner all retry a
+	// connection to a collector nobody started, for ever, in the background of
+	// every run. Empty is the honest statement that there is nowhere to send
+	// telemetry — it is reported once at start-up — and a deployment that wants
+	// it says where.
+	OTLPEndpoint string
+	// ExportTimeout bounds one attempt at exporting a batch. An exporter that
+	// is not answering must not become back pressure on the thing being
+	// measured.
+	ExportTimeout time.Duration
+	// MetricInterval is how often measurements are exported. It is also how
+	// often the outbox lag is asked for, since that one is observed on
+	// collection rather than recorded on a loop.
+	MetricInterval time.Duration
 }
+
+// Exporting reports whether this process has anywhere to send telemetry.
+//
+// Two conditions, one answer, because a caller asking "do I build the SDK"
+// must not have to remember both — and because the two are different
+// sentences for an operator: switched off deliberately, or never told where.
+func (t Telemetry) Exporting() bool { return !t.Disabled && t.OTLPEndpoint != "" }
 
 // Lifecycle bounds the whole of start-up and the whole of shutdown.
 //

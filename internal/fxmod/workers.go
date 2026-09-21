@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"go.uber.org/fx"
 
 	"github.com/gabrielrauch/wagering-service/internal/adapters/postgres"
 	"github.com/gabrielrauch/wagering-service/internal/app"
 	"github.com/gabrielrauch/wagering-service/internal/config"
+	"github.com/gabrielrauch/wagering-service/internal/telemetry"
 	"github.com/gabrielrauch/wagering-service/internal/workers"
 )
 
@@ -29,7 +31,7 @@ func Consumer() fx.Option {
 func Outbox() fx.Option {
 	return fx.Module("outbox",
 		fx.Provide(newPublisher),
-		fx.Invoke(runPublisher),
+		fx.Invoke(runPublisher, observeOutboxLag),
 	)
 }
 
@@ -61,10 +63,12 @@ func newConsumer(
 	queues config.SQS,
 	queue inboundQueue,
 	wagering *app.Wagering,
+	reporting *telemetry.Telemetry,
 	logger *slog.Logger,
 ) (*workers.Consumer, error) {
 	settings := consumerSettings(cfg, queues)
 	settings.Queue, settings.Wagering, settings.Logger = queue, wagering, logger
+	settings.Telemetry = reporting
 	return workers.NewConsumer(settings)
 }
 
@@ -109,12 +113,56 @@ func newPublisher(
 	claims *postgres.OutboxClaims,
 	queue outboundQueue,
 	clock app.Clock,
+	reporting *telemetry.Telemetry,
 	logger *slog.Logger,
 ) (*workers.Publisher, error) {
 	settings := publisherSettings(cfg)
 	settings.Outbox, settings.Queue = claims, queue
 	settings.Clock, settings.Logger = clock, logger
+	settings.Telemetry = reporting
 	return workers.NewPublisher(settings)
+}
+
+// observeOutboxLag reports how old the oldest unpublished event is, from the
+// process that is responsible for draining it.
+//
+// Here and not in [Telemetry], although the lag is a property of the table
+// rather than of this loop. Every replica registering it would report the same
+// global number under a different instance label, and a dashboard would have to
+// know to take the maximum of four identical series; the publisher is the one
+// process whose job the number describes, so it is the one that answers for it.
+// A deployment with the publisher switched off reports no lag, which is honest:
+// nothing in it is draining the outbox.
+//
+// The callback runs on the meter's own collection interval —
+// TELEMETRY_METRIC_INTERVAL — and is unregistered on the way down, before the
+// pool closes, so that the last collection of a shutting-down process does not
+// ask a closed pool and report the failure as an export error.
+func observeOutboxLag(
+	lc fx.Lifecycle,
+	claims *postgres.OutboxClaims,
+	clock app.Clock,
+	reporting *telemetry.Telemetry,
+) error {
+	stop, err := reporting.ObserveOutboxLag(func(ctx context.Context) (time.Duration, error) {
+		oldest, waiting, err := claims.OldestUnpublished(ctx)
+		if err != nil {
+			return 0, err
+		}
+		if !waiting {
+			return 0, nil
+		}
+		// Clamped at nought rather than reported negative. occurred_at comes
+		// from this service's own clock and the comparison is made against
+		// another replica's, so a few milliseconds of skew is ordinary — and a
+		// gauge that goes negative is one somebody writes an alert around.
+		return max(clock.Now().Sub(oldest), 0), nil
+	})
+	if err != nil {
+		return err
+	}
+	lc.Append(fx.Hook{OnStop: func(context.Context) error { return stop() }})
+	return nil
 }
 
 // publisherSettings is the configuration half of the publisher's wiring.
@@ -146,10 +194,12 @@ func runPublisher(lc fx.Lifecycle, publisher *workers.Publisher) {
 // audit trail alone, so it is stable rather than per-process: a row's trail
 // should name the job and not whichever replica happened to run the turn.
 func newReferenceWorker(
-	cfg config.Reference, wagering *app.Wagering, logger *slog.Logger,
+	cfg config.Reference, wagering *app.Wagering,
+	reporting *telemetry.Telemetry, logger *slog.Logger,
 ) (*workers.ReferenceWorker, error) {
 	settings := referenceSettings(cfg)
 	settings.Wagering, settings.Logger = wagering, logger
+	settings.Telemetry = reporting
 	return workers.NewReferenceWorker(settings)
 }
 

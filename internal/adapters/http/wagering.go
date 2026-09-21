@@ -6,6 +6,7 @@ import (
 	"github.com/gabrielrauch/wagering-service/internal/app"
 	"github.com/gabrielrauch/wagering-service/internal/domain/failure"
 	"github.com/gabrielrauch/wagering-service/internal/domain/wagering"
+	"github.com/gabrielrauch/wagering-service/internal/telemetry"
 )
 
 // idempotencyKeyHeader carries the provider's key for a submission.
@@ -38,7 +39,15 @@ func (a *API) submitOperation(w http.ResponseWriter, r *http.Request, principal 
 		return
 	}
 
-	result, err := a.wagering.Submit(r.Context(), app.SubmitOperation{
+	// The provider is named on the span before the call, because a submission
+	// that is refused for a provider this caller may not act as never reaches
+	// the result below. The idempotency key is NOT: it is a provider's own
+	// secret-shaped string, it is hashed into the transaction, and a trace is
+	// not where one belongs.
+	describe(r, telemetry.ProviderID(body.Provider), telemetry.Kind(body.Kind))
+
+	ctx, done := a.usecase(r, telemetry.SpanSubmit)
+	result, err := a.wagering.Submit(ctx, app.SubmitOperation{
 		Principal:   principal,
 		Correlation: correlationFrom(r.Context()),
 		// Inbox is nil: an HTTP request is not a queue message, has no message
@@ -56,11 +65,14 @@ func (a *API) submitOperation(w http.ResponseWriter, r *http.Request, principal 
 			ReferenceExternalTransactionID: body.ReferenceExternalTransactionID,
 		},
 	})
-	if err != nil {
-		a.fail(w, r, err)
+	if err == nil {
+		a.applied(ctx, result, done(nil))
+		describe(r, telemetry.TransactionID(result.TransactionID.String()))
+		a.submitted(w, r, result)
 		return
 	}
-	a.submitted(w, r, result)
+	done(err)
+	a.fail(w, r, err)
 }
 
 // readOperation reads one operation by this system's identifier for it.
@@ -76,7 +88,11 @@ func (a *API) readOperation(w http.ResponseWriter, r *http.Request, principal ap
 		a.fail(w, r, err)
 		return
 	}
-	result, err := a.wagering.TransactionByID(r.Context(), principal, id)
+	describe(r, telemetry.TransactionID(id.String()))
+
+	ctx, done := a.usecase(r, telemetry.SpanTransactionByID)
+	result, err := a.wagering.TransactionByID(ctx, principal, id)
+	done(err)
 	if err != nil {
 		a.fail(w, r, err)
 		return
@@ -112,10 +128,19 @@ func (a *API) readProviderOperation(
 		a.fail(w, r, err)
 		return
 	}
-	result, err := a.wagering.TransactionByExternalID(r.Context(), principal, provider, external)
+	// The provider is named; the provider's own identifier for the operation is
+	// not. An external id is a competitor's vocabulary — it is the thing this
+	// route refuses to be an oracle for — and a trace that carried every one
+	// somebody asked about would be that oracle by another road.
+	describe(r, telemetry.ProviderID(provider.String()))
+
+	ctx, done := a.usecase(r, telemetry.SpanTransactionByExternalID)
+	result, err := a.wagering.TransactionByExternalID(ctx, principal, provider, external)
+	done(err)
 	if err != nil {
 		a.fail(w, r, err)
 		return
 	}
+	describe(r, telemetry.TransactionID(result.TransactionID.String()))
 	a.read(w, r, result)
 }

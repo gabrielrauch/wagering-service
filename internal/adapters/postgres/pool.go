@@ -7,11 +7,13 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/gabrielrauch/wagering-service/internal/telemetry"
 )
 
 // PoolConfig is what a connection pool is built from.
 //
-// It is deliberately three fields. Everything else pgx can be told is either a
+// It is deliberately small. Everything else pgx can be told is either a
 // property of the server, which belongs in the DSN where an operator can change
 // it without a deployment, or a default that has never needed changing here.
 type PoolConfig struct {
@@ -28,6 +30,14 @@ type PoolConfig struct {
 	// ConnectTimeout bounds opening a connection, so a server that accepts the
 	// TCP connection and then says nothing cannot hold a command indefinitely.
 	ConnectTimeout time.Duration
+	// Telemetry is where each statement is reported. Optional: nil is
+	// [telemetry.Disabled], and a pool built without it runs exactly as it did
+	// before there was any.
+	//
+	// It becomes pgx's QueryTracer, which is the only hook that sees a
+	// statement start and finish. See [queryTracer] for the one rule that hook
+	// is written to: the arguments are never recorded.
+	Telemetry *telemetry.Telemetry
 }
 
 // NewPool opens the connection pool every other type here is built from.
@@ -53,6 +63,7 @@ func NewPool(ctx context.Context, cfg PoolConfig) (*pgxpool.Pool, error) {
 	}
 	parsed.MaxConns = cfg.MaxConns
 	parsed.ConnConfig.ConnectTimeout = cfg.ConnectTimeout
+	parsed.ConnConfig.Tracer = queryTracer{telemetry: telemetry.Or(cfg.Telemetry)}
 
 	pool, err := pgxpool.NewWithConfig(ctx, parsed)
 	if err != nil {

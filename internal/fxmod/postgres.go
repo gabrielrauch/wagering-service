@@ -9,6 +9,7 @@ import (
 
 	"github.com/gabrielrauch/wagering-service/internal/adapters/postgres"
 	"github.com/gabrielrauch/wagering-service/internal/config"
+	"github.com/gabrielrauch/wagering-service/internal/telemetry"
 )
 
 // Postgres is the database this service's state lives in: the pool, the
@@ -47,7 +48,9 @@ func Postgres() fx.Option {
 // prevents is concrete: a publisher hands back its outbox claims from inside
 // its own Stop, and a pool closed first turns that into a wallet's whole event
 // stream waiting out a claim hold.
-func newPool(lc fx.Lifecycle, cfg config.Postgres, logger *slog.Logger) (*pgxpool.Pool, error) {
+func newPool(
+	lc fx.Lifecycle, cfg config.Postgres, reporting *telemetry.Telemetry, logger *slog.Logger,
+) (*pgxpool.Pool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.ConnectTimeout)
 	defer cancel()
 
@@ -55,6 +58,7 @@ func newPool(lc fx.Lifecycle, cfg config.Postgres, logger *slog.Logger) (*pgxpoo
 		DSN:            cfg.DSN,
 		MaxConns:       cfg.MaxConns,
 		ConnectTimeout: cfg.ConnectTimeout,
+		Telemetry:      reporting,
 	})
 	if err != nil {
 		return nil, err
@@ -83,11 +87,14 @@ func (p *pools) close(ctx context.Context) error {
 
 // newTxManager wires the transaction manager the application layer opens every
 // command inside.
-func newTxManager(pool *pgxpool.Pool, cfg config.Postgres) (*postgres.TxManager, error) {
+func newTxManager(
+	pool *pgxpool.Pool, cfg config.Postgres, reporting *telemetry.Telemetry,
+) (*postgres.TxManager, error) {
 	return postgres.NewTxManager(postgres.TxConfig{
 		Pool:             pool,
 		LockTimeout:      cfg.LockTimeout,
 		StatementTimeout: cfg.StatementTimeout,
+		Telemetry:        reporting,
 	})
 }
 

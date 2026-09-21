@@ -3,14 +3,21 @@
 package postgres
 
 import (
+	"context"
+	"encoding/json"
 	"slices"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"github.com/gabrielrauch/wagering-service/internal/app"
 	"github.com/gabrielrauch/wagering-service/internal/domain/wagering"
+	"github.com/gabrielrauch/wagering-service/internal/telemetry"
 )
 
 // The hold every claim in these tests takes. Long enough that nothing expires
@@ -495,4 +502,196 @@ func TestPublishersClaimingAtOnceNeverTakeTheSameEvent(t *testing.T) {
 		t.Fatalf("%d events were claimed between them, wanted the head of each of %d wallets",
 			len(taken), wallets)
 	}
+}
+
+// TestTheClaimReturnsTheTraceBesideTheEnvelopeAndNotInsideIt is the SQL half of
+// the outbox's trace carriage.
+//
+// The adapter writes the trace into the payload because there is no column for
+// it and no migration here to add one, and the claim takes it back out —
+// `payload - '$trace'` as the body, `payload -> '$trace'` beside it. That
+// projection is what keeps the published contract exactly what it was: the
+// bytes a publisher sends are the envelope, so a downstream consumer reading
+// the body strictly is not broken by a member it has never heard of.
+//
+// Both halves have to hold together, and only one of them is visible in Go.
+// An operator dropping the `- '$trace'` would publish a telemetry field to
+// every consumer; dropping the `-> '$trace'` would publish nothing and silently
+// end every trace at the outbox. Neither shows up anywhere else.
+func TestTheClaimReturnsTheTraceBesideTheEnvelopeAndNotInsideIt(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	// Opened at nought, so it emits no events of its own: the outbox is
+	// head-of-line per wallet, and an opening pair ahead of the event under
+	// test would be all the claim ever returned.
+	wallet := w.openWallet(t, "player-traced-claim", "0.00", "BRL")
+
+	// The row is written through the real adapter, inside a transaction the
+	// manager opened under a span — which is exactly how a command writes one.
+	spans := tracetest.NewSpanRecorder()
+	reporting, err := telemetry.New(telemetry.Config{
+		TracerProvider: sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spans)),
+		Propagator:     propagation.TraceContext{},
+	})
+	if err != nil {
+		t.Fatalf("build the telemetry: %v", err)
+	}
+	manager, err := NewTxManager(TxConfig{
+		Pool:             w.app,
+		LockTimeout:      testLockTimeout,
+		StatementTimeout: testStatementTimeout,
+		Telemetry:        reporting,
+	})
+	if err != nil {
+		t.Fatalf("new transaction manager: %v", err)
+	}
+
+	// The span an HTTP request would have opened, so that what is asserted is
+	// the trace a command inherited rather than one the manager rooted itself.
+	requestCtx, request := reporting.Start(t.Context(), "POST /wagering/transactions")
+	defer request.End()
+
+	envelope := anOutboxEnvelope(t, wallet.ID())
+	var traced oteltrace.TraceID
+	err = manager.WithinMovement(requestCtx, func(ctx context.Context, r *app.Repos) error {
+		traced = oteltrace.SpanContextFromContext(ctx).TraceID()
+		return r.Outbox.Append(ctx, []app.Envelope{envelope})
+	})
+	if err != nil {
+		t.Fatalf("append an event: %v", err)
+	}
+	if !traced.IsValid() {
+		t.Fatal("the transaction ran in no trace, so this test cannot mean anything")
+	}
+
+	// The row itself carries the member, which is the only reason the publisher
+	// can ever see it.
+	if got := w.jsonField(t, envelope.EventID, traceMember); got == "" {
+		t.Fatalf("the stored payload carries no %s member", traceMember)
+	}
+
+	claimed := w.claim(t, w.claims(t), "publisher-traced", 10, at(20))
+	var found *ClaimedEvent
+	for i := range claimed {
+		if claimed[i].EventID == envelope.EventID {
+			found = &claimed[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("the claim did not return event %s", envelope.EventID)
+	}
+
+	// Beside the envelope.
+	if found.Trace["traceparent"] == "" {
+		t.Errorf("the claim returned no carried trace: %v", found.Trace)
+	}
+	continued := oteltrace.SpanContextFromContext(reporting.Extract(t.Context(), found.Trace))
+	if got := continued.TraceID(); got != traced {
+		t.Errorf("the claim carries trace %s, wanted the transaction's %s", got, traced)
+	}
+	if got := request.SpanContext().TraceID(); got != traced {
+		t.Errorf("the transaction ran in trace %s and the request in %s; a command's "+
+			"transaction is a level of the request's trace", traced, got)
+	}
+
+	// The transaction is a span of its own, under the request's. Without it the
+	// trace still reaches the outbox — the request's context does that on its
+	// own — and the level that says how long the wallet lock was held is simply
+	// missing, which is the child span the task asks for and the one a reader
+	// looking at a slow submission wants.
+	movement := endedSpan(t, spans, telemetry.SpanMovement)
+	if movement == nil {
+		t.Fatalf("no %s span finished; the transaction opened none", telemetry.SpanMovement)
+	}
+	if got := movement.Parent().SpanID(); got != request.SpanContext().SpanID() {
+		t.Errorf("the transaction's span hangs off %s, wanted the request's %s",
+			got, request.SpanContext().SpanID())
+	}
+
+	// And not inside it.
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(found.Payload, &members); err != nil {
+		t.Fatalf("the claimed payload is not JSON: %v\n%s", err, found.Payload)
+	}
+	if _, present := members[traceMember]; present {
+		t.Errorf("the claimed body still carries %s, so it would be published:\n%s",
+			traceMember, found.Payload)
+	}
+	if _, present := members["eventId"]; !present {
+		t.Errorf("the claimed body is not an envelope:\n%s", found.Payload)
+	}
+
+	// occurred_at comes back too, because the outbox lag is measured from it.
+	if !found.OccurredAt.Equal(envelope.OccurredAt) {
+		t.Errorf("the claim reports the event happened at %s, wanted %s",
+			found.OccurredAt, envelope.OccurredAt)
+	}
+}
+
+// TestTheOutboxLagIsTheAgeOfTheOldestUnpublishedEvent pins the gauge's query.
+//
+// It is the one number that says whether the outbox is draining, and because
+// the outbox is head-of-line per wallet it also bounds how far behind any one
+// wallet's event stream has fallen. An empty outbox is told apart from a query
+// that failed, because a gauge reporting zero for both would say the backlog is
+// clear at the exact moment nothing is answering.
+func TestTheOutboxLagIsTheAgeOfTheOldestUnpublishedEvent(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	claims := w.claims(t)
+
+	if _, waiting, err := claims.OldestUnpublished(t.Context()); err != nil || waiting {
+		t.Fatalf("an empty outbox reports waiting=%v, err=%v", waiting, err)
+	}
+
+	wallet := w.openWallet(t, "player-lag", "100.00", "BRL")
+	rows := w.outboxRows(t, wallet.ID())
+	if len(rows) == 0 {
+		t.Fatal("opening a funded wallet wrote no outbox rows")
+	}
+
+	oldest, waiting, err := claims.OldestUnpublished(t.Context())
+	if err != nil {
+		t.Fatalf("read the outbox lag: %v", err)
+	}
+	if !waiting {
+		t.Fatal("the outbox holds unpublished rows and reports nothing waiting")
+	}
+
+	// Everything published: the backlog is empty again, and that is reported as
+	// nothing waiting rather than as an age of nought.
+	for _, row := range rows {
+		w.markPublished(t, claims, row.eventID, at(30))
+	}
+	if _, waiting, err := claims.OldestUnpublished(t.Context()); err != nil || waiting {
+		t.Fatalf("a drained outbox reports waiting=%v, err=%v (oldest was %s)",
+			waiting, err, oldest)
+	}
+}
+
+// anOutboxEnvelope is one event to append, of the shape the application layer
+// produces.
+func anOutboxEnvelope(t *testing.T, wallet wagering.WalletID) app.Envelope {
+	t.Helper()
+	return app.Envelope{
+		EventID:       app.NewEventID(),
+		EventType:     "WalletBalanceChanged",
+		EventVersion:  1,
+		AggregateType: "WALLET",
+		AggregateID:   wallet,
+		CorrelationID: "thread-traced",
+		OccurredAt:    at(19).UTC(),
+		Data:          map[string]string{"walletId": wallet.String()},
+	}
+}
+
+// endedSpan is the first finished span with that name, or nil.
+func endedSpan(t *testing.T, spans *tracetest.SpanRecorder, name string) sdktrace.ReadOnlySpan {
+	t.Helper()
+	for _, span := range spans.Ended() {
+		if span.Name() == name {
+			return span
+		}
+	}
+	return nil
 }

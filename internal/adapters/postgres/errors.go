@@ -201,6 +201,22 @@ func transient(err error) bool {
 	return false
 }
 
+// lockTimeout reports a statement that gave up waiting for a row lock.
+//
+// PostgreSQL raises lock_not_available for it, and nothing else in this system
+// does: the wallet lock is the only lock a command takes, and statement_timeout
+// firing is query_canceled rather than this. That exactness is why it is worth
+// counting on its own — see [TxManager.contention] for what the two contention
+// counts mean apart.
+//
+// The chain is walked rather than the head examined, because by the time this
+// is asked the error has been through [fail] and is a classified error wrapping
+// the driver's.
+func lockTimeout(err error) bool {
+	pgErr, ok := errors.AsType[*pgconn.PgError](err)
+	return ok && pgErr.Code == pgerrcode.LockNotAvailable
+}
+
 // corrupt reports a stored row the domain refused to load.
 //
 // It is Unretryable whatever the refusal's own code says, and classifying it

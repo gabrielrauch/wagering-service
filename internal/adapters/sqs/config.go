@@ -9,6 +9,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
+
+	"github.com/gabrielrauch/wagering-service/internal/telemetry"
 )
 
 // The bounds SQS itself applies, restated here so that a value outside them is
@@ -60,6 +62,10 @@ type ClientConfig struct {
 	// address, so this alone is enough: a queue URL naming a host this process
 	// cannot reach is still usable, because the request never goes there.
 	Endpoint string
+	// Telemetry is where each call against SQS is reported. Optional: nil is
+	// [telemetry.Disabled], and a client built without it behaves exactly as it
+	// did before there was any.
+	Telemetry *telemetry.Telemetry
 }
 
 // NewClient builds the SQS client, resolving credentials from the default
@@ -81,6 +87,7 @@ func NewClient(ctx context.Context, cfg ClientConfig) (*awssqs.Client, error) {
 		if cfg.Endpoint != "" {
 			o.BaseEndpoint = aws.String(cfg.Endpoint)
 		}
+		o.APIOptions = append(o.APIOptions, traced(telemetry.Or(cfg.Telemetry)))
 	}), nil
 }
 
