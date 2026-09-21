@@ -1,8 +1,12 @@
 {
   "realm": "wagering",
+  "displayName": "Wagering (DEVELOPMENT ONLY - placeholder secrets, plain HTTP)",
   "enabled": true,
   "sslRequired": "none",
   "accessTokenLifespan": 300,
+  "attributes": {
+    "deployment.notice": "This realm must never seed a production identity provider. Every client secret in it is the client id with -secret after it, sslRequired is none so that plain HTTP works in a container, and provider-expiring is a fourth valid provider identity that exists only so a test can present an expired token. A production realm is built from this file's shape, never from its values."
+  },
   "roles": {
     "realm": [
       {
@@ -133,7 +137,7 @@
     {
       "clientId": "provider-expiring",
       "name": "Expiring provider",
-      "description": "A provider whose access tokens live one second, so a suite can present a genuinely expired one. A client of its own rather than an override on provider-a, so that no other caller's token is short-lived.",
+      "description": "A provider whose access tokens live five seconds, so a suite can use one and then watch it expire. A client of its own rather than an override on provider-a, so that no other caller's token is short-lived.",
       "enabled": true,
       "protocol": "openid-connect",
       "publicClient": false,
@@ -145,7 +149,7 @@
       "fullScopeAllowed": true,
       "secret": "provider-expiring-secret",
       "attributes": {
-        "access.token.lifespan": "1"
+        "access.token.lifespan": "5"
       },
       "protocolMappers": [
         {

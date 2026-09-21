@@ -43,8 +43,8 @@ const (
 	providerB = "provider-b"
 	// walletService is this system acting for itself, holding the internal role.
 	walletService = "wallet-service"
-	// expiringProvider is a provider whose access tokens live one second. See
-	// [expiredToken].
+	// expiringProvider is a provider whose access tokens live five seconds. See
+	// [shortLivedGrant].
 	expiringProvider = "provider-expiring"
 
 	// discoveryPath is the readiness signal: the realm answering for itself,
@@ -55,16 +55,27 @@ const (
 	certsPath     = "/realms/" + realmName + "/protocol/openid-connect/certs"
 )
 
-// suiteClockSkew is the tolerance the authenticator under test runs with, and
-// it is one second rather than the package's thirty-second default for one
-// reason: the expired-token scenario has to outlive it, and thirty-one seconds
-// of sleep is a suite nobody runs twice.
+// keycloakStartupBudget is how long the container has to import the realm and
+// answer for it. See the note beside the wait strategy.
+const keycloakStartupBudget = 3 * time.Minute
+
+// expiryClockSkew is the tolerance the ONE authenticator that has to outlive a
+// token's expiry runs with.
 //
-// One second is safe here, and the suite measured why rather than assuming it.
-// Keycloak's clock is this host's clock — the container shares it — so "iat" is
-// never in the future and "exp" is never later than the wall clock says. The
-// skew exists for a host whose clock has stepped, and nothing here has one.
-const suiteClockSkew = time.Second
+// One second rather than the package's thirty-second default, because the
+// expired-token scenario has to wait the skew out and thirty-one seconds of
+// sleep is a suite nobody runs twice. It is confined to the stacks that
+// scenario builds, and every other stack here runs on the default, because the
+// skew is not only a bound on "exp": oidc refuses a token whose "iat" is more
+// than the skew in the FUTURE, so a host whose clock had stepped a second
+// behind the container's would fail every test in the suite with "the token was
+// issued in the future" — which reads as a broken realm and is a broken clock,
+// and is exactly the case the thirty-second default was sized for.
+//
+// One second is safe for the two tests that take it, and the suite measured
+// why: Keycloak's clock is this host's clock, so "iat" never runs ahead. The
+// cost of being wrong about that is now two tests rather than fourteen.
+const expiryClockSkew = time.Second
 
 var (
 	// identityBase is the address Keycloak was published on, and so the prefix
@@ -78,8 +89,15 @@ var (
 // startKeycloak brings up the identity provider with the realm imported.
 //
 // The export is the repository's own deploy/keycloak/realm-export.json rather
-// than a fixture of this suite's: it is the file the deployed container
-// imports, and testing a copy of it would test a copy.
+// than a fixture of this suite's, so that the realm under test is the artefact
+// that ships and not a copy of it that could drift.
+//
+// deploy/ holds that file and nothing else today: the compose service that is
+// to import it automatically belongs to a later task and does not exist yet.
+// Until it does, this suite is the only thing that imports the export, and the
+// arguments below — the command, the import path, the bootstrap administrator
+// — are the shape that service will need rather than a description of one that
+// is already written.
 func startKeycloak(ctx context.Context) (testcontainers.Container, error) {
 	export, err := repositoryFile("deploy", "keycloak", "realm-export.json")
 	if err != nil {
@@ -88,10 +106,10 @@ func startKeycloak(ctx context.Context) (testcontainers.Container, error) {
 	container, err := testcontainers.Run(ctx, keycloakImage,
 		testcontainers.WithExposedPorts("8080/tcp"),
 		testcontainers.WithCmd("start-dev", "--import-realm"),
-		// The bootstrap administrator is what a developer logs into the console
-		// with. It is a placeholder, it is never used by this suite, and it is
-		// set here only so that the container this suite runs is the container
-		// deploy/ describes.
+		// The bootstrap administrator is what a developer will log into the
+		// console with. It is a placeholder, it is never used by this suite,
+		// and it is set here so that the container this suite runs is the
+		// container the compose service will have to run.
 		testcontainers.WithEnv(map[string]string{
 			"KC_BOOTSTRAP_ADMIN_USERNAME": "admin",
 			"KC_BOOTSTRAP_ADMIN_PASSWORD": "admin",
@@ -105,13 +123,25 @@ func startKeycloak(ctx context.Context) (testcontainers.Container, error) {
 		// endpoint. Keycloak accepts connections well before the import has
 		// finished, so anything earlier than this would hand the first test a
 		// realm that does not exist yet.
-		testcontainers.WithWaitStrategy(
+		//
+		// AndDeadline, and that is not a stylistic choice. WithWaitStrategy is
+		// WithWaitStrategyAndDeadline(60s, ...), and the deadline becomes a
+		// context timeout wrapped AROUND the inner strategies — so a
+		// WithStartupTimeout longer than it can never take effect, and the real
+		// budget stays sixty seconds however large the inner one is written.
+		// Keycloak boots in about twelve seconds unloaded and was measured at
+		// seventy-three under `go test -race -tags integration ./...`, where it
+		// competes with three other container suites for the same cores; at the
+		// implicit sixty that failed two runs in three.
+		testcontainers.WithWaitStrategyAndDeadline(keycloakStartupBudget,
 			wait.ForHTTP(discoveryPath).
 				WithPort("8080/tcp").
-				WithStartupTimeout(3*time.Minute)),
+				WithStartupTimeout(keycloakStartupBudget)),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("start keycloak: %w", err)
+		// The container is returned beside the error, because Run hands one
+		// back even when the wait failed and it is the caller's to terminate.
+		return container, fmt.Errorf("start keycloak: %w", err)
 	}
 	host, err := container.Host(ctx)
 	if err != nil {
@@ -143,19 +173,34 @@ func issuerURL() string { return identityBase + "/realms/" + realmName }
 // and refuses redirects.
 var identityClient = &http.Client{Timeout: 10 * time.Second}
 
-// authenticator is the one [oidc.Authenticator] every stack in this package
-// shares.
+// The two [oidc.Authenticator]s this package has, each shared by every stack
+// that asks for it.
 //
-// One rather than one per test, and that is the honest wiring as well as the
+// Shared rather than one per test, and that is the honest wiring as well as the
 // fast one: the authenticator holds the key cache, which is process-wide in the
 // service too, and giving each test a private one would mean no test ever
 // exercised a cache that had already been used.
-var authenticator = sync.OnceValues(func() (*oidc.Authenticator, error) {
+//
+// Two rather than one because of the skew above. Twelve of the fourteen tests
+// here take the default configuration; the two that watch a token expire take
+// the tight one, and nothing else is different between them.
+var (
+	defaultAuthenticator = sync.OnceValues(func() (*oidc.Authenticator, error) {
+		return newAuthenticator(0)
+	})
+	tightAuthenticator = sync.OnceValues(func() (*oidc.Authenticator, error) {
+		return newAuthenticator(expiryClockSkew)
+	})
+)
+
+// newAuthenticator builds and primes a verifier pointed at the realm. A zero
+// skew means the package's own default, which is what production would run.
+func newAuthenticator(skew time.Duration) (*oidc.Authenticator, error) {
 	a, err := oidc.NewAuthenticator(oidc.Config{
 		Issuer:     issuerURL(),
 		Audience:   apiAudience,
 		HTTPClient: identityClient,
-		ClockSkew:  suiteClockSkew,
+		ClockSkew:  skew,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("new authenticator: %w", err)
@@ -168,7 +213,7 @@ var authenticator = sync.OnceValues(func() (*oidc.Authenticator, error) {
 		return nil, fmt.Errorf("prime the authenticator: %w", err)
 	}
 	return a, nil
-})
+}
 
 // grant is one client_credentials access token and the instant it stops being
 // one.
@@ -181,9 +226,7 @@ type grant struct {
 //
 // A token lives five minutes and this suite issues dozens of requests, so
 // minting one per request would spend most of the run talking to Keycloak
-// rather than to the service. It is refreshed while a minute of it is left, so
-// a slow run never presents a credential that expired between being asked for
-// and being used.
+// rather than to the service.
 var held = struct {
 	mu     sync.Mutex
 	grants map[string]grant
@@ -195,17 +238,30 @@ func tokenFor(t *testing.T, clientID string) string {
 	t.Helper()
 	requireIdentityProvider(t)
 
-	held.mu.Lock()
-	defer held.mu.Unlock()
-	if g, ok := held.grants[clientID]; ok && time.Now().Add(time.Minute).Before(g.expiresAt) {
+	if g, ok := cachedGrant(clientID); ok {
 		return g.token
 	}
+	// Outside the lock. Holding it across the round trip would serialise every
+	// parallel test in the package behind one HTTP request to Keycloak, and the
+	// worst a concurrent miss can do is mint a second token nobody needed.
 	g, err := clientCredentials(t.Context(), clientID, secretFor(clientID))
 	if err != nil {
 		t.Fatalf("obtain a token for %s: %v", clientID, err)
 	}
+	held.mu.Lock()
+	defer held.mu.Unlock()
 	held.grants[clientID] = g
 	return g.token
+}
+
+// cachedGrant answers the held token for a client while a minute of it is left,
+// so a slow run never presents a credential that expired between being asked
+// for and being used.
+func cachedGrant(clientID string) (grant, bool) {
+	held.mu.Lock()
+	defer held.mu.Unlock()
+	g, ok := held.grants[clientID]
+	return g, ok && time.Now().Add(time.Minute).Before(g.expiresAt)
 }
 
 // secretFor is the client secret the realm declares, which is the client id
@@ -285,20 +341,19 @@ func refusedCredentials(t *testing.T, clientID, secret string) int {
 	return resp.StatusCode
 }
 
-// expiredToken obtains a token that is genuinely past its expiry, and waits for
-// it to get there.
+// shortLivedGrant obtains a token from provider-expiring, whose access tokens
+// the realm gives a five-second lifespan.
 //
-// The client is provider-expiring, whose access tokens the realm gives a
-// one-second lifespan. The wait is computed from the token's own "exp" plus the
-// skew the authenticator was configured with, so it is the verifier's own rule
-// rather than a sleep somebody guessed — and it is about two and a half
-// seconds, once, in a suite whose tests run in parallel.
+// Never cached, and five seconds rather than one so that a caller has room to
+// present it while it still works before waiting it out — which is what makes
+// "this credential stopped working" a statement about time rather than about
+// the client.
 //
 // Nothing else in the realm is short-lived. That is why this is a client of its
 // own rather than an attribute on provider-a: an override there would put every
 // other test in the suite one slow moment away from a credential that expired
 // while it was being used.
-func expiredToken(t *testing.T) string {
+func shortLivedGrant(t *testing.T) grant {
 	t.Helper()
 	requireIdentityProvider(t)
 
@@ -306,12 +361,28 @@ func expiredToken(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("obtain a short-lived token: %v", err)
 	}
-	// A margin on top of the verifier's rule, because "now" here and "now"
-	// inside the authenticator are two different readings of the same clock.
-	deadline := g.expiresAt.Add(suiteClockSkew).Add(500 * time.Millisecond)
-	if wait := time.Until(deadline); wait > 0 {
-		time.Sleep(wait)
+	return g
+}
+
+// waitOutExpiry sleeps until a grant is past the point the verifier stops
+// accepting it.
+//
+// The instant is computed from the token's own "exp" plus the skew the
+// authenticator was configured with, so it is the verifier's own rule rather
+// than a sleep somebody guessed. The half-second on top is because "now" here
+// and "now" inside the authenticator are two readings of one clock.
+func waitOutExpiry(g grant) {
+	deadline := g.expiresAt.Add(expiryClockSkew).Add(500 * time.Millisecond)
+	if remaining := time.Until(deadline); remaining > 0 {
+		time.Sleep(remaining)
 	}
+}
+
+// expiredToken is the pair of them, for a caller with nothing to do in between.
+func expiredToken(t *testing.T) string {
+	t.Helper()
+	g := shortLivedGrant(t)
+	waitOutExpiry(g)
 	return g.token
 }
 

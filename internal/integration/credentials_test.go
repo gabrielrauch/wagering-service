@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"slices"
 	"testing"
+	"time"
 )
 
 // TestTheRealmIssuesTheClaimsTheVerifierReads holds deploy/keycloak's export to
@@ -218,55 +219,70 @@ func TestACredentialThisServiceCannotUseIsRefused(t *testing.T) {
 // TestAnExpiredTokenIsRefused presents a credential the realm really issued,
 // really signed, and that has really run out.
 //
-// provider-expiring's access tokens live one second — see the realm export —
-// and the wait is computed from the token's own "exp" plus the skew this
-// suite's authenticator was configured with, so it is the verifier's rule
-// rather than a guess. Nothing else about the token is wrong: the issuer, the
-// audience, the realm role and the providerId are all the ones a working
-// provider's token carries, which is what makes the expiry the only thing this
-// can be failing on.
+// The control is this same token, a moment earlier. provider-expiring's access
+// tokens live five seconds, so the test submits with it while it works and then
+// waits it out and submits again — which makes the refusal a statement about
+// time rather than about the client, the route or the suite's wiring. A control
+// that used a different client would have proved the route works and left the
+// interesting half unproved.
+//
+// The wait is computed from the token's own "exp" plus the skew this stack's
+// authenticator was configured with, so it is the verifier's rule rather than a
+// guess, and it is about six and a half seconds in a suite whose tests run in
+// parallel.
 func TestAnExpiredTokenIsRefused(t *testing.T) {
 	t.Parallel()
-	s := newStack(t)
+	s := newStack(t, withTightClockSkew)
 	wallet := s.openWallet(t, "player-expired", "100.00")
 
-	token := expiredToken(t)
-	claims, err := claimsOf(token)
+	g := shortLivedGrant(t)
+	claims, err := claimsOf(g.token)
 	if err != nil {
-		t.Fatalf("read the expired token's claims: %v", err)
+		t.Fatalf("read the short-lived token's claims: %v", err)
 	}
 	if claims["iss"] != issuerURL() || !audienceContains(claims["aud"], apiAudience) {
-		t.Fatalf("the expired token is not otherwise valid: %v", claims)
+		t.Fatalf("the short-lived token is not otherwise valid: %v", claims)
 	}
 	if !slices.Contains(realmRoles(t, claims), "provider") {
-		t.Fatalf("the expired token carries no provider role: %v", claims)
+		t.Fatalf("the short-lived token carries no provider role: %v", claims)
 	}
 
+	// While it works.
+	live := s.do(t, call{
+		method:         http.MethodPost,
+		path:           "/wagering/transactions",
+		body:           encode(t, bet(expiringProvider, "ext-while-live", "player-expired", "1.00")),
+		token:          g.token,
+		idempotencyKey: "key-while-live",
+	})
+	if live.status != http.StatusOK {
+		t.Fatalf("the short-lived token was answered %s while it was still live "+
+			"(expiring at %s, now %s)", live, g.expiresAt, time.Now())
+	}
+
+	waitOutExpiry(g)
 	before := s.snapshot(t)
 
+	// And once it does not.
 	unauthenticated(t, s.do(t, call{
 		method: http.MethodGet,
 		path:   "/wallets/" + wallet.WalletID,
-		token:  token,
+		token:  g.token,
 	}))
 	unauthenticated(t, s.do(t, call{
 		method:         http.MethodPost,
 		path:           "/wagering/transactions",
 		body:           encode(t, bet(expiringProvider, "ext-expired", "player-expired", "1.00")),
-		token:          token,
+		token:          g.token,
 		idempotencyKey: "key-expired",
 	}))
+	unauthenticated(t, s.do(t, call{
+		method: http.MethodGet,
+		path:   "/providers/" + expiringProvider + "/wagering/transactions/ext-while-live",
+		token:  g.token,
+	}))
 
-	unchanged(t, before, s.snapshot(t), "a submission under an expired token")
-
-	// The control. A token from a client whose only difference is a five-minute
-	// lifespan is accepted on the same route, so what was refused above was the
-	// expiry and not the route, the realm or the suite's wiring.
-	fresh := s.submit(t, providerA,
-		bet(providerA, "ext-fresh", "player-expired", "1.00"), "key-fresh")
-	if fresh.status != http.StatusOK {
-		t.Fatalf("a live token was answered %s on the route an expired one was refused on", fresh)
-	}
+	unchanged(t, before, s.snapshot(t), "requests under an expired token")
 }
 
 // audienceContains reports whether an "aud" claim names what this service is.

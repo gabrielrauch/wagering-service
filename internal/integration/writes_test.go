@@ -26,7 +26,9 @@ import (
 // that read nothing at all would pass every assertion above.
 func TestARefusedRequestWritesNothing(t *testing.T) {
 	t.Parallel()
-	s := newStack(t)
+	// The tight-skew authenticator, because one of the credentials below is an
+	// expired token and waiting out the default would cost half a minute.
+	s := newStack(t, withTightClockSkew)
 
 	// A populated database rather than an empty one. An empty one cannot tell
 	// "nothing was written" from "nothing was read", and it is the UPDATEs to
@@ -46,12 +48,18 @@ func TestARefusedRequestWritesNothing(t *testing.T) {
 	provider := tokenFor(t, providerA)
 	other := tokenFor(t, providerB)
 
-	// Every door, with every credential this service refuses, and with the
-	// bodies that would have changed something had they been let through: a
-	// wallet for a player who already holds one, a bet against a real wallet,
-	// and a resubmission under a key that is already bound.
+	// Every door, with every credential this service refuses, and with bodies
+	// that really would have changed something had they been let through: a
+	// wallet for a player who holds none yet, a bet against a real wallet, and a
+	// resubmission under a key that is already bound.
+	//
+	// The player matters more than it looks. An earlier version named the player
+	// who already holds a wallet, so an authorised Open would have been refused
+	// by wallet_player_currency_key and rolled back anyway — four of the calls
+	// below could not then have demonstrated anything, and removing
+	// MayAdministerWallets from Wallets.Open left this test green.
 	openBody := encode(t, map[string]any{
-		"playerId":       "player-audited",
+		"playerId":       "player-unopened",
 		"initialBalance": amount{Amount: "50.00", Currency: currency},
 	})
 	betBody := encode(t, bet(providerA, "ext-unauthorised", "player-audited", "25.00"))
@@ -59,68 +67,84 @@ func TestARefusedRequestWritesNothing(t *testing.T) {
 
 	for _, c := range []struct {
 		name string
-		call call
+		// status is named per call rather than checked as "at least 400",
+		// because every other assertion in this package names the status it
+		// wants and a bare inequality would read a 500 as a refusal.
+		status int
+		call   call
 	}{
-		{name: "open a wallet with no credential", call: call{
+		{name: "open a wallet with no credential", status: http.StatusUnauthorized, call: call{
 			method: http.MethodPost, path: "/wallets", body: openBody,
 		}},
-		{name: "open a wallet with a forged token", call: call{
+		{name: "open a wallet with a forged token", status: http.StatusUnauthorized, call: call{
 			method: http.MethodPost, path: "/wallets", body: openBody, token: forged,
 		}},
-		{name: "open a wallet with an expired token", call: call{
+		{name: "open a wallet with an expired token", status: http.StatusUnauthorized, call: call{
 			method: http.MethodPost, path: "/wallets", body: openBody, token: expired,
 		}},
-		{name: "open a wallet as a provider", call: call{
+		{name: "open a wallet as a provider", status: http.StatusForbidden, call: call{
 			method: http.MethodPost, path: "/wallets", body: openBody, token: provider,
 		}},
-		{name: "submit with no credential", call: call{
+		{name: "submit with no credential", status: http.StatusUnauthorized, call: call{
 			method: http.MethodPost, path: "/wagering/transactions",
 			body: betBody, idempotencyKey: "key-unauthorised",
 		}},
-		{name: "submit with a malformed credential", call: call{
+		{name: "submit with a malformed credential", status: http.StatusUnauthorized, call: call{
 			method: http.MethodPost, path: "/wagering/transactions",
 			body: betBody, idempotencyKey: "key-unauthorised",
 			rawAuthorization: "Bearer not-a-jwt",
 		}},
-		{name: "submit with a forged token", call: call{
+		{name: "submit with a forged token", status: http.StatusUnauthorized, call: call{
 			method: http.MethodPost, path: "/wagering/transactions",
 			body: betBody, idempotencyKey: "key-unauthorised", token: forged,
 		}},
-		{name: "submit with an expired token", call: call{
+		{name: "submit with an expired token", status: http.StatusUnauthorized, call: call{
 			method: http.MethodPost, path: "/wagering/transactions",
 			body: betBody, idempotencyKey: "key-unauthorised", token: expired,
 		}},
-		{name: "submit as another provider", call: call{
+		{name: "submit as another provider", status: http.StatusForbidden, call: call{
 			method: http.MethodPost, path: "/wagering/transactions",
 			body: betBody, idempotencyKey: "key-unauthorised", token: other,
 		}},
-		{name: "replay another provider's key as the service", call: call{
-			method: http.MethodPost, path: "/wagering/transactions",
-			body: replayBody, idempotencyKey: "key-audited",
-			token: tokenFor(t, walletService),
-		}},
-		{name: "reconcile with no credential", call: call{
+		{
+			name:   "replay another provider's key as the service",
+			status: http.StatusForbidden,
+			call: call{
+				method: http.MethodPost, path: "/wagering/transactions",
+				body: replayBody, idempotencyKey: "key-audited",
+				token: tokenFor(t, walletService),
+			},
+		},
+		{name: "reconcile with no credential", status: http.StatusUnauthorized, call: call{
 			method: http.MethodPost, path: "/wallets/" + wallet.WalletID + "/reconciliation",
 		}},
-		{name: "reconcile as a provider", call: call{
+		{name: "reconcile as a provider", status: http.StatusForbidden, call: call{
 			method: http.MethodPost, path: "/wallets/" + wallet.WalletID + "/reconciliation",
 			token: provider,
 		}},
-		{name: "read another provider's operation", call: call{
+		{name: "read another provider's operation", status: http.StatusNotFound, call: call{
 			method: http.MethodGet, path: "/wagering/transactions/" + existing.TransactionID,
 			token: other,
 		}},
-		{name: "read a wallet as a provider", call: call{
+		{
+			name:   "read another provider's operation by external id",
+			status: http.StatusForbidden,
+			call: call{
+				method: http.MethodGet,
+				path:   "/providers/" + providerA + "/wagering/transactions/ext-audited",
+				token:  other,
+			},
+		},
+		{name: "read a wallet as a provider", status: http.StatusForbidden, call: call{
 			method: http.MethodGet, path: "/wallets/" + wallet.WalletID, token: provider,
 		}},
-		{name: "page a ledger with a forged token", call: call{
+		{name: "page a ledger with a forged token", status: http.StatusUnauthorized, call: call{
 			method: http.MethodGet, path: "/wallets/" + wallet.WalletID + "/ledger",
 			token: forged,
 		}},
 	} {
-		got := s.do(t, c.call)
-		if got.status < 400 {
-			t.Fatalf("%s was answered %s, which is not a refusal", c.name, got)
+		if got := s.do(t, c.call); got.status != c.status {
+			t.Fatalf("%s was answered %s, wanted %d", c.name, got, c.status)
 		}
 	}
 

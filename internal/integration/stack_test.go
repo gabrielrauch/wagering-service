@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	httpapi "github.com/gabrielrauch/wagering-service/internal/adapters/http"
+	"github.com/gabrielrauch/wagering-service/internal/adapters/oidc"
 	"github.com/gabrielrauch/wagering-service/internal/adapters/postgres"
 	"github.com/gabrielrauch/wagering-service/internal/app"
 	"github.com/gabrielrauch/wagering-service/internal/domain/wagering"
@@ -52,6 +53,33 @@ type stack struct {
 	owner *pgxpool.Pool
 }
 
+// stackOption varies one thing about how a stack is built.
+//
+// There is exactly one of them and it exists for exactly one reason, stated on
+// [withTightClockSkew]. A stack built without options is the configuration a
+// deployment would run.
+type stackOption func(*stackOptions)
+
+type stackOptions struct{ tightClockSkew bool }
+
+// withTightClockSkew builds the stack on the authenticator that tolerates one
+// second of clock difference rather than the package's default thirty.
+//
+// Only the two scenarios that watch a token expire take it, because waiting out
+// the default would cost thirty-one seconds of sleep and because a tight skew
+// is also a tighter bound on "iat" — see [expiryClockSkew]. Everything else
+// here runs on the default so that a clock step would break two tests rather
+// than all of them.
+func withTightClockSkew(o *stackOptions) { o.tightClockSkew = true }
+
+// authenticator answers the verifier these options ask for.
+func (o stackOptions) authenticator() (*oidc.Authenticator, error) {
+	if o.tightClockSkew {
+		return tightAuthenticator()
+	}
+	return defaultAuthenticator()
+}
+
 // newStack wires the whole service onto a freshly migrated database.
 //
 // Nothing in it stands in for anything. The pool is opened by the adapter's own
@@ -59,10 +87,15 @@ type stack struct {
 // the two use cases are the real ones, the authenticator is the real one
 // pointed at the Keycloak container, and the API is carried by the real server
 // on a port the kernel chose.
-func newStack(t *testing.T) *stack {
+func newStack(t *testing.T, opts ...stackOption) *stack {
 	t.Helper()
 	requireCluster(t)
 	requireIdentityProvider(t)
+
+	var settings stackOptions
+	for _, opt := range opts {
+		opt(&settings)
+	}
 
 	dsn := migrated(t)
 	pool, err := postgres.NewPool(t.Context(), postgres.PoolConfig{
@@ -124,7 +157,7 @@ func newStack(t *testing.T) *stack {
 	if err != nil {
 		t.Fatalf("wire the readiness check: %v", err)
 	}
-	verifier, err := authenticator()
+	verifier, err := settings.authenticator()
 	if err != nil {
 		t.Fatalf("wire the authenticator: %v", err)
 	}

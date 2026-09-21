@@ -13,6 +13,23 @@
 // Nothing here skips. The build tag already makes running this a deliberate
 // act, so a run that was asked for and quietly checked nothing is the worse of
 // the two outcomes, and it is the one a green pipeline reports as success.
+//
+// # This file duplicates internal/adapters/postgres/main_test.go, deliberately
+//
+// About two hundred lines of it, function for function. That is a real cost and
+// the two harnesses have drifted before — the CI workflow records the run in
+// which they disagreed about database naming — so it is worth saying why it was
+// not factored out.
+//
+// A helper shared between two packages' _test.go files cannot itself be a test
+// file, so it would be a non-test package existing only for tests, compiled
+// into every build of the tree. And extracting it means editing the PostgreSQL
+// adapter's suite, which this task was told not to touch. The duplication is
+// therefore the smaller of two costs today; whoever is next allowed to change
+// both files should collapse them into one internal package and delete this
+// note. The two divergences that are NOT accidental are the database name
+// prefix (wagering_e2e_ rather than wagering_adapter_, so a leftover says which
+// suite left it) and the second container below.
 package integration
 
 import (
@@ -41,6 +58,9 @@ import (
 // the other two suites pin so that a test passing here says something about the
 // version that will run in production.
 const postgresImage = "postgres:16-alpine"
+
+// postgresStartupBudget is how long the cluster has to accept connections.
+const postgresStartupBudget = 60 * time.Second
 
 var (
 	sharedDSN string
@@ -115,10 +135,16 @@ func startCluster(ctx context.Context) (*tcpostgres.PostgresContainer, string, e
 		tcpostgres.WithDatabase("wagering"),
 		tcpostgres.WithUsername("postgres"),
 		tcpostgres.WithPassword("postgres"),
-		testcontainers.WithWaitStrategy(
+		// AndDeadline for the same reason Keycloak's says so: WithWaitStrategy
+		// wraps a sixty-second context timeout around whatever inner timeout it
+		// is given, so the inner one can only ever be the smaller of the two.
+		// Sixty is right for PostgreSQL, which is up in about three seconds;
+		// writing it once rather than twice is what keeps it from being right
+		// by accident.
+		testcontainers.WithWaitStrategyAndDeadline(postgresStartupBudget,
 			wait.ForLog("database system is ready to accept connections").
 				WithOccurrence(2).
-				WithStartupTimeout(60*time.Second)),
+				WithStartupTimeout(postgresStartupBudget)),
 	)
 	if err != nil {
 		return nil, "", err
@@ -284,8 +310,10 @@ func rename(dsn, name string) (string, error) {
 // application's guarantees with an authority the application does not have.
 //
 // The space is written as %20 rather than left to url.Values.Encode, which
-// spells a space "+" — a spelling libpq does not decode, so the server reads
-// the parameter as "+role" and refuses the connection.
+// spells a space "+". pgx's own URL parser passes that "+" through as a literal
+// rather than decoding it back to a space, so what reaches the server is
+// "-c+role=wagering_app" and PostgreSQL refuses the connection with
+// `unrecognized configuration parameter "+role"`.
 func asApplication(dsn string) string {
 	const option = "options=-c%20role%3Dwagering_app"
 	if strings.Contains(dsn, "?") {
