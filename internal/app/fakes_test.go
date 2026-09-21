@@ -112,6 +112,15 @@ type fakeDB struct {
 	// a command in the middle and observe that nothing it had written survives.
 	failAt map[string]error
 
+	// blindToKeyOnce makes the next ByIdempotencyKey answer "not there" for a
+	// row that is. It is the one thing the fake cannot produce on its own and
+	// the real database produces routinely: a movement transaction is READ
+	// COMMITTED, so its two idempotency lookups see two instants, and a
+	// submission racing its own twin can read the key before the winner commits
+	// and the external id after it. The fake commits atomically into one state,
+	// so without this the second half of that sequence is unreachable here.
+	blindToKeyOnce bool
+
 	// blindToActiveReversals makes ReferenceFor omit a hold that is really
 	// there, which is the one way the ErrReferenceAlreadyReversed backstop can
 	// be reached: the domain rejects a held reference properly when the view
@@ -145,6 +154,21 @@ func (d *fakeDB) Begins() int  { return d.begins }
 func (d *fakeDB) Commits() int { return d.commits }
 
 func (d *fakeDB) failNext(op string, err error) { d.failAt[op] = err }
+
+// hideNextKeyLookup arranges for the next ByIdempotencyKey to miss a row that
+// exists, reproducing the older snapshot the write path's first lookup can be
+// answered from.
+func (d *fakeDB) hideNextKeyLookup() { d.blindToKeyOnce = true }
+
+// blindToKey reports, once, that the key lookup should answer from before the
+// winner committed.
+func (d *fakeDB) blindToKey() bool {
+	if !d.blindToKeyOnce {
+		return false
+	}
+	d.blindToKeyOnce = false
+	return true
+}
 
 func (d *fakeDB) fail(op string) error {
 	if err, ok := d.failAt[op]; ok {
@@ -458,6 +482,9 @@ func (t txnStore) ByIdempotencyKey(
 ) (*app.StoredTransaction, error) {
 	if err := t.db.fail("txn.ByIdempotencyKey"); err != nil {
 		return nil, err
+	}
+	if t.db.blindToKey() {
+		return nil, nil
 	}
 	row, ok := t.find(func(r txnRow) bool {
 		return r.snap.External != nil && r.snap.External.Provider == p && r.snap.External.IdempotencyKey == k

@@ -36,27 +36,35 @@ import (
 // debits; a suite that only checked the balance could not tell that from a
 // service that dropped forty-nine requests on the floor.
 //
-// # What it finds today
+// # What it found
 //
-// This test does not pass, and the failure is the service's rather than the
-// test's. Between two and six of the fifty are refused 409 CONFLICT — "operation
-// %q is already recorded under another idempotency key" — for an operation
-// recorded under exactly the key they sent. It reproduces on roughly two runs
-// in three.
+// This test did not pass when it was written, and the failure was the service's
+// rather than the test's. Between one and six of the fifty were refused 409
+// CONFLICT — "operation %q is already recorded under another idempotency key" —
+// for an operation recorded under exactly the key they sent, on roughly four
+// runs in five.
 //
-// The refusal comes from the first of the two calls to Wagering.replay, the one
+// The refusal came from the first of the two calls to Wagering.replay, the one
 // inside WithinMovement. That transaction is READ COMMITTED, so its two lookups
 // — ByIdempotencyKey and then ByExternal — take a fresh snapshot each, and a
-// submission whose first lookup runs before the winner commits and whose second
-// runs after sees no row for its key and a row for its external identifier. The
-// same function reads correctly from resolveDuplicate, which runs under
-// WithinSnapshot and therefore sees one instant.
+// submission whose first lookup ran before the winner committed and whose
+// second ran after saw no row for its key and a row for its external
+// identifier. The same function read correctly from resolveDuplicate, which
+// runs under WithinSnapshot and therefore sees one instant.
 //
-// The contract it breaks is CONTEXT.md's own: a Conflict is "refused because it
+// The contract it broke is CONTEXT.md's own: a Conflict is "refused because it
 // contradicts one already recorded... sending it again unchanged will be refused
-// again", and sending any of these again unchanged is answered 200 with the
-// outcome the operation reached. The wallet is never wrong — one debit either
+// again", and sending any of those again unchanged was answered 200 with the
+// outcome the operation reached. The wallet was never wrong — one debit either
 // way — which is why nothing before this suite noticed.
+//
+// replay now reads the key off the row the second lookup found rather than
+// inferring ownership from which index found it, so a submission recognises its
+// own row across that window and answers it the way the first lookup would
+// have. internal/app holds the interleaving as a deterministic test, driven by
+// a step rather than by fifty goroutines; this one holds the whole of the
+// contract, end to end, across three processes that share nothing but a
+// database.
 func TestOneBetSubmittedFiftyTimesAcrossThreeInstancesDebitsOnce(t *testing.T) {
 	requireStack(t)
 

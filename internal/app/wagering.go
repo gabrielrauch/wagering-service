@@ -312,6 +312,28 @@ func (w *Wagering) submitOnce(
 // already been submitted under a different key?", which is only ever a conflict,
 // and carries no failure code because nothing is persisted for it: the catalogue
 // describes outcomes a provider can act on, and this is not one.
+//
+// # Two lookups, and on the write path two instants
+//
+// [TxManager.WithinMovement] is READ COMMITTED, so these two statements do not
+// share a snapshot, and a submission racing its own twin can fall between them:
+// the first lookup runs before the winner commits and finds nothing under the
+// key, the second runs after it commits and finds the winner under the external
+// id. Read without looking at what was found, that is "this operation is already
+// recorded under another idempotency key" — which is false, because it is
+// recorded under exactly this one, and is the wrong category besides. Conflict
+// promises that the same submission sent again unchanged will be refused again,
+// and this one sent again is a replay. The provider is told to stop retrying
+// something that would have succeeded.
+//
+// The window is closed by recognising the row rather than by widening the
+// transaction. A row found by external id carries the key it was recorded
+// under, so a submission can tell its own row from somebody else's and take the
+// branch the first lookup would have taken. Raising the isolation level would
+// close it too, and would do it by changing the concurrency design that ADR-0011
+// and the wallet lock are built around — a large answer to a window that costs
+// nothing once the row is read for what it is. This layer should not need the
+// isolation to be stronger than the port promises.
 func (w *Wagering) replay(
 	ctx context.Context,
 	store TransactionReader,
@@ -323,43 +345,69 @@ func (w *Wagering) replay(
 		return nil, err
 	}
 	if existing != nil {
-		if err := existing.Transaction.AssertSamePayload(hash); err != nil {
-			// The code is read off the refusal rather than assumed, because
-			// AssertSamePayload has a second one: a transaction carrying no
-			// payload hash at all. Only an opening has none, an opening has no
-			// provider, and this lookup is scoped by provider — so that answer
-			// is the store returning a row it was not asked for, which is this
-			// system's defect and not a conflict to report to a provider.
-			if !failure.Is(err, failure.IdempotencyPayloadConflict) {
-				// Carrying the refusal rather than only naming the condition:
-				// this branch is reached when the assumption behind it is
-				// already wrong, so the one thing worth keeping is what the
-				// domain actually said.
-				return nil, newError(Unretryable, "", err,
-					"operation %s answered a provider-scoped lookup with no payload hash",
-					existing.Transaction.ID())
-			}
-			return nil, conflict(failure.IdempotencyPayloadConflict, err,
-				"idempotency key %q is already bound to another operation", command.IdempotencyKey)
-		}
-		// A still-parked original is replayed as it stands and deliberately not
-		// carried forward here: continuing is the worker's job, and doing it on a
-		// provider's retry would spend the wait budget twice as fast as the
-		// policy says.
-		settled := resultOf(existing.Transaction, true)
-		return &settled, nil
+		return replayOf(existing, command, hash)
 	}
 
 	other, err := store.ByExternal(ctx, command.Provider, command.ExternalTransactionID)
 	if err != nil {
 		return nil, err
 	}
-	if other != nil {
-		return nil, conflict("", nil,
-			"operation %q is already recorded under another idempotency key",
-			command.ExternalTransactionID)
+	if other == nil {
+		return nil, nil
 	}
-	return nil, nil
+	// The key is read off the row rather than inferred from which lookup found
+	// it. Equal means this is the submission's own row, seen across the window
+	// above, and it is answered exactly as the first lookup would have answered
+	// it. Only a different key is the conflict the message below describes.
+	//
+	// A row carrying no key at all is neither case and needs no branch of its
+	// own: only an opening has none, an opening has no provider and no external
+	// id, and this lookup is scoped by both, so it cannot be what was found.
+	if key, ok := other.Transaction.IdempotencyKey(); ok && key == command.IdempotencyKey {
+		return replayOf(other, command, hash)
+	}
+	return nil, conflict("", nil,
+		"operation %q is already recorded under another idempotency key",
+		command.ExternalTransactionID)
+}
+
+// replayOf decides what a row recorded under this submission's own idempotency
+// key means for it: a replay when it carries the same payload, and a conflict
+// when the key has been bound to a different one.
+//
+// It is reached from both lookups in [Wagering.replay] and gives one answer to
+// both, which is the point: which index found the row is an accident of timing,
+// and a submission must not learn a different outcome from it.
+func replayOf(
+	stored *StoredTransaction,
+	command wagering.Command,
+	hash wagering.PayloadHash,
+) (*OperationResult, error) {
+	if err := stored.Transaction.AssertSamePayload(hash); err != nil {
+		// The code is read off the refusal rather than assumed, because
+		// AssertSamePayload has a second one: a transaction carrying no
+		// payload hash at all. Only an opening has none, an opening has no
+		// provider, and both lookups are scoped by provider — so that answer
+		// is the store returning a row it was not asked for, which is this
+		// system's defect and not a conflict to report to a provider.
+		if !failure.Is(err, failure.IdempotencyPayloadConflict) {
+			// Carrying the refusal rather than only naming the condition:
+			// this branch is reached when the assumption behind it is
+			// already wrong, so the one thing worth keeping is what the
+			// domain actually said.
+			return nil, newError(Unretryable, "", err,
+				"operation %s answered a provider-scoped lookup with no payload hash",
+				stored.Transaction.ID())
+		}
+		return nil, conflict(failure.IdempotencyPayloadConflict, err,
+			"idempotency key %q is already bound to another operation", command.IdempotencyKey)
+	}
+	// A still-parked original is replayed as it stands and deliberately not
+	// carried forward here: continuing is the worker's job, and doing it on a
+	// provider's retry would spend the wait budget twice as fast as the policy
+	// says.
+	settled := resultOf(stored.Transaction, true)
+	return &settled, nil
 }
 
 // resolveDuplicate decides what a submission that lost a race actually was.
