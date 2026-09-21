@@ -265,6 +265,14 @@ func TestPublishedEventsKeepTheirEventIdAcrossRepublication(t *testing.T) {
 
 	// The state a publisher killed between the send and the mark leaves: on the
 	// wire, and no row says so.
+	//
+	// One notch off, and worth naming. A publisher that died holding the row
+	// leaves claimed_by set and claim_expires_at in the past — a claim that has
+	// expired — where this leaves both NULL, which is a row that was never
+	// claimed. Both are claimable by the next turn and the scenario turns on
+	// what the send does with the event id rather than on who held it; the
+	// claim's own expiry is asserted by TestAnExpiredClaimIsTakenUpByAnother-
+	// Publisher, which arranges it through the adapter rather than by hand.
 	s.exec(t, `UPDATE wagering.outbox SET published_at = NULL, claimed_by = NULL, `+
 		`claimed_at = NULL, claim_expires_at = NULL, next_attempt_at = $1`, time.Now().UTC())
 
@@ -306,8 +314,8 @@ func TestPublishedEventsKeepTheirEventIdAcrossRepublication(t *testing.T) {
 	}
 }
 
-// wire is what actually reached SQS, recorded by a middleware on the real SDK
-// client.
+// wire is what a publisher OFFERED to SQS, recorded by a middleware on the real
+// SDK client.
 //
 // A middleware rather than a stand-in for the queue: the call still goes to
 // LocalStack and the answer still comes back from it. What is added is a count
@@ -315,6 +323,12 @@ func TestPublishedEventsKeepTheirEventIdAcrossRepublication(t *testing.T) {
 // event id — and that count is the one thing the queue itself cannot be asked
 // about, because deduplication is exactly the mechanism that hides a second
 // send.
+//
+// Offered, not sent, and the distinction is deliberate: the middleware sits at
+// the Initialize step, which is above the SDK's retry loop, so a call the SDK
+// retried is counted once. That is the right level for the property being
+// asserted — whether the PUBLISHER decided to send an event twice — and it
+// would be the wrong level for a question about packets.
 type wire struct {
 	mu      sync.Mutex
 	offered map[string]int

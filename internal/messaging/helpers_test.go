@@ -23,8 +23,8 @@ import (
 const currency = "BRL"
 
 // provider is the game operator every scenario submits as. The queue is what
-// authorises it — see [stack.submitDirectly] for what stands in for the token
-// on the other transport.
+// authorises it — see [stack.submitDirectly] for how the submission that does
+// not arrive on the queue is authorised, and for what that leaves untested.
 const provider = "provider-a"
 
 // amount is money on the wire: a two-decimal string and a currency, never a
@@ -161,17 +161,17 @@ func minor(t *testing.T, value string) int64 {
 }
 
 // submitDirectly submits an operation over the application layer's own door,
-// with no inbox identity — which is the shape the HTTP handler produces.
+// with no inbox identity — which is the shape the HTTP handler produces once it
+// has authenticated.
 //
-// It is the other transport for the scenario that submits one operation twice,
-// and it stops one step short of a real HTTP request deliberately. The handler
-// authenticates a bearer token, turns the claims into exactly this principal
-// and calls exactly this method; driving the request instead would mean a
-// Keycloak in this suite for the sake of a scenario whose subject is one
-// movement and one replay rather than authentication. What is lost is the
-// handler's own decoding, which internal/integration asserts against a real
-// token, and what is kept is that both transports reach one use case, parse one
-// payload and share one idempotency decision — which is the whole of the claim.
+// It is deliberately one step short of a real HTTP request, and it is careful
+// not to be described as one. The handler verifies a bearer token, reads the
+// idempotency key out of a HEADER, decodes a body that has no such member, and
+// derives a correlation; then it builds exactly this principal and makes
+// exactly this call. Everything from that call onwards is shared, which is what
+// the scenario that uses this asserts on; the three steps before it are not
+// here, and the test that uses this says so in its own documentation rather
+// than leaving it to be inferred.
 func (s *stack) submitDirectly(t *testing.T, op operation, correlation string) app.OperationResult {
 	t.Helper()
 	acting, err := wagering.NewProvider(op.Provider)

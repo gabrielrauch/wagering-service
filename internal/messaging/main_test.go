@@ -29,6 +29,16 @@
 // all three should collapse them into one internal package and delete all three
 // notes.
 //
+// There is a cost neither of the other notes records, and it is the strongest
+// argument the status quo has. testcontainers-go is reached from _test.go files
+// only, in all six suites that use it; a shared helper would have to be a
+// non-test package, which would make it a non-test import of this module. What
+// `go mod graph` reports, what an SBOM lists and what a vulnerability scanner
+// considers shipped would all then include a container runtime client that
+// nothing in the built service touches. Whoever collapses these three has to
+// answer that first, and a build tag on the shared package is probably the
+// answer.
+//
 // The deliberate divergences from the two existing copies: the database name
 // prefix is wagering_msg_, so a leftover says which suite left it; the admin
 // pool is larger, because these tests run in parallel and each of them opens an

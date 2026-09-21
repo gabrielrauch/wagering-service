@@ -8,6 +8,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"strings"
 	"sync"
 	"testing"
@@ -34,13 +36,22 @@ import (
 // which its unit tests already prove, and not that a real outage is one.
 //
 // What is asserted is that the message came back SOONER than the queue would
-// have produced unaided. The queue's visibility timeout is ten seconds and the
-// consumer's backoff is two, so three deliveries inside ten seconds cannot be
-// the queue timing the message out — the second delivery alone would have taken
-// the whole ten. That comparison is the only thing separating "the consumer
+// have produced unaided. The queue's visibility timeout is twenty seconds and
+// the consumer's backoff is two, so three deliveries inside one visibility
+// window cannot be the queue timing the message out — unaided it would need
+// forty seconds to deliver three times, and the second delivery alone would
+// have taken twenty. That comparison is the only thing separating "the consumer
 // handed the message back" from "the consumer did nothing and the message
 // returned anyway", and a suite without it would pass against a
 // ChangeVisibility that was never called.
+//
+// Twenty rather than the ten it was first written with, and the margin is the
+// reason. The row-lock case pays its one-second lock timeout on each of three
+// attempts, so its span is about 7.9 seconds and inflates by a fifth when the
+// whole tree's integration run is in flight — 2.1 seconds of headroom under a
+// ten-second ceiling, which is the one place in this suite where a slower
+// machine reddens a correct test. Raising the ceiling STRENGTHENS the claim
+// rather than loosening it: the bound a mutant has to beat goes up with it.
 //
 // Each case also asserts WHICH failure it produced, by the SQLSTATE that
 // reached the consumer. Without that the two are indistinguishable — a
@@ -53,7 +64,7 @@ func TestATransientFailureLeavesTheMessageVisibleAgain(t *testing.T) {
 	const (
 		// Every timing assertion below is stated against this: a redelivery
 		// sooner than this is one the consumer asked for.
-		visibility = 10 * time.Second
+		visibility = 20 * time.Second
 		// The consumer's own backoff, in whole seconds because that is the
 		// resolution a visibility timeout has.
 		backoff = 2 * time.Second
@@ -143,7 +154,13 @@ func TestATransientFailureLeavesTheMessageVisibleAgain(t *testing.T) {
 				t.Fatalf("%d deliveries, want at least %d: %+v", len(deliveries), wanted,
 					deliveries)
 			}
-			if span := deliveries[wanted-1].at.Sub(deliveries[0].at); span >= visibility {
+			// Reported on the way past, not only on failure. This is the one
+			// upper bound in the suite, and the margin it is passing by is
+			// what somebody moving these numbers needs to see.
+			span := deliveries[wanted-1].at.Sub(deliveries[0].at)
+			t.Logf("%d deliveries spanned %s against a %s visibility timeout", wanted, span,
+				visibility)
+			if span >= visibility {
 				t.Errorf("%d deliveries took %s, which the queue's own %s visibility timeout "+
 					"could have produced unaided — the backoff proved nothing", wanted, span,
 					visibility)
@@ -220,20 +237,36 @@ func refusedWith(code string) func(error) bool {
 	}
 }
 
+// connectionExceptionClass is SQLSTATE class 08, every member of which is the
+// connection failing rather than the statement being wrong. Restated here
+// because the adapter's copy is unexported.
+const connectionExceptionClass = "08"
+
 // lostConnection reports whether a failure is the connection going away rather
 // than a statement being refused.
 //
 // Two shapes reach here and both are the same event. The server may get its
-// FATAL out first, which arrives as admin_shutdown; or the socket may simply
-// end, which pgx reports with no SQLSTATE at all. What this must NOT accept is
-// lock_not_available, because that is the other case in this table and a
-// termination that never landed would produce it.
+// FATAL out first, which arrives as admin_shutdown or somewhere in class 08; or
+// the socket may simply end, which pgx reports with no SQLSTATE at all — as an
+// unexpected EOF, as a net.OpError on the read, or as a use of a closed
+// connection.
+//
+// Those three are named rather than answered with "anything that is not a
+// SQLSTATE", which is what this used to do and which is not a predicate at all:
+// it accepted a pool error and a bare deadline just as readily, so the only
+// thing it actually rejected was the neighbouring case's lock_not_available.
+// The point of this function is to say which of the two failures the table
+// arranged actually happened, and a predicate that accepts everything else
+// cannot.
 func lostConnection(err error) bool {
 	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
 		return pgErr.Code == pgerrcode.AdminShutdown ||
-			strings.HasPrefix(pgErr.Code, "08")
+			strings.HasPrefix(pgErr.Code, connectionExceptionClass)
 	}
-	return err != nil
+	var opErr *net.OpError
+	return errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.As(err, &opErr)
 }
 
 // endBlockedConnections keeps ending the connections that are waiting on a lock
@@ -243,14 +276,19 @@ func lostConnection(err error) bool {
 // transaction holding the lock — this test's own — survives to keep holding it.
 // The sweep repeats because each attempt the consumer makes opens a new
 // connection, and the scenario needs several attempts to fail the same way.
+//
+// It is blunt within its own database: every backend waiting on a lock there is
+// ended, not only the consumer's. Nothing else is waiting on one, and the
+// datname predicate is what keeps the bluntness off the tests running beside
+// this one — each of which has a database of its own.
 func endBlockedConnections(t *testing.T, s *stack) func() {
 	t.Helper()
 	database := databaseOf(t, s.dsn)
 	done := make(chan struct{})
-	finished := make(chan struct{})
+	swept := make(chan struct{})
 
 	go func() {
-		defer close(finished)
+		defer close(swept)
 		for {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			_, _ = admin.Exec(ctx, `SELECT pg_terminate_backend(pid) FROM pg_stat_activity `+
@@ -267,7 +305,7 @@ func endBlockedConnections(t *testing.T, s *stack) func() {
 
 	return sync.OnceFunc(func() {
 		close(done)
-		<-finished
+		<-swept
 	})
 }
 

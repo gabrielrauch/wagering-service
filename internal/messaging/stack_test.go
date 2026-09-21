@@ -378,16 +378,24 @@ type hidden struct {
 
 // watchedQueue is the real queue with a record of what passed through it.
 //
-// It is not a substitute for anything: every method below forwards to the
-// embedded *sqs.Queue against real LocalStack and returns exactly what it
-// returned. What is added is memory, and it is here because half of what these
-// scenarios are about leaves no row — that a duplicate was genuinely delivered
-// a second time, that a transient failure pushed a message's visibility out
-// rather than deleting it, that a shutdown handed a message back. A suite
-// asserting only on the final balance would pass with all three of those
-// deleted, which is the failure this suite was written after.
+// It is not a substitute for anything: every method below forwards to the real
+// queue against real LocalStack and returns exactly what it returned. What is
+// added is memory, and it is here because half of what these scenarios are
+// about leaves no row — that a duplicate was genuinely delivered a second time,
+// that a transient failure pushed a message's visibility out rather than
+// deleting it, that a shutdown handed a message back. A suite asserting only on
+// the final balance would pass with all three of those deleted, which is the
+// failure this suite was written after.
+//
+// The queue is held as an [workers.InboundQueue] and every method is written
+// out, rather than embedding *sqs.Queue. Embedding would promote SendBatch as
+// well, so this type would satisfy [workers.OutboundQueue] too — and a
+// watchedQueue handed to a publisher would record nothing while reading as
+// perfectly good wiring. It would also promote, unobserved, whatever method
+// sqs.Queue gains next. Naming the four calls this decorator exists to watch
+// means a fifth has to be added here deliberately.
 type watchedQueue struct {
-	*sqs.Queue
+	inner workers.InboundQueue
 
 	mu         sync.Mutex
 	deliveries []delivery
@@ -400,13 +408,18 @@ type watchedQueue struct {
 	owners map[string]string
 }
 
-func watch(queue *sqs.Queue) *watchedQueue {
-	return &watchedQueue{Queue: queue, owners: map[string]string{}}
+// watchedQueue is the consumer's side of the queue and deliberately nothing
+// else. The assertion is here rather than in prose because it is the thing that
+// stops being true the moment somebody embeds the adapter again.
+var _ workers.InboundQueue = (*watchedQueue)(nil)
+
+func watch(queue workers.InboundQueue) *watchedQueue {
+	return &watchedQueue{inner: queue, owners: map[string]string{}}
 }
 
 // Receive forwards the receive and records what came back.
 func (w *watchedQueue) Receive(ctx context.Context) ([]sqs.Message, error) {
-	messages, err := w.Queue.Receive(ctx)
+	messages, err := w.inner.Receive(ctx)
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for _, m := range messages {
@@ -424,7 +437,7 @@ func (w *watchedQueue) Receive(ctx context.Context) ([]sqs.Message, error) {
 
 // Delete forwards the delete and records it.
 func (w *watchedQueue) Delete(ctx context.Context, receiptHandle string) error {
-	err := w.Queue.Delete(ctx, receiptHandle)
+	err := w.inner.Delete(ctx, receiptHandle)
 	w.record(&w.deletes, receiptHandle)
 	return err
 }
@@ -433,7 +446,7 @@ func (w *watchedQueue) Delete(ctx context.Context, receiptHandle string) error {
 func (w *watchedQueue) ChangeVisibility(
 	ctx context.Context, receiptHandle string, in time.Duration,
 ) error {
-	err := w.Queue.ChangeVisibility(ctx, receiptHandle, in)
+	err := w.inner.ChangeVisibility(ctx, receiptHandle, in)
 	w.mu.Lock()
 	w.hides = append(w.hides, hidden{receiptHandle: receiptHandle, in: in})
 	w.mu.Unlock()
@@ -448,7 +461,7 @@ func (w *watchedQueue) ChangeVisibility(
 // work back, and a suite that could not tell them apart would let the shutdown
 // scenario pass on a message that was merely deferred.
 func (w *watchedQueue) Release(ctx context.Context, receiptHandle string) error {
-	err := w.Queue.Release(ctx, receiptHandle)
+	err := w.inner.Release(ctx, receiptHandle)
 	w.record(&w.releases, receiptHandle)
 	return err
 }

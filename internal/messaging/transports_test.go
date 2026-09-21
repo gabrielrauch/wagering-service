@@ -1,6 +1,6 @@
 //go:build integration
 
-// One operation, submitted over both transports.
+// One operation, submitted twice: once carrying an inbox identity and once not.
 package messaging
 
 import (
@@ -11,22 +11,45 @@ import (
 	"github.com/gabrielrauch/wagering-service/internal/domain/wagering"
 )
 
-// TestOneOperationOverBothTransportsMovesMoneyOnceAndReplaysOnce sends one
-// submission down both doors, in both orders.
+// TestOneOperationWithAndWithoutAnInboxIdentityMovesMoneyOnceAndReplaysOnce
+// sends one submission down the queue and down the application's own door, in
+// both orders.
 //
-// The two transports are deliberately different in exactly one way that
-// matters: the queue carries an inbox identity and the application's own door
-// carries none. Everything else — the provider, the external id, the
-// idempotency key and the payload the hash is taken over — is the same
-// submission, because that is the condition under which the idempotency
-// decision has to hold. Whichever arrives second is answered from what the
-// first recorded, and the wallet moves once.
+// The two differ in exactly one way that matters: the queue's submission
+// carries an inbox identity and the direct one carries none. Everything else —
+// the provider, the external id, the idempotency key and the payload the hash
+// is taken over — is the same submission, because that is the condition under
+// which the idempotency decision has to hold. Whichever arrives second is
+// answered from what the first recorded, and the wallet moves once.
 //
-// Both orders, because they exercise different code. The transport that arrives
-// first takes the wallet lock and writes; the one that arrives second is
-// answered by the replay lookup before the lock is ever reached, and only the
-// queue's side of that also writes an inbox row.
-func TestOneOperationOverBothTransportsMovesMoneyOnceAndReplaysOnce(t *testing.T) {
+// Both orders, because they exercise different code. The one that arrives first
+// takes the wallet lock and writes; the one that arrives second is answered by
+// the replay lookup before the lock is ever reached, and only the queue's side
+// of that also writes an inbox row.
+//
+// # What this is not, and why the name says so
+//
+// It is not a test of two TRANSPORTS, and an earlier name claimed it was. The
+// HTTP adapter's own half is absent: the Idempotency-Key HEADER, which the
+// handler refuses on before it looks at the body; the strict decode into a
+// request type that deliberately has no idempotencyKey member of its own; and
+// the correlation the handler derives. Everything after those three is the
+// identical call this test makes — which is what makes the idempotency claim
+// below sound, and what makes the bug class it cannot catch precisely this one:
+// the HTTP door and the queue envelope disagreeing about where the idempotency
+// key lives, or a member renamed on one side only.
+//
+// internal/integration drives that door over a real listener with a token a
+// real Keycloak issued, so the coverage exists; what is missing is only the
+// cross-check against the queue in ONE test. Reaching the handler from here
+// instead would need something standing in at the credential gate, which is an
+// in-memory substitute for exactly what an identity provider does on this path
+// — the one thing this tree's brief refuses in an integration test, and the
+// first fake in a package whose documentation says it has none. A name that
+// claims only what is proved is the cheaper price of the two.
+func TestOneOperationWithAndWithoutAnInboxIdentityMovesMoneyOnceAndReplaysOnce(
+	t *testing.T,
+) {
 	t.Parallel()
 
 	cases := []struct {

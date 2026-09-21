@@ -36,6 +36,26 @@ import (
 // own or every one of them fails.
 const cleanupBudget = 15 * time.Second
 
+// The bounds SQS puts on one receive's long poll, restated here because a probe
+// states its budget as a duration and a receive takes whole seconds.
+//
+// The floor is the one that matters. A budget under a second truncates to zero,
+// and zero is a SHORT poll — which samples a subset of the queue's hosts and
+// answers empty while messages are waiting, the one thing a probe asserting
+// "nothing came back" must never do. The ceiling is simply what SQS refuses
+// past; a caller with a longer budget is served by several receives rather than
+// by an InvalidParameterValue.
+const (
+	minPoll = time.Second
+	maxPoll = 20 * time.Second
+)
+
+// pollSeconds is a probe's budget in the unit a receive takes, clamped to what
+// SQS allows.
+func pollSeconds(within time.Duration) int32 {
+	return int32(min(max(within, minPoll), maxPoll) / time.Second)
+}
+
 // fifoQueue creates a FIFO queue this test alone uses, and removes it
 // afterwards.
 func fifoQueue(t *testing.T, kind string, attributes map[string]string) string {
@@ -177,7 +197,7 @@ type seen struct {
 }
 
 // peek takes up to ten messages off a queue without deleting them, waiting up
-// to within for the first of them.
+// to within — clamped by [pollSeconds] — for the first of them.
 //
 // Nothing is deleted because every caller here is asking what is on the queue
 // rather than consuming it, and a probe that deleted would make the next
@@ -188,10 +208,9 @@ func peek(t *testing.T, queue string, within time.Duration) []seen {
 	received, err := sharedSDK.ReceiveMessage(t.Context(), &awssqs.ReceiveMessageInput{
 		QueueUrl:            queueURL(t, queue),
 		MaxNumberOfMessages: 10,
-		WaitTimeSeconds:     int32(within / time.Second),
-		// Zero would be a short poll, which samples a subset of the queue's
-		// hosts and answers empty while messages are waiting — the one thing a
-		// probe asserting "nothing came back" must not do.
+		WaitTimeSeconds:     pollSeconds(within),
+		// This zero is the visibility timeout and means "leave the queue's own
+		// alone", which is not the zero [pollSeconds] exists to prevent.
 		VisibilityTimeout: 0,
 		MessageSystemAttributeNames: []types.MessageSystemAttributeName{
 			types.MessageSystemAttributeNameApproximateReceiveCount,
@@ -259,11 +278,22 @@ func unhide(t *testing.T, queue string, messages []seen) {
 // inside it would pass against a Delete that did nothing. That is not a
 // hypothetical — it is the shape a delete assertion in this tree once had, and
 // it is why this one is given a budget rather than asked straight away.
+// It spends its budget across as many receives as it takes rather than in one,
+// because SQS refuses a wait past twenty seconds and some of these queues are
+// provisioned with a visibility timeout longer than that.
 func empty(t *testing.T, queue string, within time.Duration, what string) {
 	t.Helper()
-	if left := peek(t, queue, within); len(left) != 0 {
-		for _, m := range left {
-			t.Errorf("%s: %s still holds %s (delivery %d)", what, queue, m.body, m.receiveCount)
+	deadline := time.Now().Add(within)
+	for {
+		if left := peek(t, queue, time.Until(deadline)); len(left) != 0 {
+			for _, m := range left {
+				t.Errorf("%s: %s still holds %s (delivery %d)", what, queue, m.body,
+					m.receiveCount)
+			}
+			return
+		}
+		if !time.Now().Before(deadline) {
+			return
 		}
 	}
 }
