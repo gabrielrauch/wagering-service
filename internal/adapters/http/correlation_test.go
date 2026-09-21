@@ -80,7 +80,6 @@ func TestACorrelationThatCannotBeUsedIsRefusedRatherThanReplaced(t *testing.T) {
 		{"a newline, which would write the log", "trace\nlevel=error msg=\"fake\""},
 		{"a control character", "trace\x00id"},
 		{"surrounded by whitespace", " trace-1 "},
-		{"longer than the column holds", strings.Repeat("t", maxCorrelationBytes+1)},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -112,6 +111,38 @@ func TestACorrelationThatCannotBeUsedIsRefusedRatherThanReplaced(t *testing.T) {
 				t.Error("a correlation the database would refuse still reached the use case")
 			}
 		})
+	}
+}
+
+// Too long is not the same as dangerous. The bound is the storage column's and
+// a caller has no way to know it, so a well-formed identifier that overruns it
+// is replaced and the request goes on rather than failing over a number this
+// service never published.
+func TestACorrelationTooLongToStoreIsReplacedRatherThanRefused(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	h.auth.principal = providerPrincipal(t, "acme")
+	h.wagering.result = processed(t, false)
+
+	supplied := strings.Repeat("t", maxCorrelationBytes+1)
+	req := submission(submitBody)
+	req.headers[correlationHeader] = supplied
+	recorder := h.do(t, req)
+
+	assertStatus(t, recorder, http.StatusOK)
+	echoed := recorder.Header().Get(correlationHeader)
+	if echoed == supplied || echoed == "" {
+		t.Fatalf("echoed %q, want a minted correlation", echoed)
+	}
+	// Replaced, not dropped: the request is still one thread, and it is the
+	// thread the caller was told about.
+	if got := h.wagering.submitted().Correlation; got != echoed {
+		t.Errorf("the use case was given %q while the caller was told %q", got, echoed)
+	}
+	// Invisible to the caller beyond the header not matching, so it is said in
+	// the log or nowhere.
+	if h.logs.find("a supplied correlation was too long to keep") == nil {
+		t.Error("nothing recorded that a correlation had been replaced")
 	}
 }
 

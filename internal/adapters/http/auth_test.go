@@ -160,8 +160,8 @@ func TestTheHealthEndpointsNeedNoCredential(t *testing.T) {
 		})
 
 		assertStatus(t, recorder, http.StatusOK)
-		if h.auth.calls != 0 {
-			t.Errorf("%s asked the authenticator %d times", path, h.auth.calls)
+		if h.auth.called() != 0 {
+			t.Errorf("%s asked the authenticator %d times", path, h.auth.called())
 		}
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -116,6 +117,43 @@ func TestAConnectionThatSendsNoHeadersIsLetGoOf(t *testing.T) {
 	_, _ = io.ReadAll(conn)
 	if elapsed := time.Since(begun); elapsed > 2*time.Second {
 		t.Errorf("the connection was held for %s, want the header bound to end it", elapsed)
+	}
+}
+
+// The header bound, actually bounding something: headers larger than it are
+// refused rather than read.
+func TestHeadersLargerThanTheBoundAreRefused(t *testing.T) {
+	t.Parallel()
+	cfg := bounds(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	cfg.MaxHeaderBytes = 1024
+	server := started(t, cfg)
+
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(t.Context(), "tcp", server.Addr())
+	if err != nil {
+		t.Fatalf("connecting: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	request := "GET /health/live HTTP/1.1\r\nHost: x\r\nX-Big: " +
+		padding(8*cfg.MaxHeaderBytes) + "\r\n\r\n"
+	if _, err := io.WriteString(conn, request); err != nil {
+		t.Fatalf("writing an oversized header: %v", err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("setting a deadline: %v", err)
+	}
+
+	answer, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("reading the answer: %v", err)
+	}
+	// The handler must not have been reached, so a teapot means the bound did
+	// nothing.
+	if got := string(answer); !strings.Contains(got, "431") {
+		t.Errorf("answered %q, want the header bound to refuse it", got)
 	}
 }
 

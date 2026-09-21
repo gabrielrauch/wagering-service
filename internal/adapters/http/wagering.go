@@ -60,7 +60,7 @@ func (a *API) submitOperation(w http.ResponseWriter, r *http.Request, principal 
 		a.fail(w, r, err)
 		return
 	}
-	a.operation(w, r, result)
+	a.submitted(w, r, result)
 }
 
 // readOperation reads one operation by this system's identifier for it.
@@ -81,32 +81,30 @@ func (a *API) readOperation(w http.ResponseWriter, r *http.Request, principal ap
 		a.fail(w, r, err)
 		return
 	}
-	a.operation(w, r, result)
+	a.read(w, r, result)
 }
 
 // readProviderOperation reads one operation by the provider's identifier for
 // it.
 //
-// The provider in the path is checked against the provider the token names, and
-// nothing else is done with it: the read itself is scoped by the principal, so
-// the path segment can only ever agree with the token or be refused.
+// The provider comes from the path because an external id names an operation
+// only within the provider that issued it, and the service reads every
+// provider's. Whether this caller may read as that provider is
+// [app.Principal.MayReadAs]'s to say, which is where the rule is tested and
+// where the SQS path would ask it too; there is no copy of it here.
 //
-// A mismatch is 403 rather than 404, although a refused read of somebody else's
-// operation is 404 everywhere else here. The two are different questions. This
-// one is answered from the token alone, before anything is looked up, so it is
-// the same answer for every identifier and reveals nothing about any of them; a
-// 404 would instead say the operation is absent, which this route never went to
-// find out.
+// A provider naming another provider is 403 and not 404, although a refused
+// read of somebody else's operation is 404 everywhere else here. The two are
+// different questions. This one is answered from the token and the path alone,
+// before anything is looked for, so it is the same answer for every external id
+// and confirms the existence of none of them; 404 would instead say the
+// operation is absent, which this route never went to find out.
 func (a *API) readProviderOperation(
 	w http.ResponseWriter, r *http.Request, principal app.Principal,
 ) {
-	// A principal that names no provider is not refused here. It is refused by
-	// the application layer, which owns that rule: reading by a provider's own
-	// identifier is a provider's door, and an internal caller reads the same
-	// operation by this system's identifier for it instead.
-	if provider, isProvider := principal.Provider(); isProvider &&
-		provider.String() != r.PathValue("providerId") {
-		a.fail(w, r, &app.Error{Class: app.Unauthorized})
+	provider, err := wagering.NewProvider(r.PathValue("providerId"))
+	if err != nil {
+		a.fail(w, r, err)
 		return
 	}
 	external, err := wagering.NewExternalTransactionID(r.PathValue("externalTransactionId"))
@@ -114,10 +112,10 @@ func (a *API) readProviderOperation(
 		a.fail(w, r, err)
 		return
 	}
-	result, err := a.wagering.TransactionByExternalID(r.Context(), principal, external)
+	result, err := a.wagering.TransactionByExternalID(r.Context(), principal, provider, external)
 	if err != nil {
 		a.fail(w, r, err)
 		return
 	}
-	a.operation(w, r, result)
+	a.read(w, r, result)
 }

@@ -720,18 +720,22 @@ func (w *Wagering) TransactionByID(
 }
 
 // TransactionByExternalID reads one operation by the provider's identifier for
-// it. The provider comes from the principal and never from the request, so the
-// query is scoped by construction rather than by a check that could be forgotten.
+// it.
+//
+// The provider is named rather than derived from the principal, because an
+// external id identifies an operation only within the provider that issued it
+// and the service reads every provider's. [Principal.MayReadAs] is what keeps
+// that from widening the scope a provider has: it is answered before any row is
+// looked for, so a provider naming somebody else is refused without this door
+// ever having gone to see whether the operation exists.
 func (w *Wagering) TransactionByExternalID(
 	ctx context.Context,
 	principal Principal,
+	provider wagering.Provider,
 	id wagering.ExternalTransactionID,
 ) (OperationResult, error) {
-	provider, ok := principal.Provider()
-	if !ok {
-		// The provider comes from the principal, so an identity that names none
-		// has no way to address this door at all.
-		return OperationResult{}, unauthorized("only a provider reads its own operations by external id")
+	if err := principal.MayReadAs(provider); err != nil {
+		return OperationResult{}, err
 	}
 	var result OperationResult
 	err := w.tx.WithinSnapshot(ctx, func(ctx context.Context, r *ReadRepos) error {

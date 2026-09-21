@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gabrielrauch/wagering-service/internal/app"
 	"github.com/gabrielrauch/wagering-service/internal/domain/failure"
@@ -30,6 +32,7 @@ type fakeWagering struct {
 	lastSubmit     app.SubmitOperation
 	lastPrincipal  app.Principal
 	lastByID       wagering.TransactionID
+	lastProvider   wagering.Provider
 	lastByExternal wagering.ExternalTransactionID
 	// lastContext is kept so a test can assert the context a handler passed
 	// down was the request's own and not one of its making.
@@ -64,12 +67,14 @@ func (f *fakeWagering) TransactionByID(
 }
 
 func (f *fakeWagering) TransactionByExternalID(
-	ctx context.Context, principal app.Principal, id wagering.ExternalTransactionID,
+	ctx context.Context, principal app.Principal,
+	provider wagering.Provider, id wagering.ExternalTransactionID,
 ) (app.OperationResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
 	f.lastPrincipal = principal
+	f.lastProvider = provider
 	f.lastByExternal = id
 	f.lastContext = ctx
 	return f.result, f.err
@@ -173,6 +178,12 @@ type fakeAuthenticator struct {
 	err       error
 }
 
+func (f *fakeAuthenticator) called() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
 func (f *fakeAuthenticator) Authenticate(
 	_ context.Context, bearer string,
 ) (app.Principal, error) {
@@ -184,14 +195,53 @@ func (f *fakeAuthenticator) Authenticate(
 }
 
 // fakeCheck stands in for a readiness probe.
+//
+// Counted under a lock like every other fake here, because readiness runs its
+// checks at the same time: without it the count is a data race the moment there
+// is more than one check to run.
 type fakeCheck struct {
+	mu    sync.Mutex
 	err   error
 	calls int
 }
 
 func (f *fakeCheck) Ready(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls++
 	return f.err
+}
+
+func (f *fakeCheck) called() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+// delayedCheck answers after a delay, or gives up when the budget runs out. It
+// is how a dependency that is slow rather than absent behaves.
+type delayedCheck struct {
+	delay time.Duration
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *delayedCheck) Ready(ctx context.Context) error {
+	c.mu.Lock()
+	c.calls++
+	c.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(c.delay):
+		return nil
+	}
+}
+
+func (c *delayedCheck) called() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
 }
 
 // classifiedError is an error carrying its class, and sometimes a sentinel, the
@@ -252,6 +302,74 @@ func forbidden(t *testing.T) error {
 // discard is a logger that records nothing, for the tests that are not about
 // what was logged.
 func discard() *slog.Logger { return slog.New(slog.DiscardHandler) }
+
+// recorder keeps what was logged, so that the distinctions this package refuses
+// to put on the wire can be asserted where it does put them.
+//
+// That is not a nicety. A foreign read and an ordinary miss are one answer to a
+// caller by design, and the log line is the only place they are ever told
+// apart; a credential refusal says one sentence to the caller whichever of five
+// things went wrong, and the log line is the only place those are told apart.
+// Both are therefore behaviour that a suite logging into a discard cannot see
+// removed.
+type recorder struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *recorder) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *recorder) Handle(_ context.Context, record slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, record.Clone())
+	return nil
+}
+
+func (h *recorder) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *recorder) WithGroup(string) slog.Handler      { return h }
+
+// find returns the first record carrying message, or nil.
+func (h *recorder) find(message string) *slog.Record {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for i := range h.records {
+		if h.records[i].Message == message {
+			return &h.records[i]
+		}
+	}
+	return nil
+}
+
+// attr reads one attribute off a record.
+func attr(record *slog.Record, key string) string {
+	var found string
+	record.Attrs(func(a slog.Attr) bool {
+		if a.Key == key {
+			found = a.Value.String()
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// rendered is everything that was logged, as one string, for asserting that
+// something never appears in any of it.
+func (h *recorder) rendered() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out strings.Builder
+	for i := range h.records {
+		out.WriteString(h.records[i].Message)
+		h.records[i].Attrs(func(a slog.Attr) bool {
+			out.WriteString(" " + a.Key + "=" + a.Value.String())
+			return true
+		})
+		out.WriteString("\n")
+	}
+	return out.String()
+}
 
 // errBoom is an infrastructure failure nobody classified.
 var errBoom = errors.New("dial tcp 10.0.0.5:5432: connect: connection refused")

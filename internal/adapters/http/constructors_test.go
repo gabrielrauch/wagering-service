@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"context"
-	"net/http"
 	"testing"
 	"time"
 )
@@ -65,10 +64,8 @@ func TestACancelledRequestIsCancelledAllTheWayDown(t *testing.T) {
 	h.wagering.result = processed(t, false)
 
 	ctx, cancel := context.WithCancel(t.Context())
-	req := submission(submitBody)
-	recorder := h.doWithContext(t, ctx, req, cancel)
+	h.doWithContext(t, ctx, submission(submitBody), cancel)
 
-	_ = recorder
 	if err := h.wagering.lastContext.Err(); err == nil {
 		t.Error("the use case was given a context that was still live")
 	}
@@ -85,9 +82,4 @@ func TestTheRequestsContextReachesTheUseCaseLive(t *testing.T) {
 	if err := h.wagering.lastContext.Err(); err != nil {
 		t.Errorf("the use case was given a context that was already done: %v", err)
 	}
-}
-
-func TestAPIIsAHandler(t *testing.T) {
-	t.Parallel()
-	var _ http.Handler = newHarness(t).api
 }

@@ -82,7 +82,7 @@ func TestTheAdapterWiresIntoTheUseCases(t *testing.T) {
 			report.Stored.Amount(), report.Reconstructed.Amount())
 	}
 
-	result, err := wagers.TransactionByExternalID(t.Context(), provider, "ext-w-1")
+	result, err := wagers.TransactionByExternalID(t.Context(), provider, "acme", "ext-w-1")
 	if err != nil {
 		t.Fatalf("read an operation through the use case: %v", err)
 	}

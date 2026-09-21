@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json/v2"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -31,27 +32,36 @@ type harness struct {
 	wallets  *fakeWallets
 	auth     *fakeAuthenticator
 	checks   map[string]ReadinessCheck
+	logs     *recorder
 }
 
 // newHarness builds an API whose every dependency is a fake, authenticating
-// every credential as principal.
-func newHarness(t *testing.T) *harness {
+// every credential as the service.
+func newHarness(t *testing.T) *harness { return newHarnessWith(t, func(*Config) {}) }
+
+// newHarnessWith is newHarness with the configuration altered before it is
+// used, for the tests that are about a bound rather than about a handler.
+func newHarnessWith(t *testing.T, adjust func(*Config)) *harness {
 	t.Helper()
 	h := &harness{
 		wagering: &fakeWagering{},
 		wallets:  &fakeWallets{},
 		auth:     &fakeAuthenticator{principal: servicePrincipal(t)},
 		checks:   map[string]ReadinessCheck{},
+		logs:     &recorder{},
 	}
-	api, err := New(Config{
+	cfg := Config{
 		Wagering:         h.wagering,
 		Wallets:          h.wallets,
 		Authenticator:    h.auth,
 		Readiness:        h.checks,
 		ReadinessTimeout: testReadinessBudget,
 		MaxBodyBytes:     testBodyLimit,
-		Logger:           discard(),
-	})
+		Logger:           slog.New(h.logs),
+	}
+	adjust(&cfg)
+	h.checks = cfg.Readiness
+	api, err := New(cfg)
 	if err != nil {
 		t.Fatalf("building the API: %v", err)
 	}

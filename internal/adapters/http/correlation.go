@@ -51,20 +51,40 @@ func correlationFrom(ctx context.Context) string {
 
 // correlationOf reads the correlation a request carries, or mints one.
 //
-// A supplied value that cannot be used is refused rather than quietly replaced.
-// Replacing it would leave the caller tracing a request under an identifier
-// this service never recorded, and nothing would ever tell them their tracing
-// had stopped working. The correlation returned alongside the refusal is a
-// fresh one, so the refusal itself is still traceable.
-func correlationOf(r *http.Request) (string, error) {
+// A supplied value this service will not use is handled one of two ways, and
+// which one depends on what is wrong with it.
+//
+// A value carrying a control character, a value that is not UTF-8 and a value
+// with whitespace around it are REFUSED. The first of those is the reason: this
+// value is written into every log line the request produces and echoed in a
+// response header, so a caller that could put a newline in it would be writing
+// those log lines. Quietly replacing it would repair a log-injection attempt
+// and report nothing, which is precisely the case somebody needs to hear about.
+// The other two go with it because all three describe a value the caller wrote
+// down wrongly and can correct.
+//
+// A value that is merely too long is REPLACED, and the request goes on. The
+// hundred-and-twenty-eight-byte bound is wagering.opaque_id's — the column the
+// correlation is eventually stored in — and a caller has no way to know that
+// number. Refusing a well-formed identifier against a limit this service never
+// published would fail a good request over a storage fact; the replacement is
+// logged and the minted value is echoed, so a caller comparing what it sent
+// with what came back can see that its thread was not kept.
+//
+// The correlation returned alongside a refusal is a fresh one, so the refusal
+// itself is still traceable.
+func correlationOf(r *http.Request) (correlation string, replaced bool, err error) {
 	supplied := r.Header.Get(correlationHeader)
 	if supplied == "" {
-		return newCorrelation(), nil
+		return newCorrelation(), false, nil
+	}
+	if len(supplied) > maxCorrelationBytes {
+		return newCorrelation(), true, nil
 	}
 	if err := checkCorrelation(supplied); err != nil {
-		return newCorrelation(), err
+		return newCorrelation(), false, err
 	}
-	return supplied, nil
+	return supplied, false, nil
 }
 
 // newCorrelation mints a correlation for a request that carries none.
@@ -75,14 +95,15 @@ func correlationOf(r *http.Request) (string, error) {
 // nothing a test would need to fix it for.
 func newCorrelation() string { return uuid.NewV7().String() }
 
-// checkCorrelation holds a supplied correlation to wagering.opaque_id's shape.
+// checkCorrelation refuses a supplied correlation this service must not repeat.
+//
+// Length is not among the tests, deliberately: it is handled by [correlationOf]
+// as a replacement rather than a refusal, for the reason set out there.
 func checkCorrelation(correlation string) error {
 	refuse := func(why string) error {
 		return failure.New(failure.InvalidFieldFormat, "%s", why).WithField(correlationHeader)
 	}
 	switch {
-	case len(correlation) > maxCorrelationBytes:
-		return refuse("must be at most 128 bytes")
 	case !utf8.ValidString(correlation):
 		return refuse("must be valid UTF-8")
 	case strings.TrimSpace(correlation) != correlation:

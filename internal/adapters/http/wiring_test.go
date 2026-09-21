@@ -1,6 +1,8 @@
 package httpapi
 
 import (
+	"net/http"
+
 	"github.com/gabrielrauch/wagering-service/internal/adapters/oidc"
 	"github.com/gabrielrauch/wagering-service/internal/adapters/postgres"
 	"github.com/gabrielrauch/wagering-service/internal/app"
@@ -14,6 +16,7 @@ import (
 // not build is an assertion like this one, made where the interfaces live
 // rather than in the wiring that is not written yet.
 var (
+	_ http.Handler    = (*API)(nil)
 	_ WageringService = (*app.Wagering)(nil)
 	_ WalletService   = (*app.Wallets)(nil)
 	_ Authenticator   = (*oidc.Authenticator)(nil)

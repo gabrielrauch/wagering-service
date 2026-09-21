@@ -65,6 +65,33 @@ func TestTheRoutersOwnRefusalsTakeTheContractsShape(t *testing.T) {
 	}
 }
 
+// A path the mux can clean is redirected, not refused. 307 preserves the
+// method, so a submission survives it; the HTML page it would have drawn does
+// not, because it is the one representation this API never serves.
+func TestAPathTheRouterCanCleanIsRedirectedWithoutAPage(t *testing.T) {
+	t.Parallel()
+
+	for _, path := range []string{"//wallets", "/health//live", "/wallets/x/../y"} {
+		h := newHarness(t)
+
+		recorder := h.do(t, request{method: http.MethodGet, path: path})
+
+		assertStatus(t, recorder, http.StatusTemporaryRedirect)
+		if recorder.Header().Get("Location") == "" {
+			t.Errorf("%s was redirected to nowhere", path)
+		}
+		if body := recorder.Body.String(); body != "" {
+			t.Errorf("%s answered with a body: %q", path, body)
+		}
+		if got := recorder.Header().Get("Content-Type"); got != "" {
+			t.Errorf("%s answered with Content-Type %q, want none", path, got)
+		}
+		if recorder.Header().Get(correlationHeader) == "" {
+			t.Errorf("%s was redirected with no correlation", path)
+		}
+	}
+}
+
 // A handler's own 404 is not the router's, and must not be restated as one.
 func TestAHandlersNotFoundIsLeftAlone(t *testing.T) {
 	t.Parallel()

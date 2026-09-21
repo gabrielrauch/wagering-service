@@ -215,7 +215,8 @@ func TestAProviderReadsItsOwnOperations(t *testing.T) {
 		t.Errorf("read %s, want %s", byID.TransactionID, mine.TransactionID)
 	}
 
-	byExternal, err := f.wagers.TransactionByExternalID(t.Context(), providerPrincipal(t, acme), "ext-1")
+	byExternal, err := f.wagers.TransactionByExternalID(
+		t.Context(), providerPrincipal(t, acme), acme, "ext-1")
 	if err != nil {
 		t.Fatalf("by external id: %v", err)
 	}

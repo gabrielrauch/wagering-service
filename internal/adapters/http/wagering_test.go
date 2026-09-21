@@ -380,59 +380,139 @@ func TestReadOperationPassesThePrincipalToTheUseCase(t *testing.T) {
 	}
 }
 
-func TestReadByExternalIDRefusesAPathNamingAnotherProvider(t *testing.T) {
+// The provider in the path is the provider the read is made as. Whether this
+// caller may read as that provider is app.Principal.MayReadAs's to answer, so
+// the request reaches the use case carrying both.
+func TestReadByExternalIDPassesThePathsProviderToTheUseCase(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		principal func(*testing.T) app.Principal
+		path      string
+		want      wagering.Provider
+	}{
+		{
+			name:      "a provider reading as itself",
+			principal: func(t *testing.T) app.Principal { return providerPrincipal(t, "acme") },
+			path:      "/providers/acme/wagering/transactions/acme-tx-1",
+			want:      "acme",
+		},
+		{
+			name:      "the service reading as a provider",
+			principal: func(t *testing.T) app.Principal { return servicePrincipal(t) },
+			path:      "/providers/acme/wagering/transactions/acme-tx-1",
+			want:      "acme",
+		},
+		{
+			name:      "the service reading as another provider",
+			principal: func(t *testing.T) app.Principal { return servicePrincipal(t) },
+			path:      "/providers/rival/wagering/transactions/rival-tx-1",
+			want:      "rival",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t)
+			h.auth.principal = c.principal(t)
+			h.wagering.result = processed(t, false)
+
+			recorder := h.do(t, request{method: http.MethodGet, path: c.path})
+
+			assertStatus(t, recorder, http.StatusOK)
+			if h.wagering.lastProvider != c.want {
+				t.Errorf("the use case was asked as %q, want %q", h.wagering.lastProvider, c.want)
+			}
+			if h.wagering.lastByExternal == "" {
+				t.Error("the use case was given no external id")
+			}
+		})
+	}
+}
+
+// A provider naming another provider is refused by the application layer, and
+// the refusal is 403 here rather than the 404 a refused read carries elsewhere:
+// it is answered from the token and the path alone, before anything is looked
+// for, so it is the same answer for every external id.
+func TestReadByExternalIDAnswersARefusedProviderWithoutLookingAnythingUp(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
 	h.auth.principal = providerPrincipal(t, "acme")
+	h.wagering.err = classified(app.Unauthorized, "", `provider acme may not read as "rival"`)
 
 	recorder := h.do(t, request{
 		method: http.MethodGet,
 		path:   "/providers/rival/wagering/transactions/rival-tx-1",
 	})
 
-	// Decided from the token alone, before anything is read, so it is the same
-	// answer for every identifier and says nothing about any of them.
 	assertStatus(t, recorder, http.StatusForbidden)
 	if got := errorOf(t, recorder).Code; got != string(app.Unauthorized) {
 		t.Errorf("code = %q, want UNAUTHORIZED", got)
 	}
-	if h.wagering.called() != 0 {
-		t.Error("a path naming another provider still reached the use case")
-	}
 }
 
-func TestReadByExternalIDReadsTheProvidersOwnOperation(t *testing.T) {
+func TestReadByExternalIDRefusesAProviderThatIsNotOne(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
 	h.auth.principal = providerPrincipal(t, "acme")
-	h.wagering.result = processed(t, false)
 
 	recorder := h.do(t, request{
 		method: http.MethodGet,
-		path:   "/providers/acme/wagering/transactions/acme-tx-1",
+		path:   "/providers/%20acme/wagering/transactions/acme-tx-1",
 	})
 
-	assertStatus(t, recorder, http.StatusOK)
-	if h.wagering.lastByExternal != "acme-tx-1" {
-		t.Errorf("the use case was asked for %q, want acme-tx-1", h.wagering.lastByExternal)
+	assertStatus(t, recorder, http.StatusBadRequest)
+	if h.wagering.called() != 0 {
+		t.Error("a provider that is not one still reached the use case")
 	}
 }
 
-func TestReadByExternalIDLetsTheApplicationLayerRefuseANonProvider(t *testing.T) {
+// A read answers 200 whatever the operation came to. The status line says the
+// read succeeded; the body says what was read.
+func TestReadingAnOperationAnswersTwoHundredWhateverItCameTo(t *testing.T) {
 	t.Parallel()
-	h := newHarness(t)
-	h.auth.principal = servicePrincipal(t)
-	h.wagering.err = classified(app.Unauthorized, "",
-		"only a provider reads its own operations by external id")
 
-	recorder := h.do(t, request{
-		method: http.MethodGet,
-		path:   "/providers/acme/wagering/transactions/acme-tx-1",
-	})
+	cases := []struct {
+		name   string
+		status wagering.Status
+	}{
+		{"processed", wagering.Processed},
+		{"waiting for its reference", wagering.PendingReference},
+		{"rejected", wagering.Rejected},
+		{"failed", wagering.Failed},
+	}
 
-	// The rule belongs to the application layer, so the request reaches it.
-	assertStatus(t, recorder, http.StatusForbidden)
-	if h.wagering.called() != 1 {
-		t.Errorf("the use case was called %d times, want once", h.wagering.called())
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t)
+			h.auth.principal = providerPrincipal(t, "acme")
+			h.wagering.result = app.OperationResult{
+				TransactionID:         wagering.NewTransactionID(),
+				ExternalTransactionID: "acme-tx-1",
+				Kind:                  wagering.Bet,
+				Status:                c.status,
+				Money:                 mustMoney(t, "25.00", "BRL"),
+			}
+
+			byID := h.do(t, request{
+				method: http.MethodGet,
+				path:   "/wagering/transactions/" + h.wagering.result.TransactionID.String(),
+			})
+			byExternal := h.do(t, request{
+				method: http.MethodGet,
+				path:   "/providers/acme/wagering/transactions/acme-tx-1",
+			})
+
+			assertStatus(t, byID, http.StatusOK)
+			assertStatus(t, byExternal, http.StatusOK)
+			var view operationView
+			bodyOf(t, byID, &view)
+			if view.Status != string(c.status) {
+				t.Errorf("status = %q, want %q in the body", view.Status, c.status)
+			}
+		})
 	}
 }

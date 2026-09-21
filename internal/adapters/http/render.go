@@ -9,11 +9,19 @@ import (
 	"github.com/gabrielrauch/wagering-service/internal/domain/wagering"
 )
 
-// renderFailure is the body written when a response could not be rendered.
+// renderFailureMessage is what a caller is told when the answer could not be
+// rendered.
+const renderFailureMessage = "the response could not be rendered"
+
+// renderFailure is the body of last resort.
 //
-// It is a constant rather than a marshalled value for the obvious reason: the
-// path that reaches it is the one where marshalling did not work.
-const renderFailure = `{"code":"UNRETRYABLE","message":"the response could not be rendered","correlationId":""}`
+// It has no correlation, and it is the one response this package writes that
+// does not — which is why it exists as a constant and is reached only when the
+// three-string body below has ALSO failed to marshal. At that point nothing can
+// be built from anything, and a body that breaks the shape is still better than
+// a status line with nothing under it.
+const renderFailure = `{"code":"UNRETRYABLE","message":"` + renderFailureMessage +
+	`","correlationId":""}`
 
 // writeJSON renders body and sends it.
 //
@@ -32,9 +40,7 @@ func (a *API) writeJSON(w http.ResponseWriter, r *http.Request, status int, body
 			slog.String("route", r.Pattern),
 			slog.String("error", err.Error()),
 			slog.String("correlationId", correlationFrom(r.Context())))
-		w.Header().Set("Content-Type", contentTypeJSON)
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte(renderFailure))
+		a.writeRenderFailure(w, r)
 		return
 	}
 
@@ -50,22 +56,43 @@ func (a *API) writeJSON(w http.ResponseWriter, r *http.Request, status int, body
 	}
 }
 
-// operationStatus is the status an [app.OperationResult] is answered with.
+// writeRenderFailure answers a response that could not be rendered, in the
+// shape every other refusal takes.
 //
-// One rule, wherever a result is rendered: a submission and a read of the same
-// operation answer the same way, so a provider writes one branch rather than
-// two that can disagree about the transaction they are both describing.
+// It builds the body rather than reaching for the constant, because the
+// correlation is the whole point of that member: a caller reporting "your
+// service returned a 500" with nothing to name the request by is a caller
+// nobody can help. The three strings here cannot fail to marshal for the same
+// reason a string is not a cycle — but the constant is still there for the
+// answer if they somehow do.
+func (a *API) writeRenderFailure(w http.ResponseWriter, r *http.Request) {
+	payload, err := json.Marshal(errorBody{
+		Code:          string(app.Unretryable),
+		Message:       renderFailureMessage,
+		CorrelationID: correlationFrom(r.Context()),
+	}, json.Deterministic(true))
+	if err != nil {
+		payload = []byte(renderFailure)
+	}
+	w.Header().Set("Content-Type", contentTypeJSON)
+	w.WriteHeader(http.StatusInternalServerError)
+	_, _ = w.Write(payload)
+}
+
+// submissionStatus is the status a submitted operation is answered with.
 //
-// A rejection is 422 and arrives here on a nil error, which is the whole of
-// ADR-0012: a business rule settling an operation persisted a row, emitted an
-// event and bound the idempotency key to that payload for good. Inferring it
-// from an error would mean inferring it from something that never happens.
+// It says what the submission came to, which is why it applies to a submission
+// and to nothing else. A rejection is 422 and arrives on a nil error, which is
+// the whole of ADR-0012: a business rule settling an operation persisted a row,
+// emitted an event and bound the idempotency key to that payload for good.
+// Inferring it from an error would mean inferring it from something that never
+// happens.
 //
-// PENDING and FAILED fall to 200. Neither is reachable through these doors
-// today — nothing commits PENDING, and a permanently failed operation can only
-// be read back — but a mapping with a hole in it answers a status of zero, and
-// the honest answer for "here is the operation, in the state it is in" is 200.
-func operationStatus(result app.OperationResult) int {
+// PENDING and FAILED fall to 200. Neither is reachable through this door today
+// — nothing commits PENDING, and a permanently failed operation can only be
+// read back — but a mapping with a hole in it answers a status of zero, and the
+// honest answer for "here is the operation, in the state it is in" is 200.
+func submissionStatus(result app.OperationResult) int {
 	switch result.Status {
 	case wagering.PendingReference:
 		return http.StatusAccepted
@@ -76,7 +103,21 @@ func operationStatus(result app.OperationResult) int {
 	}
 }
 
-// operation answers with one operation.
-func (a *API) operation(w http.ResponseWriter, r *http.Request, result app.OperationResult) {
-	a.writeJSON(w, r, operationStatus(result), operationOf(result))
+// submitted answers a submission with what it came to.
+func (a *API) submitted(w http.ResponseWriter, r *http.Request, result app.OperationResult) {
+	a.writeJSON(w, r, submissionStatus(result), operationOf(result))
+}
+
+// read answers a read with the operation it found, always 200.
+//
+// A read that found the operation succeeded, whatever the operation came to,
+// and the status line says so. The alternative — reusing [submissionStatus] —
+// buys a consistency that costs the read its usable status: 422 on a GET tells
+// a client that the request could not be processed when it was processed
+// perfectly, and 202 tells it something has been accepted for processing when
+// nothing has. Any client with generic HTTP error handling then treats a
+// successful read as a failure. The branch a provider actually needs is the
+// status member of the body, which is there either way.
+func (a *API) read(w http.ResponseWriter, r *http.Request, result app.OperationResult) {
+	a.writeJSON(w, r, http.StatusOK, operationOf(result))
 }

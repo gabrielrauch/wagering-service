@@ -26,8 +26,8 @@ func TestLivenessReportsOnTheProcessAndNothingElse(t *testing.T) {
 	}
 	// A liveness probe that asked a dependency restarts a healthy process the
 	// moment that dependency goes away, and does it to every replica at once.
-	if postgres.calls != 0 {
-		t.Errorf("liveness ran %d readiness checks", postgres.calls)
+	if postgres.called() != 0 {
+		t.Errorf("liveness ran %d readiness checks", postgres.called())
 	}
 	if len(body.Checks) != 0 {
 		t.Errorf("checks = %v, want none", body.Checks)
@@ -91,9 +91,9 @@ func TestReadinessReportsEveryCheck(t *testing.T) {
 			}
 			// Every check runs even after one has failed, so an operator is
 			// not sent after one dependency while a second is also down.
-			if postgres.calls != 1 || queue.calls != 1 {
+			if postgres.called() != 1 || queue.called() != 1 {
 				t.Errorf("checks ran postgres %d, sqs %d times, want once each",
-					postgres.calls, queue.calls)
+					postgres.called(), queue.called())
 			}
 			if c.wantStatus == http.StatusServiceUnavailable &&
 				recorder.Header().Get("Retry-After") != retryAfter {
@@ -133,27 +133,14 @@ func (c *blockingCheck) Ready(ctx context.Context) error {
 
 func TestReadinessIsBoundedByItsOwnBudget(t *testing.T) {
 	t.Parallel()
-	h := &harness{
-		wagering: &fakeWagering{},
-		wallets:  &fakeWallets{},
-		auth:     &fakeAuthenticator{principal: servicePrincipal(t)},
-		checks:   map[string]ReadinessCheck{"sqs": &blockingCheck{released: make(chan struct{})}},
-	}
-	api, err := New(Config{
-		Wagering:      h.wagering,
-		Wallets:       h.wallets,
-		Authenticator: h.auth,
-		Readiness:     h.checks,
+	h := newHarnessWith(t, func(cfg *Config) {
 		// Short enough that a test waiting on it is not waiting long, and long
 		// enough that a loaded machine does not trip it by accident.
-		ReadinessTimeout: 50 * time.Millisecond,
-		MaxBodyBytes:     testBodyLimit,
-		Logger:           discard(),
+		cfg.ReadinessTimeout = 50 * time.Millisecond
+		cfg.Readiness = map[string]ReadinessCheck{
+			"sqs": &blockingCheck{released: make(chan struct{})},
+		}
 	})
-	if err != nil {
-		t.Fatalf("building the API: %v", err)
-	}
-	h.api = api
 
 	started := time.Now()
 	recorder := h.do(t, request{method: http.MethodGet, path: "/health/ready"})
@@ -168,6 +155,47 @@ func TestReadinessIsBoundedByItsOwnBudget(t *testing.T) {
 	bodyOf(t, recorder, &body)
 	if body.Checks["sqs"] != checkFailed {
 		t.Errorf("checks = %v, want the dependency that did not answer reported failed", body.Checks)
+	}
+}
+
+// Serial checks under a shared budget report the slow one AND everything queued
+// behind it as failed, and which ones those are depends on the order a map
+// happened to range in. Run at the same time, one slow dependency spends the
+// budget on its own and every other check still answers for itself.
+func TestOneSlowDependencyDoesNotSpendAnotherCheckBudget(t *testing.T) {
+	t.Parallel()
+	const budget = 200 * time.Millisecond
+	slow := &delayedCheck{delay: 4 * budget}
+	quick := &delayedCheck{delay: time.Millisecond}
+
+	h := newHarnessWith(t, func(cfg *Config) {
+		cfg.ReadinessTimeout = budget
+		cfg.Readiness = map[string]ReadinessCheck{"sqs": slow, "postgres": quick}
+	})
+
+	begun := time.Now()
+	recorder := h.do(t, request{method: http.MethodGet, path: "/health/ready"})
+	elapsed := time.Since(begun)
+
+	assertStatus(t, recorder, http.StatusServiceUnavailable)
+	var body healthBody
+	bodyOf(t, recorder, &body)
+	if body.Checks["postgres"] != checkPassed {
+		t.Errorf("the quick dependency reported %q, want ok: it answered in a millisecond",
+			body.Checks["postgres"])
+	}
+	if body.Checks["sqs"] != checkFailed {
+		t.Errorf("the slow dependency reported %q, want failed", body.Checks["sqs"])
+	}
+	// Both were asked. A check that never ran is the failure mode a serial
+	// loop has and this one must not.
+	if slow.called() != 1 || quick.called() != 1 {
+		t.Errorf("checks ran slow %d, quick %d times, want once each",
+			slow.called(), quick.called())
+	}
+	// The budget bounds the endpoint, not the sum of the checks.
+	if elapsed > 2*budget {
+		t.Errorf("readiness took %s, want it bounded by the %s budget", elapsed, budget)
 	}
 }
 

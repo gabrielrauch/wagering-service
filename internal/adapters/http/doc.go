@@ -67,10 +67,22 @@
 //
 // # The router
 //
-// net/http's ServeMux, with method-and-wildcard patterns. It matches the
-// routes this API has exactly, so a third-party router would be a dependency
-// bought for nothing. Its own two refusals — no route, and a route that exists
-// under another method — are the only responses this package does not compose
-// itself, so they are intercepted and restated in the contract's shape rather
-// than left as the two lines of plain text the mux writes.
+// net/http's ServeMux, with method-and-wildcard patterns. It matches the routes
+// this API has exactly, so a third-party router would be a dependency bought
+// for nothing. It composes three responses of its own — no route, a route that
+// exists under another method, and a redirect for a path it can clean — and
+// those are the only ones this package does not write itself. All three are
+// intercepted: the two refusals are restated in the contract's shape rather
+// than left as the lines of plain text the mux writes, and the redirect keeps
+// its status and its Location and loses the HTML page. See [routed].
+//
+// # 401 and 403, again, at the two doors
+//
+// Authentication is this package's. Authorisation is the application layer's,
+// with one exception: the provider named in a path is compared with the
+// provider the token names by [app.Principal.MayReadAs], which this package
+// calls rather than reimplements. A provider naming another provider is 403 and
+// not the 404 a refused read carries elsewhere, because that answer is reached
+// from the token and the path alone, before any row is looked for — the same
+// answer for every identifier, and an oracle for none of them.
 package httpapi

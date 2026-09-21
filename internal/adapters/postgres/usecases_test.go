@@ -636,7 +636,7 @@ func TestAHeldReferenceRejectsFurtherReversals(t *testing.T) {
 
 			// Stored, and readable by the provider that sent it.
 			stored, err := u.wagers.TransactionByExternalID(t.Context(), providerPrincipal(t),
-				wagering.ExternalTransactionID(attempt.external))
+				"acme", wagering.ExternalTransactionID(attempt.external))
 			if err != nil {
 				t.Fatalf("read %s back: %v", attempt.name, err)
 			}
