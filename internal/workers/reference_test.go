@@ -3,6 +3,8 @@ package workers
 import (
 	"context"
 	"errors"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -264,4 +266,56 @@ func settledResult() app.OperationResult {
 		Kind:          wagering.Rollback,
 		Status:        wagering.Processed,
 	}
+}
+
+// The reference worker's Stop is bounded the same way. There is nothing to give
+// back — a resume claim lasts only as long as its transaction — so the deadline
+// is the whole of what Stop owes the caller.
+func TestTheWorkerStopsEvenWhenATurnIgnoresCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	var (
+		admitted = make(chan struct{})
+		stuck    = make(chan struct{})
+		finished = make(chan struct{})
+		once     sync.Once
+	)
+	resumer := newFakeResumer(func(int) (app.ResumeOutcome, error) {
+		once.Do(func() {
+			close(admitted)
+			<-stuck
+			close(finished)
+		})
+		return app.ResumeOutcome{}, nil
+	})
+	worker, err := NewReferenceWorker(ReferenceConfig{
+		Wagering: resumer, Name: "reference-worker", Logger: discard(),
+		Interval: time.Hour, DrainTimeout: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if err := worker.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	<-admitted
+
+	returned := make(chan error, 1)
+	go func() { returned <- worker.Stop(ctx) }()
+
+	select {
+	case stopped := <-returned:
+		if stopped == nil {
+			t.Fatal("a shutdown against a turn that never came back reported success")
+		}
+		if !strings.Contains(stopped.Error(), "still running") {
+			t.Errorf("the shutdown error %q does not say a turn was still running", stopped)
+		}
+	case <-time.After(settledWithin):
+		t.Fatal("Stop never returned")
+	}
+
+	close(stuck)
+	<-finished
 }

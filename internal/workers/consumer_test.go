@@ -599,7 +599,7 @@ func TestTheCorrelationComesFromTheTraceAttributes(t *testing.T) {
 		{
 			name: "a correlation the inbox could not store is replaced",
 			attributes: map[string]string{
-				correlationAttribute: strings.Repeat("t", maxCorrelationBytes+1),
+				correlationAttribute: strings.Repeat("t", maxOpaqueIDBytes+1),
 			},
 			want: "envelope-message-1",
 		},
@@ -700,4 +700,243 @@ func (a *atomic64) next() string {
 	defer a.mu.Unlock()
 	a.n++
 	return time.Duration(a.n).String()
+}
+
+// The three queue calls that can fail after the consumer has already decided
+// what to do with a message. None of them changes the decision, and none of
+// them may be silent — a delete that was lost and a delete that was never
+// attempted look identical in the queue and must not look identical in a log.
+func TestAQueueCallThatFailedAfterTheDecisionIsReported(t *testing.T) {
+	cases := []struct {
+		name string
+		// spoil breaks one of the queue's calls.
+		spoil func(*fakeQueue)
+		// answer decides what the application layer says, which is what picks
+		// the call the consumer then makes.
+		answer func(context.Context, int, app.SubmitOperation) (app.OperationResult, error)
+		want   string
+	}{
+		{
+			name:  "a delete that failed leaves the work recorded",
+			spoil: func(q *fakeQueue) { q.deleteErr = app.AsRetryable(errors.New("lost")) },
+			want:  "the message was handled but could not be deleted",
+		},
+		{
+			name:  "a visibility change that failed leaves the queue's own timeout",
+			spoil: func(q *fakeQueue) { q.changeErr = app.AsRetryable(errors.New("lost")) },
+			answer: func(context.Context, int, app.SubmitOperation) (app.OperationResult, error) {
+				return app.OperationResult{}, app.AsRetryable(errors.New("the database is down"))
+			},
+			want: "the message could not be hidden for its backoff",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			log := &recorder{}
+			queue := newFakeQueue([]sqs.Message{message("handle-1", validBody(t, nil), 1)})
+			c.spoil(queue)
+			consumerOver(t, t.Context(), ConsumerConfig{
+				Queue: queue, Wagering: &fakeSubmitter{answer: c.answer}, Logger: log.logger(),
+			})
+			queue.handled(t)
+
+			log.await(t, c.want)
+		})
+	}
+}
+
+// A release that failed is not a message given back, and a shutdown that
+// counted it as one would tell an operator the work is on its way round again
+// when it is waiting out a visibility timeout instead.
+func TestAReleaseThatFailedIsNotCountedAsReleased(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	log := &recorder{}
+	queue := newFakeQueue([]sqs.Message{message("handle-1", validBody(t, nil), 1)})
+	queue.releaseErr = app.AsRetryable(errors.New("the queue is unreachable"))
+
+	var (
+		admitted = make(chan struct{})
+		release  = make(chan struct{})
+		once     sync.Once
+	)
+	defer once.Do(func() { close(release) })
+
+	submitter := &fakeSubmitter{
+		answer: func(ctx context.Context, _ int, _ app.SubmitOperation) (app.OperationResult, error) {
+			close(admitted)
+			select {
+			case <-release:
+				return processed(), nil
+			case <-ctx.Done():
+				return app.OperationResult{}, ctx.Err()
+			}
+		},
+	}
+	consumer, err := NewConsumer(ConsumerConfig{
+		Queue: queue, Wagering: submitter, Name: "wager-transactions",
+		Logger: log.logger(), Concurrency: 1, DrainTimeout: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("build a consumer: %v", err)
+	}
+	if err := consumer.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	<-admitted
+
+	stopped := consumer.Stop(ctx)
+	if stopped == nil {
+		t.Fatal("a shutdown that ran out of time reported success")
+	}
+	if !strings.Contains(stopped.Error(), "0 messages were released") {
+		t.Errorf("the shutdown error %q counts a release that failed as a message given back",
+			stopped)
+	}
+	log.await(t, "a message in flight could not be released")
+	once.Do(func() { close(release) })
+}
+
+// What the consumer says about a message it settled, and about one it is going
+// to see again. Neither line carries an amount, a balance or a player: those are
+// a financial payload and a log is not where one belongs.
+func TestWhatTheConsumerSaysAboutAMessage(t *testing.T) {
+	cases := []struct {
+		name   string
+		answer func(context.Context, int, app.SubmitOperation) (app.OperationResult, error)
+		want   string
+		says   map[string]string
+	}{
+		{
+			name: "an operation that was applied",
+			answer: func(context.Context, int, app.SubmitOperation) (app.OperationResult, error) {
+				return app.OperationResult{
+					Kind:   wagering.Bet,
+					Status: wagering.Rejected,
+					// A rejection is an outcome, and the line has to say which.
+					FailureCode: failure.InsufficientFunds,
+				}, nil
+			},
+			want: "the operation was applied",
+			says: map[string]string{
+				"status":      "REJECTED",
+				"failureCode": failure.InsufficientFunds.String(),
+				"messageId":   "message-1",
+			},
+		},
+		{
+			name: "an operation that will be delivered again",
+			answer: func(context.Context, int, app.SubmitOperation) (app.OperationResult, error) {
+				return app.OperationResult{}, app.AsRetryable(errors.New("the database is down"))
+			},
+			want: "the operation could not be applied and will be delivered again",
+			says: map[string]string{
+				"class":     string(app.Retryable),
+				"hiddenFor": (2 * time.Second).String(),
+				"messageId": "message-1",
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			log := &recorder{}
+			queue := newFakeQueue([]sqs.Message{message("handle-1", validBody(t, nil), 1)})
+			consumerOver(t, t.Context(), ConsumerConfig{
+				Queue: queue, Wagering: &fakeSubmitter{answer: c.answer}, Logger: log.logger(),
+			})
+			queue.handled(t)
+
+			record := log.await(t, c.want)
+			for key, want := range c.says {
+				if got, ok := attr(record, key); !ok || got != want {
+					t.Errorf("%s = %q, want %q", key, got, want)
+				}
+			}
+			for _, forbidden := range []string{"amount", "balance", "playerId", "body"} {
+				if _, carried := attr(record, forbidden); carried {
+					t.Errorf("the line carries %q, which belongs in the database and not a log",
+						forbidden)
+				}
+			}
+		})
+	}
+}
+
+// A correlation this service may not repeat is replaced rather than refused,
+// and the substitution is said out loud — a thread silently swapped is a thread
+// nobody can follow back.
+func TestAReplacedCorrelationIsReported(t *testing.T) {
+	log := &recorder{}
+	m := message("handle-1", validBody(t, nil), 1)
+	m.Attributes = map[string]string{correlationAttribute: "thread\n1"}
+
+	queue := newFakeQueue([]sqs.Message{m})
+	consumerOver(t, t.Context(), ConsumerConfig{
+		Queue: queue, Wagering: &fakeSubmitter{}, Logger: log.logger(),
+	})
+	queue.handled(t)
+
+	record := log.await(t, "the message's correlation was not usable and was replaced")
+	if got, _ := attr(record, "messageId"); got != "message-1" {
+		t.Errorf("messageId = %q, want the envelope's", got)
+	}
+}
+
+// Stop keeps the deadline it advertises, even against work that does not honour
+// its context. A drain timeout that only decided when to CANCEL would leave the
+// caller waiting past the budget it was given, which is not a deadline.
+func TestStopReturnsEvenWhenTheWorkIgnoresCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	var (
+		admitted = make(chan struct{})
+		stuck    = make(chan struct{})
+		finished = make(chan struct{})
+	)
+	queue := newFakeQueue([]sqs.Message{message("handle-1", validBody(t, nil), 1)})
+	submitter := &fakeSubmitter{
+		answer: func(context.Context, int, app.SubmitOperation) (app.OperationResult, error) {
+			defer close(finished)
+			close(admitted)
+			// Deliberately not watching the context. This is the call the
+			// deadline exists for.
+			<-stuck
+			return processed(), nil
+		},
+	}
+	consumer, err := NewConsumer(ConsumerConfig{
+		Queue: queue, Wagering: submitter, Name: "wager-transactions",
+		Logger: discard(), Concurrency: 1, DrainTimeout: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("build a consumer: %v", err)
+	}
+	if err := consumer.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	<-admitted
+
+	returned := make(chan error, 1)
+	go func() { returned <- consumer.Stop(ctx) }()
+
+	select {
+	case stopped := <-returned:
+		if stopped == nil {
+			t.Fatal("a shutdown against work that never came back reported success")
+		}
+		if !strings.Contains(stopped.Error(), "had not returned") {
+			t.Errorf("the shutdown error %q does not say the work never unwound", stopped)
+		}
+	case <-time.After(settledWithin):
+		t.Fatal("Stop never returned: the drain deadline decided when to cancel and not when " +
+			"to give up")
+	}
+	if got := queue.releasedHandles(); len(got) != 1 {
+		t.Errorf("released = %v, want the message handed back anyway", got)
+	}
+
+	close(stuck)
+	<-finished
 }

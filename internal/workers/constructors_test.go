@@ -1,6 +1,7 @@
 package workers
 
 import (
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -66,6 +67,13 @@ func TestAConsumerRefusesWhatItCannotWorkWithout(t *testing.T) {
 				c.Backoff = Backoff{Initial: time.Hour, Factor: 2, Max: 13 * time.Hour}
 			},
 			why: "hidden for at most",
+		},
+		{
+			name: "a backoff factor that is not a number",
+			spoil: func(c *ConsumerConfig) {
+				c.Backoff = Backoff{Initial: time.Second, Factor: math.NaN(), Max: time.Minute}
+			},
+			why: "is not a number",
 		},
 	}
 	for _, c := range cases {
@@ -147,6 +155,16 @@ func TestAPublisherRefusesWhatItCannotWorkWithout(t *testing.T) {
 			why:   "positive poll interval",
 		},
 		{
+			name:  "a negative drain timeout",
+			spoil: func(c *PublisherConfig) { c.DrainTimeout = -time.Second },
+			why:   "positive drain timeout",
+		},
+		{
+			name:  "a batch larger than one send can carry",
+			spoil: func(c *PublisherConfig) { c.Batch = maxClaimBatch + 1 },
+			why:   "past the 10 one send can carry",
+		},
+		{
 			name: "a backoff factor that shortens each wait",
 			spoil: func(c *PublisherConfig) {
 				c.Backoff = Backoff{Initial: time.Second, Factor: 0.5, Max: time.Minute}
@@ -189,6 +207,9 @@ func TestAPublisherFillsInWhatItWasNotTold(t *testing.T) {
 	if publisher.interval != defaultPollInterval {
 		t.Errorf("interval = %s, want %s", publisher.interval, defaultPollInterval)
 	}
+	if publisher.drain != defaultDrainTimeout {
+		t.Errorf("drain = %s, want %s", publisher.drain, defaultDrainTimeout)
+	}
 	want := Backoff{
 		Initial: defaultPublisherInitial,
 		Factor:  defaultPublisherFactor,
@@ -227,6 +248,11 @@ func TestAReferenceWorkerRefusesWhatItCannotWorkWithout(t *testing.T) {
 			why:   "positive interval",
 		},
 		{
+			name:  "a negative drain timeout",
+			spoil: func(c *ReferenceConfig) { c.DrainTimeout = -time.Second },
+			why:   "positive drain timeout",
+		},
+		{
 			name: "a backoff with no initial delay",
 			spoil: func(c *ReferenceConfig) {
 				c.Backoff = Backoff{Factor: 2, Max: time.Minute}
@@ -261,6 +287,9 @@ func TestAReferenceWorkerFillsInWhatItWasNotTold(t *testing.T) {
 	}
 	if worker.interval != defaultResumeInterval {
 		t.Errorf("interval = %s, want %s", worker.interval, defaultResumeInterval)
+	}
+	if worker.drain != defaultDrainTimeout {
+		t.Errorf("drain = %s, want %s", worker.drain, defaultDrainTimeout)
 	}
 	want := Backoff{
 		Initial: defaultResumeInitial,
@@ -297,7 +326,7 @@ func TestBuildingAWorkerTouchesNothing(t *testing.T) {
 		t.Fatalf("build a reference worker: %v", err)
 	}
 
-	if got := queue.receives; got != 0 {
+	if got := queue.receiveCount(); got != 0 {
 		t.Errorf("the consumer's constructor received %d times", got)
 	}
 	if got := len(outbox.claimed()); got != 0 {

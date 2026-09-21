@@ -89,6 +89,15 @@ type ConsumerConfig struct {
 	Backoff Backoff
 	// DrainTimeout is how long [Consumer.Stop] waits for work in hand before
 	// giving it back. Zero means [defaultDrainTimeout].
+	//
+	// It should be shorter than the queue's visibility timeout, so that a
+	// message this consumer gives up on is released while its receipt handle is
+	// still worth something — twenty seconds against the thirty the queues are
+	// provisioned with. That relationship is a convention and not a check: this
+	// type is not told the queue's visibility timeout, and inventing a second
+	// place to configure one would make the two disagree rather than agree.
+	// A value past the visibility timeout is accepted, and what it buys is a
+	// release that quietly fails because the message came back on its own.
 	DrainTimeout time.Duration
 	// MaxReceiveCount is the queue's redrive policy, so that the consumer can
 	// say when a delivery is the last one before the dead-letter queue — which
@@ -262,6 +271,9 @@ func (c *Consumer) Stop(ctx context.Context) error {
 	c.mu.Unlock()
 
 	stopPoll()
+	// Always, on every path out of here, so that the work context's resources
+	// are released whether the drain finished or ran out.
+	defer stopWork()
 
 	finished := make(chan struct{})
 	go func() {
@@ -269,21 +281,23 @@ func (c *Consumer) Stop(ctx context.Context) error {
 		close(finished)
 	}()
 
-	drainCtx, cancelDrain := context.WithTimeout(ctx, c.drain)
-	defer cancelDrain()
-
-	var late []string
-	select {
-	case <-finished:
-	case <-drainCtx.Done():
+	var (
+		late    []string
+		unwound = true
+	)
+	if !awaitStopped(ctx, finished, c.drain) {
 		// Named before the work is cancelled. A receiver that finishes during
 		// the cancellation would otherwise be reported or not depending on the
 		// scheduler.
 		late = stillWorking(receivers)
 		stopWork()
-		<-finished
+		// The budget is spent twice, and deliberately: once waiting for work to
+		// finish, and once waiting for it to unwind now that its context has
+		// been cancelled. Stop therefore returns within twice DrainTimeout even
+		// against a call that ignores its context, where waiting on the wait
+		// group alone would return never.
+		unwound = awaitStopped(ctx, finished, c.drain)
 	}
-	stopWork()
 
 	released := c.releaseHeld(ctx)
 	if len(late) == 0 {
@@ -295,7 +309,14 @@ func (c *Consumer) Stop(ctx context.Context) error {
 	c.logger.WarnContext(ctx, "the drain deadline passed with messages in flight",
 		slog.String("consumer", c.name),
 		slog.Any("receivers", late),
+		slog.Bool("unwound", unwound),
 		slog.Int("released", released))
+	if !unwound {
+		return fmt.Errorf(
+			"workers: the consumer's drain deadline of %s passed with %d receivers still working "+
+				"(%v), and they had not returned %s after being cancelled; %d messages were "+
+				"released for redelivery", c.drain, len(late), late, c.drain, released)
+	}
 	return fmt.Errorf(
 		"workers: the consumer's drain deadline of %s passed with %d receivers still working (%v); "+
 			"%d messages were released for redelivery", c.drain, len(late), late, released)

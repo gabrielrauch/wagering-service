@@ -17,11 +17,18 @@ import (
 
 // What a [PublisherConfig] leaves open.
 const (
-	// defaultClaimBatch is how many events one turn takes. Ten, which is the
-	// most one SendMessageBatch may carry, so a full claim is one round trip to
-	// the queue and one to the database rather than a claim the send then has
-	// to split.
+	// defaultClaimBatch is how many events one turn takes, and maxClaimBatch is
+	// the most it may be asked to take.
+	//
+	// Both are ten, which is the most one SendMessageBatch may carry, so a full
+	// claim is one round trip to the queue and one to the database. The bound
+	// is checked at construction rather than left to the adapter, which would
+	// carry a larger claim perfectly well by splitting it into several calls —
+	// and a claim that quietly became fifty calls is no longer the thing this
+	// field's own documentation describes, nor the thing an operator tuning it
+	// would be reasoning about.
 	defaultClaimBatch = 10
+	maxClaimBatch     = 10
 	// defaultClaimHold is how long a claim stands before the row returns to the
 	// pool. It has to outlast a publication attempt and must not outlast a
 	// deployment: too short and a slow send loses its work to another
@@ -75,6 +82,10 @@ type PublisherConfig struct {
 	// zero value means the documented default; anything else is taken as given
 	// and checked in full.
 	Backoff Backoff
+	// DrainTimeout is how long [Publisher.Stop] waits for the turn in progress
+	// before giving up on it and releasing the claims anyway. Zero means
+	// [defaultDrainTimeout].
+	DrainTimeout time.Duration
 	// Logger is where the publisher reports what it did. Required.
 	Logger *slog.Logger
 }
@@ -102,6 +113,7 @@ type Publisher struct {
 	batch    int
 	hold     time.Duration
 	interval time.Duration
+	drain    time.Duration
 	backoff  Backoff
 	logger   *slog.Logger
 
@@ -133,6 +145,13 @@ func NewPublisher(cfg PublisherConfig) (*Publisher, error) {
 	case cfg.Interval < 0:
 		return nil, fmt.Errorf("workers: the publisher needs a positive poll interval, got %s",
 			cfg.Interval)
+	case cfg.DrainTimeout < 0:
+		return nil, fmt.Errorf("workers: the publisher needs a positive drain timeout, got %s",
+			cfg.DrainTimeout)
+	case cfg.Batch > maxClaimBatch:
+		return nil, fmt.Errorf("workers: a claim of %d events is past the %d one send can "+
+			"carry, so the batch would be split into calls the claim cannot see", cfg.Batch,
+			maxClaimBatch)
 	}
 
 	backoff := cfg.Backoff
@@ -155,6 +174,7 @@ func NewPublisher(cfg PublisherConfig) (*Publisher, error) {
 		batch:    orDefault(cfg.Batch, defaultClaimBatch),
 		hold:     orDefaultDuration(cfg.Hold, defaultClaimHold),
 		interval: orDefaultDuration(cfg.Interval, defaultPollInterval),
+		drain:    orDefaultDuration(cfg.DrainTimeout, defaultDrainTimeout),
 		backoff:  backoff,
 		logger:   cfg.Logger,
 	}, nil
@@ -201,7 +221,15 @@ func (p *Publisher) Stop(ctx context.Context) error {
 	p.mu.Unlock()
 
 	cancel()
-	p.wg.Wait()
+	finished := make(chan struct{})
+	go func() {
+		p.wg.Wait()
+		close(finished)
+	}()
+	// Bounded, for the reason [awaitStopped] gives. The release below happens
+	// either way: a turn that has not come back is holding claims, and those are
+	// exactly the ones worth handing back.
+	stopped := awaitStopped(ctx, finished, p.drain)
 
 	// The caller's cancellation is stripped, for the reason the consumer's
 	// release sweep strips it: claims are handed back while the process is
@@ -217,23 +245,41 @@ func (p *Publisher) Stop(ctx context.Context) error {
 			slog.String("error", err.Error()))
 		return fmt.Errorf("workers: release the publisher's outbox claims: %w", err)
 	}
+	if !stopped {
+		p.logger.WarnContext(ctx, "the drain deadline passed with a turn still running",
+			slog.String("publisher", p.name),
+			slog.Int("released", released))
+		return fmt.Errorf("workers: the publisher's drain deadline of %s passed with a turn "+
+			"still running; %d claims were released anyway", p.drain, released)
+	}
 	p.logger.InfoContext(ctx, "stopped publishing",
 		slog.String("publisher", p.name),
 		slog.Int("released", released))
 	return nil
 }
 
-// run is the publisher's loop.
+// run is the publisher's loop, and what it decides is how fast to go round.
 //
-// A turn that filled its batch goes straight round again: the claim is bounded,
-// so a full one is evidence that there is more work now rather than in an
+// One rule settles it: a turn that PUBLISHED NOTHING is not progress, and
+// nothing is the answer to a turn that goes round without waiting. That covers
+// three shapes at once — a claim that failed, a send that never reached the
+// queue, and a batch the queue refused entirely — because the loop cannot tell
+// them apart and does not need to. Each waits the backoff, for however many
+// turns in a row have got nowhere.
+//
+// Progress is judged on what reached the queue rather than on what was claimed,
+// and the difference is the whole of this. A turn that claims ten events and
+// publishes none has done a claim, a send, ten reschedules and ten error lines;
+// treating that as a full batch — which it is — sends the loop straight round
+// with no wait at all, and an SQS outage becomes a PostgreSQL write storm as
+// fast as the pool will carry it, for as long as the backlog lasts. Measured at
+// around fifty thousand claim round trips in two hundred milliseconds before
+// this was a rule.
+//
+// Short of that, a turn that filled its batch goes straight round: a bounded
+// claim coming back full is evidence there is more work now rather than in an
 // interval's time. Anything less waits the interval, because the next claim
 // would find the same nothing.
-//
-// A turn that could not claim at all waits the backoff instead, for however
-// many turns have failed in a row. A publisher polling a database that is not
-// answering once a second writes one error line a second and asks a struggling
-// database a question a second, which is how a difficulty becomes an outage.
 //
 // The consecutive-failure count is in memory, and that is not the in-memory
 // state this system forbids: it decides when this process next asks a question,
@@ -243,9 +289,9 @@ func (p *Publisher) run(ctx context.Context) {
 
 	failures := 0
 	for ctx.Err() == nil {
-		claimed, err := p.turn(ctx)
+		claimed, published, err := p.turn(ctx)
 		switch {
-		case err != nil:
+		case err != nil || (claimed > 0 && published == 0):
 			failures++
 			if !wait(ctx, p.backoff.after(failures)) {
 				return
@@ -262,15 +308,21 @@ func (p *Publisher) run(ctx context.Context) {
 }
 
 // turn claims, publishes and records one batch, and reports how many events it
-// claimed.
+// claimed and how many of them reached the queue.
 //
-// The error is the claim's alone. A send that failed is not a failure of the
-// turn: every event it touched has been put back on its own schedule, so the
-// next claim will not see them and there is nothing for the loop to slow down
-// on.
-func (p *Publisher) turn(ctx context.Context) (int, error) {
+// The error is the claim's alone, because a claim that failed is the one
+// failure that leaves the loop with nothing to say about the work. A send that
+// failed is reported through the second count instead: the events have been put
+// back on their own schedules, so there is nothing left to do about THEM — but
+// there is something to do about the loop, and [Publisher.run] is where that is
+// decided.
+//
+// Published counts the entries the queue accepted, not the rows the outbox then
+// marked. A mark that fails leaves the row claimed until the hold expires, so it
+// cannot come back round and spin; an event that never reached the queue can.
+func (p *Publisher) turn(ctx context.Context) (claimed, published int, err error) {
 	at := p.clock.Now()
-	claimed, err := p.outbox.Claim(ctx, postgres.ClaimRequest{
+	batch, err := p.outbox.Claim(ctx, postgres.ClaimRequest{
 		By:    p.name,
 		Limit: p.batch,
 		At:    at,
@@ -283,10 +335,10 @@ func (p *Publisher) turn(ctx context.Context) (int, error) {
 				slog.String("class", string(app.ClassOf(err))),
 				slog.String("error", err.Error()))
 		}
-		return 0, err
+		return 0, 0, err
 	}
-	if len(claimed) == 0 {
-		return 0, nil
+	if len(batch) == 0 {
+		return 0, 0, nil
 	}
 
 	// The claim is held and nothing has been sent. A process killed here must
@@ -294,30 +346,31 @@ func (p *Publisher) turn(ctx context.Context) (int, error) {
 	// makes that true.
 	faults.Hit(faults.AfterClaimBeforePublish)
 
-	results, err := p.queue.SendBatch(ctx, outboundOf(claimed))
+	results, err := p.queue.SendBatch(ctx, outboundOf(batch))
 	if err != nil {
 		// Nothing was attempted at all — the adapter reports per entry
-		// otherwise — so every event goes back with the same cause.
+		// otherwise — so every event goes back with the same cause, and the
+		// turn reports nothing published so that the loop slows down.
 		p.logger.ErrorContext(ctx, "could not send a batch of events",
 			slog.String("publisher", p.name),
-			slog.Int("events", len(claimed)),
+			slog.Int("events", len(batch)),
 			slog.String("class", string(app.ClassOf(err))),
 			slog.String("error", err.Error()))
-		p.rescheduleAll(ctx, claimed, err)
-		return len(claimed), nil
+		p.rescheduleAll(ctx, batch, err)
+		return len(batch), 0, nil
 	}
-	if len(results) != len(claimed) {
+	if len(results) != len(batch) {
 		// Unreachable: the adapter's contract is one positionally aligned
 		// result per message. Asserting it anyway, because the alternative to
 		// noticing is marking an event published on the strength of another
 		// event's result.
 		p.logger.ErrorContext(ctx, "the queue answered for a different number of events",
 			slog.String("publisher", p.name),
-			slog.Int("events", len(claimed)),
+			slog.Int("events", len(batch)),
 			slog.Int("results", len(results)))
-		p.rescheduleAll(ctx, claimed,
+		p.rescheduleAll(ctx, batch,
 			errors.New("workers: the send reported a different number of results"))
-		return len(claimed), nil
+		return len(batch), 0, nil
 	}
 
 	// The events the queue accepted are on the wire and no row says so. A
@@ -326,14 +379,16 @@ func (p *Publisher) turn(ctx context.Context) (int, error) {
 	faults.Hit(faults.AfterPublishBeforeMark)
 
 	done := p.clock.Now()
+	sent := 0
 	for i, result := range results {
 		if result.Sent() {
-			p.mark(ctx, claimed[i], done)
+			sent++
+			p.mark(ctx, batch[i], done)
 			continue
 		}
-		p.reschedule(ctx, claimed[i], done, result.Err)
+		p.reschedule(ctx, batch[i], done, result.Err)
 	}
-	return len(claimed), nil
+	return len(batch), sent, nil
 }
 
 // mark records one event as published.
@@ -383,11 +438,29 @@ func (p *Publisher) reschedule(
 		p.logger.InfoContext(ctx, "an event was no longer this publisher's to reschedule",
 			attrs...)
 	case class == app.Unretryable:
-		// The queue will refuse this event the same way every time, and there
-		// is no door onto the outbox that parks a row permanently. It will be
-		// claimed, refused and rescheduled until somebody acts on it, holding
-		// the head of its wallet's stream while it does — which is why this is
-		// an error and not a warning.
+		// The queue will refuse this event the same way every time, and this
+		// publisher has nowhere to put it: postgres.OutboxClaims offers a claim,
+		// a mark and a reschedule, and no operation that parks a row
+		// permanently. The event is therefore claimed, refused and rescheduled
+		// for as long as the deployment runs, and because the outbox is
+		// head-of-line per aggregate it holds ONE wallet's whole event stream
+		// while it does — not the publisher's, and not another wallet's, but
+		// that one indefinitely. A downstream projection of that wallet stops
+		// rather than lags.
+		//
+		// The line says an operator is needed, and it is worth being precise
+		// about what they can do: there is no door in this code, so the recourse
+		// is SQL against wagering.outbox. Adding one is a change to the
+		// PostgreSQL adapter and is recorded as a limitation rather than done
+		// here.
+		//
+		// The likeliest way to arrive is not a malformed event. Every payload
+		// here is a marshalled app.Envelope read back out of jsonb, so an empty
+		// body, an oversized identifier and a control character are all
+		// unreachable; what reaches this branch is the queue adapter
+		// classifying a code it does not recognise as Unretryable, which is the
+		// right default and is exactly the case where rescheduling — rather
+		// than discarding — is what a publisher should do.
 		p.logger.ErrorContext(ctx,
 			"the queue refuses this event and will refuse it again; it needs an operator",
 			attrs...)

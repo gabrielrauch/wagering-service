@@ -33,6 +33,24 @@ func TestParsingAnEnvelope(t *testing.T) {
 			why:  "not a JSON envelope",
 		},
 		{
+			// A second document after the first is refused rather than
+			// discarded. Nothing in the loop would apply it, so a decoder that
+			// accepted it would be accepting an operation nobody runs.
+			name: "a second envelope after the first is refused",
+			body: append(validBody(t, nil), validBody(t, nil)...),
+			why:  "not a JSON envelope",
+		},
+		{
+			name: "trailing rubbish is refused",
+			body: append(validBody(t, nil), []byte(" nonsense")...),
+			why:  "not a JSON envelope",
+		},
+		{
+			name: "a trailing array is refused",
+			body: append(validBody(t, nil), []byte(`[1,2]`)...),
+			why:  "not a JSON envelope",
+		},
+		{
 			name: "an unknown type is refused by name",
 			body: validBody(t, map[string]any{"type": "WagerTransactionCancelled"}),
 			why:  "is not a message type this consumer handles",

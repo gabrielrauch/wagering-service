@@ -152,10 +152,14 @@ func (e envelope) validate() error {
 	return nil
 }
 
-// maxOpaqueIDBytes is what wagering.opaque_id allows, restated because the
-// inbox's message id is stored in one and a value the database would refuse has
-// to be refused before a transaction has begun.
-const maxOpaqueIDBytes = 128
+// What wagering.opaque_id allows, restated because the inbox's message id and
+// the correlation are both stored in one and a value the database would refuse
+// has to be refused before a transaction has begun.
+const (
+	maxOpaqueIDBytes = 128
+	asciiSpace       = 0x20
+	asciiDelete      = 0x7f
+)
 
 // opaqueID reports whether s is a value wagering.opaque_id accepts: between one
 // and 128 octets, valid UTF-8, no control characters, and refused rather than

@@ -1,10 +1,5 @@
 package workers
 
-import (
-	"strings"
-	"unicode/utf8"
-)
-
 // The message attributes this service carries trace context in, in both
 // directions.
 //
@@ -22,40 +17,23 @@ const (
 	causationAttribute   = "causationId"
 )
 
-// What a correlation may be.
-//
-// The bounds are wagering.opaque_id's, which is the column every correlation is
-// eventually stored in: a value the database would refuse must be refused
-// before a transaction has begun, or an operation that was otherwise perfectly
-// good fails at its last statement.
-//
-// The control-character bound does a second job, the same one it does on the
-// HTTP path. This value is written into every log line the message produces, so
-// something that could put a newline in it would be writing those log lines.
-const (
-	maxCorrelationBytes = 128
-	asciiSpace          = 0x20
-	asciiDelete         = 0x7f
-)
-
 // usableCorrelation reports whether a supplied correlation is one this service
 // may repeat.
 //
-// A queue message has no caller to hand a refusal to, so an unusable value is
-// replaced rather than rejected — see [Consumer] for what it is replaced with.
-// Refusing the message instead would send a perfectly good operation to the
-// dead-letter queue over a field that identifies nothing but a log line.
-func usableCorrelation(correlation string) bool {
-	if correlation == "" ||
-		len(correlation) > maxCorrelationBytes ||
-		!utf8.ValidString(correlation) ||
-		strings.TrimSpace(correlation) != correlation {
-		return false
-	}
-	for _, r := range correlation {
-		if r < asciiSpace || r == asciiDelete {
-			return false
-		}
-	}
-	return true
-}
+// The rules are [opaqueID]'s, and they are the same rules because they are the
+// same column: a correlation is stored in wagering.opaque_id, so a value the
+// database would refuse has to be refused before a transaction has begun, or an
+// operation that was otherwise perfectly good fails at its last statement. The
+// control-character bound does a second job here — this value is written into
+// every log line the message produces, so something that could put a newline in
+// it would be writing those log lines.
+//
+// The disposition is what differs from the HTTP path, not the test. There, a
+// correlation carrying a control character is REFUSED, because a caller is
+// waiting and a log-injection attempt quietly repaired is the one case somebody
+// needs to hear about. A queue message has nobody to hand a refusal to, so an
+// unusable value is replaced and the substitution logged — see [Consumer] for
+// what it is replaced with. Refusing the message instead would send a perfectly
+// good operation to the dead-letter queue over a field that identifies nothing
+// but a log line.
+func usableCorrelation(correlation string) bool { return opaqueID(correlation) }

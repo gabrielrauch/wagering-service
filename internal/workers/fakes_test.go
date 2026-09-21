@@ -212,6 +212,13 @@ func (q *fakeQueue) Release(_ context.Context, receiptHandle string) error {
 	return nil
 }
 
+// receiveCount is how many times the consumer has asked for a batch.
+func (q *fakeQueue) receiveCount() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.receives
+}
+
 func (q *fakeQueue) deletedHandles() []string {
 	q.mu.Lock()
 	defer q.mu.Unlock()

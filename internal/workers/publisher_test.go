@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -228,23 +230,43 @@ func TestTheEnvelopeGoesOnTheWireExactlyAsStored(t *testing.T) {
 	}
 }
 
-func TestTraceAttributesAreOmittedWhenThereIsNothingToCarry(t *testing.T) {
+func TestTraceAttributesCarryOnlyWhatTheEnvelopeHas(t *testing.T) {
 	for _, c := range []struct {
 		name    string
 		payload []byte
+		want    map[string]string
 	}{
-		{name: "no causation to name", payload: storedEnvelope("thread-1", "")},
-		{name: "a payload that cannot be read", payload: []byte("{not json")},
+		{
+			name:    "both halves of the thread",
+			payload: storedEnvelope("thread-1", "cause-1"),
+			want: map[string]string{
+				correlationAttribute: "thread-1",
+				causationAttribute:   "cause-1",
+			},
+		},
+		{
+			name:    "no causation to name",
+			payload: storedEnvelope("thread-1", ""),
+			want:    map[string]string{correlationAttribute: "thread-1"},
+		},
+		{
+			// Not a failed send: the trace is in the body either way, so the
+			// consequence is a worse morning for somebody and not a lost event.
+			name:    "a payload that cannot be read",
+			payload: []byte("{not json"),
+		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			attributes := traceOf(c.payload)
-			if _, carried := attributes[causationAttribute]; carried {
-				t.Errorf("attributes = %v, want no causation", attributes)
+			got := traceOf(c.payload)
+			if len(got) != len(c.want) {
+				t.Fatalf("attributes = %v, want %v", got, c.want)
+			}
+			for name, want := range c.want {
+				if got[name] != want {
+					t.Errorf("%s = %q, want %q", name, got[name], want)
+				}
 			}
 		})
-	}
-	if traceOf([]byte("{not json")) != nil {
-		t.Error("an unreadable payload produced attributes")
 	}
 }
 
@@ -450,4 +472,187 @@ func TestAFailedClaimDoesNotEndTheLoop(t *testing.T) {
 	if len(marked) != 1 || marked[0].id != claimed.EventID {
 		t.Errorf("marked = %v, want the publisher to have carried on to the next claim", marked)
 	}
+}
+
+// A turn that published nothing is not progress. A loop that counted it as a
+// full batch would go straight round with no wait at all, turning a queue
+// outage into a database write storm for as long as the backlog lasted.
+func TestATurnThatPublishedNothingPacesTheLoop(t *testing.T) {
+	// The outbox always has work and the queue always refuses it, which is the
+	// shape of an SQS outage with a backlog behind it.
+	outbox := newFakeOutbox()
+	outbox.claimAnswer = func(int) ([]postgres.ClaimedEvent, error) {
+		return []postgres.ClaimedEvent{event(1, storedEnvelope("thread-1", ""))}, nil
+	}
+	sender := &fakeSender{
+		answer: func(int, []sqs.Outbound) ([]sqs.SendResult, error) {
+			return nil, app.AsRetryable(errors.New("the queue is unreachable"))
+		},
+	}
+	// A backoff no test could wait out, so a second claim can only mean the
+	// loop did not pace itself. Batch 1 so that every claim is a full one,
+	// which is the branch that used to go round without waiting.
+	publisherOver(t, t.Context(), PublisherConfig{
+		Outbox: outbox, Queue: sender, Batch: 1,
+		Backoff: Backoff{Initial: time.Hour, Factor: 2, Max: 2 * time.Hour},
+	})
+	outbox.settled(t, 1)
+	time.Sleep(100 * time.Millisecond)
+
+	if got := len(outbox.claimed()); got != 1 {
+		t.Errorf("claims = %d in the first 100ms of a queue outage, want exactly 1: a turn "+
+			"that published nothing has to wait its backoff", got)
+	}
+}
+
+// A full batch of which some was published is still a full batch: something
+// reached the queue, so the loop goes straight round rather than waiting on
+// behalf of the entries that did not.
+func TestAPartlyPublishedFullBatchIsStillAFullBatch(t *testing.T) {
+	events := []postgres.ClaimedEvent{
+		event(1, storedEnvelope("thread-1", "")),
+		event(1, storedEnvelope("thread-2", "")),
+	}
+	outbox := newFakeOutbox(events)
+	sender := &fakeSender{
+		answer: func(int, []sqs.Outbound) ([]sqs.SendResult, error) {
+			return []sqs.SendResult{
+				{MessageID: "q-1"},
+				{Err: app.AsRetryable(errors.New("throttled"))},
+			}, nil
+		},
+	}
+	// Neither the interval nor the backoff is a wait a test could sit through,
+	// so a second claim can only have come from the loop going straight round.
+	publisherOver(t, t.Context(), PublisherConfig{
+		Outbox: outbox, Queue: sender, Batch: 2, Interval: time.Hour,
+		Backoff: Backoff{Initial: time.Hour, Factor: 2, Max: 2 * time.Hour},
+	})
+	outbox.drained(t)
+
+	if got := len(outbox.claimed()); got < 2 {
+		t.Errorf("claims = %d, want the loop to have gone round again on a batch that "+
+			"published something", got)
+	}
+}
+
+// Every way an outbox write can fail to be this publisher's to make, said out
+// loud. Three of these are the recovery path working and one is a lost write;
+// none of them may be silent.
+func TestWhatThePublisherSaysAboutAnOutboxWriteItDidNotWin(t *testing.T) {
+	cases := []struct {
+		name             string
+		sent             bool
+		markAnswer       func(app.EventID) (bool, error)
+		rescheduleAnswer func(app.EventID) (bool, error)
+		want             string
+	}{
+		{
+			name:       "an event reached the queue and the row could not be told",
+			sent:       true,
+			markAnswer: func(app.EventID) (bool, error) { return false, errors.New("lost") },
+			want:       "an event was published but could not be marked",
+		},
+		{
+			name:       "another publisher had already marked it",
+			sent:       true,
+			markAnswer: func(app.EventID) (bool, error) { return false, nil },
+			want:       "an event was already marked published by another publisher",
+		},
+		{
+			name:             "an event that could not be put back",
+			rescheduleAnswer: func(app.EventID) (bool, error) { return false, errors.New("lost") },
+			want:             "an event could not be rescheduled",
+		},
+		{
+			name:             "an event whose claim had gone",
+			rescheduleAnswer: func(app.EventID) (bool, error) { return false, nil },
+			want:             "an event was no longer this publisher's to reschedule",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			claimed := event(1, storedEnvelope("thread-1", ""))
+			outbox := newFakeOutbox([]postgres.ClaimedEvent{claimed})
+			outbox.markAnswer, outbox.rescheduleAnswer = c.markAnswer, c.rescheduleAnswer
+			sender := &fakeSender{
+				answer: func(int, []sqs.Outbound) ([]sqs.SendResult, error) {
+					if c.sent {
+						return []sqs.SendResult{{MessageID: "q-1"}}, nil
+					}
+					return []sqs.SendResult{
+						{Err: app.AsRetryable(errors.New("throttled"))},
+					}, nil
+				},
+			}
+			log := &recorder{}
+			publisherOver(t, t.Context(), PublisherConfig{
+				Outbox: outbox, Queue: sender, Logger: log.logger(),
+			})
+			outbox.settled(t, 1)
+
+			record := log.await(t, c.want)
+			if got, _ := attr(record, "eventId"); got != claimed.EventID.String() {
+				t.Errorf("eventId = %q, want %q", got, claimed.EventID)
+			}
+		})
+	}
+}
+
+// The publisher's Stop is bounded the same way, and releases its claims whether
+// or not the turn came back — a turn still running is holding claims, and those
+// are exactly the ones worth handing back.
+func TestThePublisherStopsEvenWhenATurnIgnoresCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	var (
+		admitted = make(chan struct{})
+		stuck    = make(chan struct{})
+		finished = make(chan struct{})
+		once     sync.Once
+	)
+	outbox := newFakeOutbox()
+	outbox.claimAnswer = func(int) ([]postgres.ClaimedEvent, error) {
+		once.Do(func() {
+			close(admitted)
+			<-stuck
+		})
+		close(finished)
+		return nil, nil
+	}
+	publisher, err := NewPublisher(PublisherConfig{
+		Outbox: outbox, Queue: &fakeSender{}, Clock: fixedClock{at: testTime()},
+		Name: "publisher-1", Logger: discard(), Interval: time.Hour,
+		DrainTimeout: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("build a publisher: %v", err)
+	}
+	if err := publisher.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	<-admitted
+
+	returned := make(chan error, 1)
+	go func() { returned <- publisher.Stop(ctx) }()
+
+	select {
+	case stopped := <-returned:
+		if stopped == nil {
+			t.Fatal("a shutdown against a turn that never came back reported success")
+		}
+		if !strings.Contains(stopped.Error(), "still running") {
+			t.Errorf("the shutdown error %q does not say a turn was still running", stopped)
+		}
+	case <-time.After(settledWithin):
+		t.Fatal("Stop never returned")
+	}
+	if got := outbox.releaseCount(); got != 1 {
+		t.Errorf("released %d times, want the claims handed back anyway", got)
+	}
+
+	close(stuck)
+	<-finished
 }

@@ -48,6 +48,9 @@ type ReferenceConfig struct {
 	// that could not be carried forward has already been rescheduled inside the
 	// transaction that tried, on the application layer's policy.
 	Backoff Backoff
+	// DrainTimeout is how long [ReferenceWorker.Stop] waits for the turn in
+	// progress. Zero means [defaultDrainTimeout].
+	DrainTimeout time.Duration
 	// Logger is where the worker reports what it did. Required.
 	Logger *slog.Logger
 }
@@ -79,6 +82,7 @@ type ReferenceWorker struct {
 	principal app.Principal
 	name      string
 	interval  time.Duration
+	drain     time.Duration
 	backoff   Backoff
 	logger    *slog.Logger
 
@@ -104,6 +108,10 @@ func NewReferenceWorker(cfg ReferenceConfig) (*ReferenceWorker, error) {
 	case cfg.Interval < 0:
 		return nil, fmt.Errorf("workers: the reference worker needs a positive interval, got %s",
 			cfg.Interval)
+	case cfg.DrainTimeout < 0:
+		return nil, fmt.Errorf(
+			"workers: the reference worker needs a positive drain timeout, got %s",
+			cfg.DrainTimeout)
 	}
 	principal, err := app.NewServicePrincipal(cfg.Name)
 	if err != nil {
@@ -127,6 +135,7 @@ func NewReferenceWorker(cfg ReferenceConfig) (*ReferenceWorker, error) {
 		principal: principal,
 		name:      cfg.Name,
 		interval:  orDefaultDuration(cfg.Interval, defaultResumeInterval),
+		drain:     orDefaultDuration(cfg.DrainTimeout, defaultDrainTimeout),
 		backoff:   backoff,
 		logger:    cfg.Logger,
 	}, nil
@@ -154,12 +163,15 @@ func (w *ReferenceWorker) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop ends the loop and waits for the turn in progress.
+// Stop ends the loop and waits for the turn in progress, within the drain
+// deadline.
 //
 // There is nothing to give back. A resume claim lasts exactly as long as the
 // transaction that took it, so a worker that stops mid-turn leaves the row
 // parked and due, and the next worker to look finds it — which is the same thing
-// that happens when one crashes.
+// that happens when one crashes. That is also why a turn that overruns the
+// deadline is reported rather than waited on: there is no state here that
+// waiting longer would protect.
 func (w *ReferenceWorker) Stop(ctx context.Context) error {
 	w.mu.Lock()
 	if !w.started || w.stopped {
@@ -171,7 +183,17 @@ func (w *ReferenceWorker) Stop(ctx context.Context) error {
 	w.mu.Unlock()
 
 	cancel()
-	w.wg.Wait()
+	finished := make(chan struct{})
+	go func() {
+		w.wg.Wait()
+		close(finished)
+	}()
+	if !awaitStopped(ctx, finished, w.drain) {
+		w.logger.WarnContext(ctx, "the drain deadline passed with a resume turn still running",
+			slog.String("worker", w.name))
+		return fmt.Errorf("workers: the reference worker's drain deadline of %s passed with a "+
+			"turn still running", w.drain)
+	}
 	w.logger.InfoContext(ctx, "stopped carrying parked operations forward",
 		slog.String("worker", w.name))
 	return nil

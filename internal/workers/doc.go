@@ -28,11 +28,14 @@
 // A consumer runs N independent receivers. Each receives its own batch and
 // handles that batch strictly in the order it arrived, one message at a time; N
 // is the bound on how many messages this instance handles at once. Two receivers
-// cannot be given the same group, because SQS holds a group for whoever is
-// holding one of its messages in flight. The group is never named in this
-// package and never has to be — which matters, because the queue adapter does
-// not carry MessageGroupId and could not be asked to without this package
-// deciding what it would do with it.
+// cannot be given the same group, because SQS will not deliver another message
+// of a group while one of that group's messages is in flight. It tracks THAT a
+// message is in flight and not who is holding it, which is why the guarantee
+// reaches across replicas and not merely across the receivers of one process —
+// two deployments of this service cannot be handed the same wallet either. The
+// group is never named in this package and never has to be, which matters
+// because the queue adapter does not carry MessageGroupId and could not be asked
+// to without this package deciding what it would do with it.
 //
 // The same fact settles what happens to the rest of a batch when one of its
 // messages is not deleted. A FIFO receive returns as many messages of one group
@@ -43,12 +46,38 @@
 // comes back together and in order; on a permanent one they are left exactly as
 // they are, and time out together.
 //
-// There is a backstop under all of that, and it is worth naming because it is
-// what makes the ordering an optimisation rather than a correctness
-// requirement. An operation whose reference has not arrived is not corrupted and
-// is not refused — the domain parks it as PENDING_REFERENCE and the reference
-// worker carries it forward when the reference lands. Out-of-order delivery
-// costs latency here, not money.
+// # What that design costs, and what it rests on
+//
+// The cost is paid by whoever is behind a failure in a group that is not
+// theirs. A receive returns as many messages of the head group as it can and
+// then fills the rest of the batch from other groups, so a batch that spans
+// groups is the ordinary case whenever the head group has fewer than ten
+// messages waiting. One message this consumer will not delete stops that whole
+// batch, so a single poison message in position one can delay up to nine
+// unrelated wallets by a full visibility timeout. That is the price of never
+// naming the group: the consumer cannot tell which of the nine are behind the
+// poison message and which merely arrived in the same response, and guessing
+// wrongly reorders a wallet.
+//
+// What it rests on is a precondition the code does not defend: the group is held
+// only while a message is GENUINELY in flight, which is to say while its
+// visibility timeout has not expired. The arithmetic is worth stating. A receive
+// takes up to ten messages and the queues are provisioned with a thirty-second
+// visibility timeout, so a batch handled strictly serially gives each message an
+// average of three seconds. There is no visibility heartbeat and no per-message
+// timeout; one slow message expires the tail's visibility while this receiver is
+// still holding it, the group is released, another receiver or another replica
+// is given that wallet, and this receiver's now-stale receipt handles fail their
+// delete or their visibility change.
+//
+// There is a backstop under all of that, and it is why the precondition being
+// fragile is a latency problem rather than a money problem. The wallet's row
+// lock serialises the balance whoever applies the operation and in whatever
+// order; an operation whose reference has not arrived is not corrupted and is
+// not refused, because the domain parks it as PENDING_REFERENCE and the
+// reference worker carries it forward when the reference lands; and a message
+// applied twice is absorbed by the inbox. Ordering here buys latency and tidy
+// event streams. It is not what makes the money right.
 //
 // # Backoff
 //
@@ -82,6 +111,15 @@
 // case where nobody released it, and the publisher hands back every outbox claim
 // it holds. Both report what did not finish, because a drain that ran out of
 // time and a drain that completed are different mornings.
+//
+// Every wait a Stop makes is bounded twice over — by the caller's own context,
+// so a lifecycle hook that was given a budget keeps it, and by the worker's own
+// drain timeout, so a caller that was given none still gets a bound. The
+// consumer's budget is spent twice in the worst case, once waiting for work to
+// finish and once waiting for it to unwind after cancellation, so Stop returns
+// within twice DrainTimeout even against a call that ignores its context. A
+// deadline that only decided when to CANCEL would not be a deadline at all: the
+// caller would still be waiting when it passed.
 //
 // # Fault points
 //

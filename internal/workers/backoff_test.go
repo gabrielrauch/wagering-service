@@ -2,6 +2,7 @@ package workers
 
 import (
 	"context"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -39,6 +40,12 @@ func TestAnOverflowingBackoffIsStillCapped(t *testing.T) {
 	if got := policy.after(20); got != 12*time.Hour {
 		t.Errorf("after(20) = %s, want the cap of %s", got, 12*time.Hour)
 	}
+	// An infinite factor needs no case of its own in validate because it ends
+	// up here, which is the right answer. This pins that it does.
+	infinite := Backoff{Initial: time.Second, Factor: math.Inf(1), Max: time.Minute}
+	if got := infinite.after(2); got != time.Minute {
+		t.Errorf("an infinite factor gave %s, want the cap of %s", got, time.Minute)
+	}
 }
 
 func TestBackoffRefusesAPolicyThatWouldNotBackAnythingOff(t *testing.T) {
@@ -61,6 +68,14 @@ func TestBackoffRefusesAPolicyThatWouldNotBackAnythingOff(t *testing.T) {
 			name:   "a maximum below the initial delay",
 			policy: Backoff{Initial: time.Minute, Factor: 2, Max: time.Second},
 			why:    "is below its initial delay",
+		},
+		{
+			// NaN passes every other check in the file: it is not below 1,
+			// math.Pow carries it, it is not above the cap, and it converts to
+			// a zero duration — a busy loop that no other guard catches.
+			name:   "a factor that is not a number",
+			policy: Backoff{Initial: time.Second, Factor: math.NaN(), Max: time.Minute},
+			why:    "is not a number",
 		},
 	}
 	for _, c := range cases {

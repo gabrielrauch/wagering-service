@@ -43,6 +43,17 @@ func (b Backoff) validate(what string) error {
 	case b.Initial <= 0:
 		return fmt.Errorf("workers: the %s backoff needs a positive initial delay, got %s",
 			what, b.Initial)
+	case math.IsNaN(b.Factor):
+		// Refused here because nothing downstream would refuse it. NaN is not
+		// less than 1, math.Pow carries it through, NaN is not greater than the
+		// cap, and converting it to a Duration yields zero — so a factor of NaN
+		// passes every other check in this file and turns the loop it paces
+		// into a busy loop. It is reachable without anybody typing it:
+		// strconv.ParseFloat("NaN", 64) succeeds, so a factor read from the
+		// environment arrives here. An infinite factor needs no case of its
+		// own; it overflows to the cap, which is the answer.
+		return fmt.Errorf("workers: the %s backoff factor is not a number, which would make "+
+			"every wait zero", what)
 	case b.Factor < 1:
 		return fmt.Errorf("workers: a %s backoff factor below 1 shortens each wait, got %v",
 			what, b.Factor)
@@ -85,6 +96,27 @@ func wholeSeconds(d time.Duration) time.Duration {
 		return time.Second
 	}
 	return (d + time.Second - 1).Truncate(time.Second)
+}
+
+// awaitStopped waits for a worker's loops to come back, and reports whether
+// they did.
+//
+// Bounded twice over: by the caller's own context, so a lifecycle hook that was
+// given a budget keeps it, and by budget, so a caller that was given none still
+// gets a bound. Waiting on the wait group alone reads as the obvious thing and
+// is the one shape that cannot honour a deadline at all — a call that does not
+// return when its context is cancelled would hold a shutdown open for ever, and
+// the deadline would silently mean "when cancellation was issued" rather than
+// "when Stop gives up".
+func awaitStopped(ctx context.Context, done <-chan struct{}, budget time.Duration) bool {
+	ctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // wait sleeps for d, or returns early when ctx ends.
