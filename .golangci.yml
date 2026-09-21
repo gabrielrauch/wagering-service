@@ -9,12 +9,13 @@
 version: "2"
 
 run:
-  # The integration suite lives behind a build tag, so without this the largest
-  # body of test code in the tree is the one body nothing lints. The tag is
-  # additive: no file outside internal/adapters carries it today, so enabling it
-  # changes what is checked and not what is built.
+  # The integration and multi-instance suites live behind build tags, so without
+  # these the largest body of test code in the tree is the one body nothing
+  # lints. The tags are additive: no non-test file carries either of them, so
+  # enabling them changes what is checked and not what is built.
   build-tags:
     - integration
+    - multi
 
 linters:
   default: standard

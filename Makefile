@@ -47,9 +47,14 @@ test-race: ## Run every test with the race detector
 test-integration: ## Run the suites that need real PostgreSQL, SQS and Keycloak
 	go test -race -tags integration -count=1 ./...
 
+# Nothing has to be started first: the suite brings the compose stack up itself
+# and builds the two binaries it drives, which is idempotent and costs about two
+# seconds against a stack that is already healthy. Budget three and a half
+# minutes from cold and two and a half warm; internal/multi/doc.go breaks that
+# down.
 .PHONY: test-multi
-test-multi: ## Run the suite that drives several replicas at once
-	go test -race -tags multi -count=1 ./...
+test-multi: ## Run the suite that drives several replicas at once (~3 min, starts the stack)
+	go test -race -tags multi -count=1 -timeout 20m ./...
 
 .PHONY: fmt
 fmt: ## Report what gofmt would change
