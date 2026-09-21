@@ -32,9 +32,16 @@
 //
 //   - About forty-five seconds for this package on its own, with the stack up
 //     and the images current. That is the ordinary case.
+//   - About seventy-five when one delivery to the deployment's own queue is
+//     swallowed. A receive left open on a worker container Compose replaced
+//     takes the message and never answers for it, so it comes back at the
+//     deployment's own thirty-second visibility timeout. That is LocalStack's
+//     rather than this service's, it is the single biggest source of spread
+//     here, and it is why the cross-transport scenario waits under a budget of
+//     its own rather than under settleBudget.
 //   - Fifty seconds to a minute and a half for `go test ./...`, which runs the
 //     rest of the tree beside it — including the suites that start PostgreSQL
-//     containers of their own, which is most of the spread.
+//     containers of their own.
 //   - About ninety seconds whenever Compose rebuilds the images, which it does
 //     on any run after a file the Dockerfile copies has changed. The test files
 //     are among them, so an edit here costs a rebuild.
