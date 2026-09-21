@@ -54,6 +54,20 @@ func (e *Error) WithField(field string) *Error {
 	return &clone
 }
 
+// Message returns the refusal's own words, without the code and the field that
+// [Error.Error] renders in front of them.
+//
+// It exists for a caller that already states the code and the field itself, and
+// would otherwise print both of them twice: the classification in
+// internal/app puts them in its own head, so what it needs from here is the
+// remainder. Everything else should use Error.
+func (e *Error) Message() string {
+	if e == nil {
+		return ""
+	}
+	return e.msg
+}
+
 // Error implements the error interface.
 func (e *Error) Error() string {
 	switch {
