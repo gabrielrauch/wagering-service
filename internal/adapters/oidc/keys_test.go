@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -251,8 +252,196 @@ func TestKeySetDropsKeysItMustNotVerifyWith(t *testing.T) {
 	if _, err := h.Authenticate(t.Context(), iss.mint(t, signing, claims)); err != nil {
 		t.Fatalf("a token signed by the signing key: %v", err)
 	}
-	_, err = h.Authenticate(t.Context(), iss.mint(t, encryption, claims))
+
+	// ErrUnknownKey rather than merely ErrKeyUnavailable is the whole
+	// assertion. It says the cache does not hold these keys at all — if the
+	// filters were dropped the lookup would find one and fail later, at
+	// verification, which is ErrTokenRejected and a different sentence about
+	// what this service is willing to hold.
+	for _, dropped := range []struct {
+		name string
+		kid  string
+	}{
+		{name: "the key published for encryption", kid: "encryption"},
+		{name: "the symmetric key", kid: "symmetric"},
+	} {
+		t.Run(dropped.name, func(t *testing.T) {
+			// Past the limit, so the miss gets its refresh and the answer is
+			// about what the document yields rather than about the rate limit.
+			h.clock.advance(pastTheLimit)
+
+			_, err := h.Authenticate(t.Context(), iss.mint(t, rsaKey(t, dropped.kid), claims))
+			assertRefused(t, err, ErrKeyUnavailable)
+			if !errors.Is(err, ErrUnknownKey) {
+				t.Errorf("err = %v, want the key to be absent from the cache entirely", err)
+			}
+		})
+	}
+}
+
+// TestKeySetKeepsTheFirstEntryUnderADuplicateIdentifier: a document with two
+// keys under one "kid" is already wrong, and the question is only which of them
+// this service will verify with. The first stands, so an entry appended to the
+// document cannot displace the key that is verifying today.
+func TestKeySetKeepsTheFirstEntryUnderADuplicateIdentifier(t *testing.T) {
+	t.Parallel()
+
+	genuine := rsaKey(t, "rotation-1")
+	impostor := rsaKey(t, "rotation-1")
+	iss := newIssuer(t, genuine, impostor)
+	h := newHarness(t, iss).start(t)
+	claims := iss.serviceClaims(h.clock.Now(), "service-account-wallet-service")
+
+	if _, err := h.Authenticate(t.Context(), iss.mint(t, genuine, claims)); err != nil {
+		t.Fatalf("a token signed by the first key published under the identifier: %v", err)
+	}
+	_, err := h.Authenticate(t.Context(), iss.mint(t, impostor, claims))
+	assertRefused(t, err, ErrTokenRejected)
+}
+
+// TestKeySetFollowsNoRedirect is the attack the origin checks would otherwise
+// only appear to stop: a jwks_uri that passes every test on its address and
+// then answers 302 to somewhere else. An open redirect on the issuer's own
+// origin is the ordinary way to get one.
+//
+// The assertion that matters is that the attacker's server was never asked.
+func TestKeySetFollowsNoRedirect(t *testing.T) {
+	t.Parallel()
+
+	attackerKey := rsaKey(t, "rotation-1")
+	var attackerRequests atomic.Int64
+	attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attackerRequests.Add(1)
+		encoded, err := json.Marshal(attackerKey.public)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"keys":[` + string(encoded) + `]}`))
+	}))
+	t.Cleanup(attacker.Close)
+
+	// The issuer's own origin, answering the JWKS address with a redirect.
+	var issuerURL string
+	mux := http.NewServeMux()
+	mux.HandleFunc(realmPath+discoveryPath, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"issuer": issuerURL, "jwks_uri": issuerURL + "/protocol/openid-connect/certs",
+		})
+	})
+	mux.HandleFunc(certsPath, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, attacker.URL, http.StatusFound)
+	})
+	redirecting := httptest.NewServer(mux)
+	t.Cleanup(redirecting.Close)
+	issuerURL = redirecting.URL + realmPath
+
+	for _, c := range []struct {
+		name    string
+		jwksURI string
+	}{
+		{name: "an address found by discovery", jwksURI: ""},
+		{name: "an address that was configured", jwksURI: redirecting.URL + certsPath},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			authenticator, err := NewAuthenticator(Config{
+				Issuer:     issuerURL,
+				Audience:   testAudience,
+				JWKSURI:    c.jwksURI,
+				HTTPClient: redirecting.Client(),
+				Clock:      newFixedClock(),
+			})
+			if err != nil {
+				t.Fatalf("NewAuthenticator: %v", err)
+			}
+
+			startErr := authenticator.OnStart(t.Context())
+			if startErr == nil {
+				t.Fatal("expected the redirect to be refused")
+			}
+			if !strings.Contains(startErr.Error(), "302") {
+				t.Errorf("err = %v, want it to report the redirect it would not follow",
+					startErr)
+			}
+
+			// And the key set it pointed at must not have been fetched — nor,
+			// therefore, cached, nor able to verify anything.
+			token := mintFor(t, attackerKey, issuerURL, "service-account-wallet-service")
+			_, err = authenticator.Authenticate(t.Context(), token)
+			assertRefused(t, err, ErrKeyUnavailable)
+			if got := attackerRequests.Load(); got != 0 {
+				t.Errorf("the redirect target was fetched %d time(s), want none", got)
+			}
+		})
+	}
+}
+
+// TestAClockStepBackwardsCostsOneIntervalAndNoMore: the stamp is wall-clock —
+// [systemClock] strips the monotonic reading — so a host corrected by NTP, or a
+// container resumed from a snapshot, can leave it in the future. Left alone the
+// subtraction in startRefresh would then decline every refresh for however far
+// the clock stepped, and a rotation inside that window would be invisible for
+// an hour. Clamping the stamp turns the step back into one ordinary interval.
+func TestAClockStepBackwardsCostsOneIntervalAndNoMore(t *testing.T) {
+	t.Parallel()
+
+	current := rsaKey(t, "rotation-1")
+	rotated := rsaKey(t, "rotation-2")
+	iss := newIssuer(t, current)
+	h := newHarness(t, iss).start(t)
+
+	iss.publish(current, rotated)
+	h.clock.advance(-time.Hour)
+
+	// Immediately after the step the limit still holds, which is the rate limit
+	// behaving normally rather than the step being ignored.
+	rotatedToken := func() string {
+		return iss.mint(t, rotated,
+			iss.serviceClaims(h.clock.Now(), "service-account-wallet-service"))
+	}
+	_, err := h.Authenticate(t.Context(), rotatedToken())
 	assertRefused(t, err, ErrKeyUnavailable)
+	if !errors.Is(err, ErrRefreshDeclined) {
+		t.Errorf("err = %v, want the rate limit to have declined the refresh", err)
+	}
+	if got := iss.certRequests.Load(); got != 1 {
+		t.Errorf("the issuer was asked for keys %d time(s), want 1", got)
+	}
+
+	// One interval later — measured from the stepped-back clock, not from the
+	// hour it went back — the refresh is allowed and the rotation lands.
+	h.clock.advance(pastTheLimit)
+	if _, err := h.Authenticate(t.Context(), rotatedToken()); err != nil {
+		t.Fatalf("a token signed by the rotated key, one interval after the step: %v", err)
+	}
+	if got := iss.certRequests.Load(); got != 2 {
+		t.Errorf("the issuer was asked for keys %d time(s), want 2", got)
+	}
+}
+
+// TestKeySetIsNotBlockedByAFailedStart: a process that started while the
+// identity provider was down must be able to pick the keys up as soon as it is
+// back, rather than sitting out the refresh interval for a loop that startup is
+// not.
+func TestKeySetIsNotBlockedByAFailedStart(t *testing.T) {
+	t.Parallel()
+
+	key := rsaKey(t, "rotation-1")
+	iss := newIssuer(t, key)
+	restore := iss.breakCerts()
+	h := newHarness(t, iss)
+
+	if err := h.OnStart(t.Context()); err == nil {
+		t.Fatal("expected the startup fetch to fail")
+	}
+	restore()
+
+	claims := iss.serviceClaims(h.clock.Now(), "service-account-wallet-service")
+	if _, err := h.Authenticate(t.Context(), iss.mint(t, key, claims)); err != nil {
+		t.Fatalf("the first token after the issuer recovered: %v", err)
+	}
 }
 
 func TestOnStartFailsFast(t *testing.T) {
@@ -263,8 +452,13 @@ func TestOnStartFailsFast(t *testing.T) {
 		iss := newIssuer(t, rsaKey(t, "rotation-1"))
 		iss.breakCerts()
 		h := newHarness(t, iss)
-		if err := h.OnStart(t.Context()); err == nil {
+
+		err := h.OnStart(t.Context())
+		if err == nil {
 			t.Fatal("expected a startup failure")
+		}
+		if !strings.Contains(err.Error(), "500") {
+			t.Errorf("err = %v, want it to report what the issuer answered", err)
 		}
 	})
 
@@ -288,8 +482,13 @@ func TestOnStartFailsFast(t *testing.T) {
 			c.JWKSURI = "http://127.0.0.1:1/realms/wagering/protocol/openid-connect/certs"
 			c.HTTPClient = &http.Client{}
 		})
-		if err := h.OnStart(t.Context()); err == nil {
+
+		err := h.OnStart(t.Context())
+		if err == nil {
 			t.Fatal("expected a startup failure")
+		}
+		if !strings.Contains(err.Error(), "127.0.0.1:1") {
+			t.Errorf("err = %v, want it to name the address it could not reach", err)
 		}
 	})
 
@@ -309,6 +508,9 @@ func TestOnStartFailsFast(t *testing.T) {
 		release()
 		if err == nil {
 			t.Fatal("expected the cancellation to be reported")
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("err = %v, want the caller's cancellation", err)
 		}
 	})
 }
@@ -358,8 +560,12 @@ func TestDiscovery(t *testing.T) {
 		iss.server.Close()
 		h := newHarness(t, iss, discovering)
 
-		if err := h.OnStart(t.Context()); err == nil {
+		err := h.OnStart(t.Context())
+		if err == nil {
 			t.Fatal("expected a startup failure")
+		}
+		if !strings.Contains(err.Error(), "OpenID configuration") {
+			t.Errorf("err = %v, want it to say discovery is what failed", err)
 		}
 	})
 
@@ -393,6 +599,31 @@ func TestDiscovery(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "off the issuer's own origin") {
 			t.Errorf("err = %v, want it to say the keys are published elsewhere", err)
+		}
+		if got := iss.certRequests.Load(); got != 0 {
+			t.Errorf("the keys were fetched %d time(s) from the address it refused", got)
+		}
+	})
+
+	t.Run("reads a redundant port as the origin it plainly is", func(t *testing.T) {
+		t.Parallel()
+		// Refusing these would fail closed, which is safe — and would fail
+		// closed on a correct configuration, which nobody meeting it could tell
+		// from a real refusal.
+		for _, c := range []struct {
+			a, b string
+			same bool
+		}{
+			{a: "http://idp/realms/w", b: "http://idp:80/certs", same: true},
+			{a: "https://idp:443/realms/w", b: "https://idp/certs", same: true},
+			{a: "http://idp/realms/w", b: "http://idp:8080/certs"},
+			{a: "http://idp/realms/w", b: "https://idp/certs"},
+			{a: "http://idp/realms/w", b: "http://elsewhere/certs"},
+			{a: "http://idp:443/realms/w", b: "http://idp/certs"},
+		} {
+			if got := sameOrigin(c.a, c.b); got != c.same {
+				t.Errorf("sameOrigin(%q, %q) = %v, want %v", c.a, c.b, got, c.same)
+			}
 		}
 	})
 }
@@ -498,8 +729,13 @@ func TestDiscoveryRefusesADocumentItCannotRead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewAuthenticator: %v", err)
 	}
-	if err := authenticator.OnStart(t.Context()); err == nil {
+
+	startErr := authenticator.OnStart(t.Context())
+	if startErr == nil {
 		t.Fatal("expected the unreadable document to be refused")
+	}
+	if !strings.Contains(startErr.Error(), "OpenID configuration") {
+		t.Errorf("err = %v, want it to say discovery is what failed", startErr)
 	}
 }
 
@@ -551,13 +787,55 @@ func TestVerifyingKeysKeepsOnlyWhatMayVerify(t *testing.T) {
 			want: []string{"usable"},
 		},
 		{
-			name: "two entries under one identifier: the first stands",
+			// Keycloak publishes an encryption key in the same document as its
+			// signing key. A verifier that kept it would be willing to check a
+			// signature against a key published for something else.
+			name: "a key published for encryption, beside one for signing",
 			document: func(t *testing.T) string {
-				other := rsaKey(t, "usable")
+				t.Helper()
+				encryption := rsaKey(t, "encryption")
+				if err := encryption.public.Set(jwk.KeyUsageKey, "enc"); err != nil {
+					t.Fatalf("mark the key for encryption: %v", err)
+				}
 				return `{"keys":[` + encoded(t, usable.public) + `,` +
-					encoded(t, other.public) + `]}`
+					encoded(t, encryption.public) + `]}`
 			},
 			want: []string{"usable"},
+		},
+		{
+			// Nothing should reach a symmetric key — no symmetric algorithm can
+			// be on the allow-list — and that is exactly why the cache refuses
+			// to hold one: a cache with no shared secret in it cannot be talked
+			// into verifying with one.
+			name: "a symmetric key, beside an asymmetric one",
+			document: func(t *testing.T) string {
+				t.Helper()
+				shared, err := jwk.Import([]byte("a shared secret nobody should verify with"))
+				if err != nil {
+					t.Fatalf("import a symmetric key: %v", err)
+				}
+				if err := shared.Set(jwk.KeyIDKey, "symmetric"); err != nil {
+					t.Fatalf("set the key id: %v", err)
+				}
+				return `{"keys":[` + encoded(t, usable.public) + `,` + encoded(t, shared) + `]}`
+			},
+			want: []string{"usable"},
+		},
+		{
+			// A key with no "use" at all is kept. The filter is "not something
+			// else", not "says signing": an issuer is allowed to publish a key
+			// without saying what it is for, and refusing those would refuse
+			// most of the JWKS documents in the world.
+			name: "a key that declares no use at all",
+			document: func(t *testing.T) string {
+				t.Helper()
+				plain := rsaKey(t, "plain")
+				if err := plain.public.Remove(jwk.KeyUsageKey); err != nil {
+					t.Fatalf("remove the key use: %v", err)
+				}
+				return `{"keys":[` + encoded(t, plain.public) + `]}`
+			},
+			want: []string{"plain"},
 		},
 		{
 			name:     "a document that is not a key set",

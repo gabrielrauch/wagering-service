@@ -234,9 +234,8 @@ func (i *issuer) setMetadata(metadata map[string]any) {
 	i.metadata = metadata
 }
 
-// mint signs a token, starting from claims that would verify and applying
-// whatever the case under test wanted different.
-func (i *issuer) mint(t *testing.T, key *signingKey, claims map[string]any) string {
+// signToken signs a claim set, whoever the issuer is meant to be.
+func signToken(t *testing.T, key *signingKey, claims map[string]any) string {
 	t.Helper()
 	payload, err := json.Marshal(claims)
 	if err != nil {
@@ -249,11 +248,26 @@ func (i *issuer) mint(t *testing.T, key *signingKey, claims map[string]any) stri
 	return string(signed)
 }
 
-// claimsFor builds the claim set a Keycloak client_credentials token carries,
+// mint signs a token, starting from claims that would verify and applying
+// whatever the case under test wanted different.
+func (i *issuer) mint(t *testing.T, key *signingKey, claims map[string]any) string {
+	t.Helper()
+	return signToken(t, key, claims)
+}
+
+// mintFor signs a wallet-service token for an issuer this suite did not start,
+// which is what the redirect case needs.
+func mintFor(t *testing.T, key *signingKey, issuerURL, subject string) string {
+	t.Helper()
+	return signToken(t, key,
+		claimSet(newFixedClock().Now(), issuerURL, subject, "wallet-service", internalRoleName))
+}
+
+// claimSet builds the claim set a Keycloak client_credentials token carries,
 // for a service account holding the given realm roles.
-func (i *issuer) claimsFor(now time.Time, subject, client string, roles ...string) map[string]any {
+func claimSet(now time.Time, issuerURL, subject, client string, roles ...string) map[string]any {
 	return map[string]any{
-		"iss":          i.url(),
+		"iss":          issuerURL,
 		"aud":          testAudience,
 		"sub":          subject,
 		"azp":          client,
@@ -262,6 +276,11 @@ func (i *issuer) claimsFor(now time.Time, subject, client string, roles ...strin
 		"typ":          "Bearer",
 		"realm_access": map[string]any{"roles": append([]string{"offline_access"}, roles...)},
 	}
+}
+
+// claimsFor is claimSet for this issuer.
+func (i *issuer) claimsFor(now time.Time, subject, client string, roles ...string) map[string]any {
+	return claimSet(now, i.url(), subject, client, roles...)
 }
 
 // providerClaims is what provider-a and provider-b present.

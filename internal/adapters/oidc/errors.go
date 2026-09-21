@@ -36,6 +36,26 @@ var (
 	ErrPrincipalUnresolved = errors.New("oidc: token names no principal")
 )
 
+// Why a key was unavailable. Both ride alongside [ErrKeyUnavailable] rather
+// than instead of it, so a handler that only asks the question above still gets
+// the same answer.
+//
+// They are apart because they are two different mornings as well. A steady
+// stream of [ErrUnknownKey] is somebody presenting invented key identifiers; a
+// steady stream of [ErrRefreshDeclined] is the rate limit doing its job while
+// that happens, or — if it outlasts the interval — a rotation this process
+// missed. A count of each is the cheapest way to tell the two apart, and the
+// same warning applies: never answer with them.
+var (
+	// ErrUnknownKey is a key identifier the issuer's published set does not
+	// contain, after a refresh that was allowed to happen.
+	ErrUnknownKey = errors.New("oidc: unknown key identifier")
+	// ErrRefreshDeclined is a refresh the rate limit turned away. It is what an
+	// attacker presenting a stream of invented key identifiers gets, and it
+	// costs the identity provider nothing.
+	ErrRefreshDeclined = errors.New("oidc: the key set was refreshed too recently")
+)
+
 // unverifiableSignature is what a caller is told whenever the signature did not
 // check out, whichever of the two reasons it was. See the block above.
 const unverifiableSignature = "the token's signature could not be verified"

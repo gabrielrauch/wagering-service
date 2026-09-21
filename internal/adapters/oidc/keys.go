@@ -67,7 +67,7 @@ type keySet struct {
 func newKeySet(s settings) *keySet {
 	return &keySet{
 		issuer:       s.issuer,
-		client:       s.client,
+		client:       withoutRedirects(s.client),
 		clock:        s.clock,
 		fetchTimeout: s.fetchTimeout,
 		minInterval:  s.minInterval,
@@ -75,25 +75,55 @@ func newKeySet(s settings) *keySet {
 	}
 }
 
+// withoutRedirects copies a client and refuses to follow anything it is
+// redirected to.
+//
+// This is what makes the origin checks in [keySet.discover] mean anything. They
+// test a URL, and an http.Client follows up to ten redirects by default, so
+// without this a jwks_uri that passed every check and then answered 302 would
+// hand key fetching to whatever it named — and a key set fetched from there
+// verifies tokens signed by whoever published it. An open redirect on the
+// identity provider's own origin is the ordinary way that happens, and it
+// passes a same-origin test on the URL trivially.
+//
+// The copy is deliberate. The client belongs to the caller, so its redirect
+// policy is not this package's to change; and the policy is not the caller's to
+// get wrong either, which is why it is overridden rather than merely required.
+// The one thing this cannot reach is a caller's own RoundTripper following
+// redirects underneath the client, which no http.Transport does.
+func withoutRedirects(client *http.Client) *http.Client {
+	copied := *client
+	copied.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &copied
+}
+
 // prime fetches the key set once, bounded, honouring the caller's context.
 //
 // It is the startup path and deliberately not the refresh path: it ignores the
-// rate limit, because the limit exists to stop a caller-driven loop and there
+// rate limit, because the limit exists to bound a caller-driven loop and there
 // is no caller here, and it reports the underlying failure verbatim, because
 // the audience is whoever is starting the process rather than whoever is
 // presenting a token.
+//
+// A failure leaves lastFetch alone, for the same reason. Stamping it would make
+// a process that started while the identity provider was down stay blind for
+// the whole interval after it came back, to bound a loop that startup is not;
+// and the cost of not stamping it is one fetch, because the miss that follows
+// stamps it whether it succeeds or fails.
 func (s *keySet) prime(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, s.fetchTimeout)
 	defer cancel()
 
 	keys, err := s.fetch(ctx)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.lastFetch = s.clock.Now()
 	if err != nil {
 		return err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.keys = keys
+	s.lastFetch = s.clock.Now()
 	return nil
 }
 
@@ -122,7 +152,7 @@ func (s *keySet) key(ctx context.Context, kid string) (jwk.Key, error) {
 		return key, nil
 	}
 	return nil, fmt.Errorf("oidc: the issuer publishes no key under that identifier: %w",
-		errNoSuchKey)
+		ErrUnknownKey)
 }
 
 // cached answers from what is already held.
@@ -132,18 +162,6 @@ func (s *keySet) cached(kid string) (jwk.Key, bool) {
 	key, ok := s.keys[kid]
 	return key, ok
 }
-
-// The conditions key reports by value, so that [Authenticator] can tell a
-// refusal it should render as "unverifiable" from one it should not reach.
-var (
-	// errNoSuchKey is a key identifier the issuer's published set does not
-	// contain, after a refresh that was allowed to happen.
-	errNoSuchKey = errors.New("oidc: unknown key identifier")
-	// errRefreshTooSoon is a refresh the rate limit declined. It is what an
-	// attacker presenting a stream of invented key identifiers gets, and it
-	// costs the identity provider nothing.
-	errRefreshTooSoon = errors.New("oidc: the key set was refreshed too recently")
-)
 
 // startRefresh joins the fetch already running, or starts one, or declines.
 //
@@ -158,8 +176,18 @@ func (s *keySet) startRefresh() (<-chan struct{}, error) {
 	if s.inflight != nil {
 		return s.inflight, nil
 	}
-	if !s.lastFetch.IsZero() && s.clock.Now().Sub(s.lastFetch) < s.minInterval {
-		return nil, errRefreshTooSoon
+	// A clock that stepped backwards must not freeze refreshing until it has
+	// caught up. The stamp is wall-clock — [systemClock] strips the monotonic
+	// reading on its way to UTC — so a host corrected by NTP, or a container
+	// resumed from a snapshot, can leave lastFetch in the future, and the
+	// subtraction below would then decline every refresh for however far it
+	// stepped. [Config.ClockSkew] already anticipates exactly that event.
+	now := s.clock.Now()
+	if now.Before(s.lastFetch) {
+		s.lastFetch = now
+	}
+	if !s.lastFetch.IsZero() && now.Sub(s.lastFetch) < s.minInterval {
+		return nil, ErrRefreshDeclined
 	}
 
 	done := make(chan struct{})
@@ -276,13 +304,30 @@ func (s *keySet) discover(ctx context.Context) (string, error) {
 }
 
 // sameOrigin reports whether two absolute URLs share a scheme and an authority.
+//
+// A port that is the scheme's default is dropped before comparing, so
+// http://idp:80 and http://idp are the one origin they plainly are. Keeping
+// them apart would fail closed and so would be safe, but it would fail closed
+// on a correct configuration, and whoever met it would have no way to tell that
+// refusal from a real one.
 func sameOrigin(a, b string) bool {
 	parsedA, errA := url.Parse(a)
 	parsedB, errB := url.Parse(b)
 	if errA != nil || errB != nil {
 		return false
 	}
-	return parsedA.Scheme == parsedB.Scheme && parsedA.Host == parsedB.Host
+	return parsedA.Scheme == parsedB.Scheme && authority(parsedA) == authority(parsedB)
+}
+
+// defaultPorts is the port a scheme means when a URL does not say.
+var defaultPorts = map[string]string{"http": "80", "https": "443"}
+
+// authority is a URL's host with a redundant port removed.
+func authority(u *url.URL) string {
+	if port := u.Port(); port != "" && defaultPorts[u.Scheme] == port {
+		return u.Hostname()
+	}
+	return u.Host
 }
 
 // get reads a bounded JSON document, within the caller's context.

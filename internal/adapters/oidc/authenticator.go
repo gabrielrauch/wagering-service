@@ -103,10 +103,12 @@ func (a *Authenticator) verify(ctx context.Context, bearer string) ([]byte, erro
 	case len(bearer) > maxCredentialBytes:
 		return nil, refuse(ErrTokenRejected, malformedToken)
 	case strings.Count(bearer, ".") != 2:
-		// A bearer credential is the compact serialisation. jws.Parse also
-		// reads the JSON one, which admits several signatures over a single
-		// payload — and a verifier that accepted it would have to choose which
-		// of them to believe. Refusing the shape means the choice never arises.
+		// A cheap shape filter, and no more than that. jws.Parse also reads the
+		// JSON serialisation, and while an ordinary JSON JWS has no dots at all
+		// and dies here, one with an extra member holding two of them does not
+		// — unknown members are ignored, so the count can be dressed up. What
+		// the count buys is that the common case never reaches a parser; what
+		// actually holds the line is the single-signature check below.
 		return nil, refuse(ErrTokenRejected, malformedToken)
 	}
 
@@ -114,6 +116,12 @@ func (a *Authenticator) verify(ctx context.Context, bearer string) ([]byte, erro
 	if err != nil {
 		return nil, refuse(ErrTokenRejected, malformedToken, err)
 	}
+	// Exactly one signature, and this is the check that means it. A JWS may
+	// carry several over one payload, and a verifier that accepted that would
+	// have to choose which of them to believe — taking the first is the usual
+	// answer and it lets anybody append a signature of their own to a token
+	// somebody else's key signed. Refusing the whole message means the choice
+	// never arises.
 	signatures := message.Signatures()
 	if len(signatures) != 1 {
 		return nil, refuse(ErrTokenRejected, malformedToken)
@@ -172,11 +180,15 @@ func (a *Authenticator) verify(ctx context.Context, bearer string) ([]byte, erro
 
 // BearerToken reads the credential out of an Authorization header value.
 //
-// It lives here rather than in the HTTP adapter because the answer to a header
-// that is missing, or carries another scheme, is the same 401 as the answer to
-// a token that does not verify — and this package is where a refusal knows how
-// to classify itself. The scheme is matched case-insensitively, as RFC 7235
-// requires, and nothing else is accepted.
+// It lives here rather than in the HTTP adapter because what counts as a
+// credential for this scheme is this package's contract, and because a header
+// that is missing or carries another scheme should be counted with the other
+// credential refusals rather than beside them: the refusal it returns carries
+// [ErrTokenRejected], which an HTTP adapter building an [app.Error] of its own
+// could produce but would have no reason to.
+//
+// The scheme is matched case-insensitively, as RFC 7235 requires, and nothing
+// else is accepted.
 func BearerToken(header string) (string, error) {
 	scheme, credential, found := strings.Cut(strings.TrimSpace(header), " ")
 	credential = strings.TrimSpace(credential)

@@ -1,7 +1,9 @@
 package oidc
 
 import (
+	"maps"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -139,12 +141,21 @@ func TestResolveFillsInWhatTheConfigurationLeftOpen(t *testing.T) {
 	if resolved.clock == nil {
 		t.Error("no clock was filled in")
 	}
-	if len(resolved.algorithms) != len(defaultAlgorithms) {
-		t.Errorf("allow-list holds %d algorithms, want %d",
-			len(resolved.algorithms), len(defaultAlgorithms))
+	// Written out rather than compared against defaultAlgorithms, which would
+	// be the same slice answering for itself: swapping one entry for another
+	// would keep the length and change what this service accepts.
+	wanted := []string{
+		"RS256", "RS384", "RS512",
+		"PS256", "PS384", "PS512",
+		"ES256", "ES384", "ES512",
+	}
+	got := slices.Sorted(maps.Keys(resolved.algorithms))
+	if !slices.Equal(got, slices.Sorted(slices.Values(wanted))) {
+		t.Errorf("the default allow-list is %v, want %v", got, wanted)
 	}
 	for _, refused := range []jwa.SignatureAlgorithm{
 		jwa.HS256(), jwa.HS384(), jwa.HS512(), jwa.NoSignature(),
+		jwa.EdDSA(), jwa.EdDSAEd25519(), jwa.ES256K(),
 	} {
 		if _, allowed := resolved.algorithms[refused.String()]; allowed {
 			t.Errorf("the default allow-list admits %q", refused)

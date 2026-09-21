@@ -49,6 +49,28 @@
 //     signing key, so that filter is load-bearing rather than theoretical.
 //   - Issuer, audience, expiry, not-before and issued-at are all checked, after
 //     the signature and never before it.
+//   - Exactly one signature is accepted. A JWS may carry several over one
+//     payload, and taking the first would let anybody append a signature of
+//     their own to a token somebody else's key signed.
+//   - Nothing on the key-fetching path follows a redirect. The origin checks
+//     below test a URL, and an http.Client follows redirects by default, so
+//     without that the checks would guard an address and not a destination.
+//
+// # What it does not guarantee: that a credential has one spelling
+//
+// The verifier is strict about what a token MEANS and lenient about how it is
+// written down. Base64 padding, an embedded newline, and an extra member in a
+// JSON serialisation are all tolerated by the parser, which reconstructs the
+// signing input canonically — so one token can arrive as several distinct
+// strings, all of which verify to the same claims. Re-serialising the header,
+// adding a claim or changing the key identifier are refused, so no algorithm or
+// key confusion is reachable through it; what is not provided is uniqueness of
+// the bytes.
+//
+// That matters to exactly one kind of consumer: anything that remembers tokens
+// — a replay cache, a denylist, a rate limit keyed on the credential. Nothing
+// does today. Whatever adds one must key on a claim, "jti" being the obvious
+// one, and not on the credential it arrived as.
 //
 // # What the key cache guarantees
 //
@@ -71,6 +93,11 @@
 // without re-deriving anything, and none of them has a financial effect or
 // reads a row.
 //
+// Two sentinels refine [ErrKeyUnavailable] rather than replacing it —
+// [ErrUnknownKey] and [ErrRefreshDeclined] — because a stream of invented key
+// identifiers and a rotation this process missed look identical from a caller
+// and are not the same morning for an operator.
+//
 // The rendered message names a claim-level reason — expired, wrong issuer,
 // wrong audience, disallowed algorithm — and that is deliberate: a JWT's header
 // and payload are base64, not ciphertext, so whoever holds the token can
@@ -91,9 +118,9 @@
 // Keycloak's client_credentials access token, and the parts of it that matter:
 //
 //   - "iss" must equal the configured issuer, compared byte for byte.
-//   - "aud" must contain the configured audience. Keycloak does not put an API's
-//     own identifier there by default, so the realm has to say so with an
-//     audience mapper.
+//   - "aud" must contain the configured audience, and may name others beside it.
+//     Keycloak does not put an API's own identifier there by default, so the
+//     realm has to say so with an audience mapper.
 //   - "sub" is the service account's user id. It becomes the principal's
 //     subject, which is audit trail and never a decision.
 //   - "realm_access.roles" decides what sort of principal this is: "provider"

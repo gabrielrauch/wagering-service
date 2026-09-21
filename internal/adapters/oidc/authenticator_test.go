@@ -34,14 +34,61 @@ func assertRefused(t *testing.T, err error, sentinel error) {
 	}
 }
 
-// assertSaysNothingAbout guards the one thing a refusal must never render.
+// assertSaysNothingAbout guards the thing a refusal must never carry, in the
+// place it would actually be carried.
+//
+// It walks the whole chain rather than reading err.Error(), because the
+// rendered message is "oidc: " plus a constant by construction and so is the
+// one channel that cannot leak by accident. The causes are the channel that
+// can: they hold library errors nobody here wrote, and internal/app warns in
+// as many words that an adapter which renders a chain publishes whatever is in
+// it. A guard that only read the message would be watching the locked door.
 func assertSaysNothingAbout(t *testing.T, err error, secrets ...string) {
 	t.Helper()
-	rendered := err.Error()
-	for _, secret := range secrets {
-		if secret != "" && strings.Contains(rendered, secret) {
-			t.Errorf("the refusal renders %q: %s", secret, rendered)
+	for _, rendered := range chainOf(err) {
+		for _, secret := range secrets {
+			if secret != "" && strings.Contains(rendered, secret) {
+				t.Errorf("the refusal carries %q, in: %s", secret, rendered)
+			}
 		}
+	}
+}
+
+// chainOf renders every error reachable from err, itself included.
+func chainOf(err error) []string {
+	if err == nil {
+		return nil
+	}
+	rendered := []string{err.Error()}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, cause := range joined.Unwrap() {
+			rendered = append(rendered, chainOf(cause)...)
+		}
+		return rendered
+	}
+	return append(rendered, chainOf(errors.Unwrap(err))...)
+}
+
+// TestChainOfReachesACauseNobodyRenders proves the guard above looks where it
+// says it does: a secret buried in a refusal's causes is found, although
+// nothing renders it.
+func TestChainOfReachesACauseNobodyRenders(t *testing.T) {
+	t.Parallel()
+
+	const credential = "eyJhbGciOiJSUzI1NiJ9.buried.signature"
+	hidden := refuse(ErrTokenRejected, malformedToken, errors.New("parsing "+credential))
+
+	if strings.Contains(hidden.Error(), credential) {
+		t.Fatal("the credential is rendered, so this proves nothing about the chain")
+	}
+	found := false
+	for _, rendered := range chainOf(hidden) {
+		if strings.Contains(rendered, credential) {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("chainOf did not reach the cause holding the credential")
 	}
 }
 
@@ -353,8 +400,11 @@ func TestAuthenticateRefusesTheToken(t *testing.T) {
 			if got := err.Error(); got != "oidc: "+c.want {
 				t.Errorf("message = %q, want %q", got, "oidc: "+c.want)
 			}
-			assertSaysNothingAbout(t, err, token, "service-account-wallet-service",
-				inventedAlgorithm)
+			// The algorithm is deliberately not in this list: jwx puts an
+			// unrecognised one in its own parse error, which rides in the
+			// chain and is never rendered. That the MESSAGE never names it is
+			// asserted above, by comparing it to a constant.
+			assertSaysNothingAbout(t, err, token, "service-account-wallet-service")
 		})
 	}
 }
@@ -462,8 +512,15 @@ func TestAuthenticateRefusesAKeyBoundToAnotherAlgorithm(t *testing.T) {
 	}
 }
 
-// TestAuthenticateRefusesTheJSONSerialisation keeps the choice of which
-// signature to believe from ever arising.
+// TestAuthenticateRefusesTheJSONSerialisation covers two checks that would each
+// look tested by the other.
+//
+// A plain JSON JWS has no dots, so it dies at the shape filter and never
+// reaches the parser — which means it says nothing at all about the
+// single-signature guard. Dressing it up with a member holding two dots gets it
+// past the filter, and then the guard is the only thing between a token
+// carrying somebody else's signature and a principal. The two cases are here so
+// that deleting either check fails something.
 func TestAuthenticateRefusesTheJSONSerialisation(t *testing.T) {
 	t.Parallel()
 
@@ -477,14 +534,80 @@ func TestAuthenticateRefusesTheJSONSerialisation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode the claims: %v", err)
 	}
-	serialised, err := jws.Sign(payload, jws.WithJSON(),
-		jws.WithKey(key.alg, key.private), jws.WithKey(other.alg, other.private))
-	if err != nil {
-		t.Fatalf("sign in JSON serialisation: %v", err)
+
+	// padded dresses a JSON JWS up to exactly two dots, which is all the shape
+	// filter looks at. Unknown members are ignored by the parser, so the
+	// document still parses as the JWS it is.
+	padded := func(t *testing.T, serialised []byte) string {
+		t.Helper()
+		var document map[string]json.RawMessage
+		if err := json.Unmarshal(serialised, &document); err != nil {
+			t.Fatalf("read back the JSON serialisation: %v", err)
+		}
+		document["padding"] = json.RawMessage(`".."`)
+		dressed, err := json.Marshal(document)
+		if err != nil {
+			t.Fatalf("re-encode the JSON serialisation: %v", err)
+		}
+		if got := strings.Count(string(dressed), "."); got != 2 {
+			t.Fatalf("the dressed document has %d dots, want 2 — it would be refused by "+
+				"the shape filter and prove nothing about the guard below it", got)
+		}
+		return string(dressed)
 	}
 
-	_, err = h.Authenticate(t.Context(), string(serialised))
-	assertRefused(t, err, ErrTokenRejected)
+	cases := []struct {
+		name  string
+		token func(t *testing.T) string
+	}{
+		{
+			name: "one signature, in JSON",
+			token: func(t *testing.T) string {
+				t.Helper()
+				serialised, err := jws.Sign(payload, jws.WithJSON(),
+					jws.WithKey(key.alg, key.private))
+				if err != nil {
+					t.Fatalf("sign in JSON serialisation: %v", err)
+				}
+				return string(serialised)
+			},
+		},
+		{
+			name: "two signatures, in JSON",
+			token: func(t *testing.T) string {
+				t.Helper()
+				serialised, err := jws.Sign(payload, jws.WithJSON(),
+					jws.WithKey(key.alg, key.private), jws.WithKey(other.alg, other.private))
+				if err != nil {
+					t.Fatalf("sign in JSON serialisation: %v", err)
+				}
+				return string(serialised)
+			},
+		},
+		{
+			name: "two signatures, dressed up to pass for compact",
+			token: func(t *testing.T) string {
+				t.Helper()
+				serialised, err := jws.Sign(payload, jws.WithJSON(),
+					jws.WithKey(key.alg, key.private), jws.WithKey(other.alg, other.private))
+				if err != nil {
+					t.Fatalf("sign in JSON serialisation: %v", err)
+				}
+				return padded(t, serialised)
+			},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			principal, err := h.Authenticate(t.Context(), c.token(t))
+			assertRefused(t, err, ErrTokenRejected)
+			if principal.Kind() != "" {
+				t.Errorf("a refusal produced a %q principal", principal.Kind())
+			}
+		})
+	}
 }
 
 // TestAuthenticateToleratesTheConfiguredSkew proves the skew is a bound rather
@@ -547,4 +670,184 @@ func TestBearerToken(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAuthenticateIsLenientAboutSpellingAndStrictAboutMeaning pins the one
+// thing this package deliberately does not provide: that a credential has a
+// single spelling.
+//
+// The parser reconstructs the signing input canonically, so padding, an
+// embedded newline and an extra member in a JSON document all name the same
+// token and all verify. Nothing here depends on the bytes being unique — the
+// package doc says so, and this is what makes that statement checkable rather
+// than merely written down. Anything that later remembers credentials, a replay
+// cache or a denylist, has to key on a claim instead.
+//
+// The second half is the half that matters: every spelling that changes what
+// the token MEANS is refused.
+func TestAuthenticateIsLenientAboutSpellingAndStrictAboutMeaning(t *testing.T) {
+	t.Parallel()
+
+	key := rsaKey(t, "rotation-1")
+	// A second published key, so that the "kid changed" case below names one
+	// the cache really holds: the header is part of the signing input, so
+	// rewriting it breaks the signature even when the key it now names is
+	// perfectly good. Without this the case would only prove that an unknown
+	// key identifier is refused, which is a different test.
+	alternate := rsaKey(t, "rotation-9")
+	iss := newIssuer(t, key, alternate)
+	h := newHarness(t, iss).start(t)
+	claims := iss.serviceClaims(h.clock.Now(), "service-account-wallet-service")
+	token := iss.mint(t, key, claims)
+	segments := strings.Split(token, ".")
+
+	// repad rewrites a segment in padded base64url, which is the same bytes
+	// spelled differently.
+	repad := func(t *testing.T, segment string) string {
+		t.Helper()
+		raw, err := base64.RawURLEncoding.DecodeString(segment)
+		if err != nil {
+			t.Fatalf("decode a segment: %v", err)
+		}
+		return base64.URLEncoding.EncodeToString(raw)
+	}
+	joined := func(head, payload, signature string) string {
+		return head + "." + payload + "." + signature
+	}
+
+	spellings := []struct {
+		name  string
+		token func(t *testing.T) string
+	}{
+		{
+			name:  "padded header",
+			token: func(t *testing.T) string { return joined(repad(t, segments[0]), segments[1], segments[2]) },
+		},
+		{
+			name:  "padded payload",
+			token: func(t *testing.T) string { return joined(segments[0], repad(t, segments[1]), segments[2]) },
+		},
+		{
+			name:  "padded signature",
+			token: func(t *testing.T) string { return joined(segments[0], segments[1], repad(t, segments[2])) },
+		},
+		{
+			name: "a newline inside a segment",
+			token: func(*testing.T) string {
+				return joined(segments[0], segments[1],
+					segments[2][:5]+"\n"+segments[2][5:])
+			},
+		},
+		{
+			name:  "surrounded by whitespace",
+			token: func(*testing.T) string { return " \n" + token + "\t " },
+		},
+		{
+			name: "one signature, in a JSON document dressed to pass for compact",
+			token: func(t *testing.T) string {
+				t.Helper()
+				payload, err := json.Marshal(claims)
+				if err != nil {
+					t.Fatalf("encode the claims: %v", err)
+				}
+				signed, err := jws.Sign(payload, jws.WithJSON(),
+					jws.WithKey(key.alg, key.private))
+				if err != nil {
+					t.Fatalf("sign in JSON serialisation: %v", err)
+				}
+				var document map[string]json.RawMessage
+				if err := json.Unmarshal(signed, &document); err != nil {
+					t.Fatalf("read back the JSON serialisation: %v", err)
+				}
+				document["padding"] = json.RawMessage(`".."`)
+				dressed, err := json.Marshal(document)
+				if err != nil {
+					t.Fatalf("re-encode the JSON serialisation: %v", err)
+				}
+				return string(dressed)
+			},
+		},
+	}
+
+	for _, c := range spellings {
+		t.Run("accepts "+c.name, func(t *testing.T) {
+			t.Parallel()
+			principal, err := h.Authenticate(t.Context(), c.token(t))
+			if err != nil {
+				t.Fatalf("Authenticate: %v", err)
+			}
+			if principal.Kind() != app.ServicePrincipal {
+				t.Errorf("kind = %q, want %q", principal.Kind(), app.ServicePrincipal)
+			}
+		})
+	}
+
+	meanings := []struct {
+		name  string
+		token func(t *testing.T) string
+	}{
+		{
+			name: "a header re-serialised with a field added",
+			token: func(t *testing.T) string {
+				t.Helper()
+				raw, err := base64.RawURLEncoding.DecodeString(segments[0])
+				if err != nil {
+					t.Fatalf("decode the header: %v", err)
+				}
+				var header map[string]json.RawMessage
+				if err := json.Unmarshal(raw, &header); err != nil {
+					t.Fatalf("read the header: %v", err)
+				}
+				header["cty"] = json.RawMessage(`"JWT"`)
+				rewritten, err := json.Marshal(header)
+				if err != nil {
+					t.Fatalf("re-encode the header: %v", err)
+				}
+				return joined(base64.RawURLEncoding.EncodeToString(rewritten),
+					segments[1], segments[2])
+			},
+		},
+		{
+			name: "a key identifier changed to one that is also published",
+			token: func(t *testing.T) string {
+				t.Helper()
+				rewritten := strings.ReplaceAll(string(mustDecode(t, segments[0])),
+					`"rotation-1"`, `"rotation-9"`)
+				return joined(base64.RawURLEncoding.EncodeToString([]byte(rewritten)),
+					segments[1], segments[2])
+			},
+		},
+		{
+			name: "a claim added to the payload",
+			token: func(t *testing.T) string {
+				t.Helper()
+				forged := iss.serviceClaims(h.clock.Now(), "service-account-wallet-service")
+				forged[providerIDClaim] = "provider-a"
+				payload, err := json.Marshal(forged)
+				if err != nil {
+					t.Fatalf("encode the forged claims: %v", err)
+				}
+				return joined(segments[0], base64.RawURLEncoding.EncodeToString(payload),
+					segments[2])
+			},
+		},
+	}
+
+	for _, c := range meanings {
+		t.Run("refuses "+c.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := h.Authenticate(t.Context(), c.token(t))
+			assertRefused(t, err, ErrTokenRejected)
+		})
+	}
+}
+
+// mustDecode reads a base64url segment or fails the test.
+func mustDecode(t *testing.T, segment string) []byte {
+	t.Helper()
+	raw, err := base64.RawURLEncoding.DecodeString(segment)
+	if err != nil {
+		t.Fatalf("decode a segment: %v", err)
+	}
+	return raw
 }

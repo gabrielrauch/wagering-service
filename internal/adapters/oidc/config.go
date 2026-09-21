@@ -100,6 +100,11 @@ type Config struct {
 	// every other caller in the process, so this package would have no say over
 	// either the TLS trust it fetches keys under or the connection limits it
 	// fetches them within.
+	//
+	// It is copied rather than used, and the copy does not follow redirects.
+	// Key fetching that followed one would make the origin checks guard an
+	// address instead of a destination, and that is not a property this package
+	// can leave to a client it was handed — see withoutRedirects.
 	HTTPClient *http.Client
 	// Algorithms is the signature algorithm allow-list, by JOSE name. Empty
 	// means [defaultAlgorithms]. A symmetric algorithm, "none", or a name jwx
