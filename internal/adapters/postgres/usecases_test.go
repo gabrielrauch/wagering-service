@@ -42,6 +42,12 @@ type injection struct {
 	// something went wrong, not that there was anything left to undo — and a
 	// failure injected before the first write proves nothing at all.
 	reachedTheEnd func(t *testing.T, err error)
+	// repair puts the fault right and returns a service that can run the same
+	// command through to the end. The scenario sends the operation again
+	// afterwards, which is what turns "these rows are absent" from a claim into
+	// a comparison: the rows that appear on the second attempt are exactly the
+	// ones the first had to undo.
+	repair func(t *testing.T, w *world) useCases
 }
 
 // cancellingIDs mints identifiers and cancels the request as it hands over the
@@ -70,24 +76,46 @@ func (i *cancellingIDs) EventID() app.EventID {
 	return app.NewEventID()
 }
 
+// The player and the operations the atomicity scenario works on. The failing
+// submission always arrives as ext-atomic under message-atomic, whichever kind
+// it is, so the absences below name one set of rows rather than a set per case.
+const (
+	atomicPlayer   = "player-atomic"
+	atomicExternal = "ext-atomic"
+	atomicMessage  = "message-atomic"
+	// The bet a refund can be a refund OF. It is laid down for every case,
+	// including the ones that do not name it, so that the state a failure is
+	// rolled back to is the same state in all four.
+	atomicReference = "ext-atomic-bet"
+	atomicStake     = "25.00"
+)
+
 // TestACommandThatFailsPartwayLeavesNothingBehind is atomicity stated as the
 // absence of rows rather than as the presence of an error.
 //
 // A submission writes into five tables — the inbox, the wallet, the wager
-// transaction, the ledger and the outbox — in that order, and the two cases
-// below both fail at the far end of it, with everything but the last statement
+// transaction, the ledger and the outbox — in that order, and both failures
+// below land at the far end of it, with everything but the last statement
 // already written. What is asserted is that none of it survives: not the row
-// the command is about, not the inbox row that claimed the message, and not a
-// minor unit of the balance it had already moved.
+// the command is about, not the inbox row that claimed the message, not the
+// hold a reversal takes on its reference, and not a minor unit of the balance
+// it had already moved.
 //
 // The failures are engineered, and where they land is the whole of the design.
 // One is the database refusing the append; the other is the caller going away
 // while the money is moving. Both are ordinary production failures, and both
 // leave a full write set behind to be undone.
+//
+// Each failure is tried against two operations, because they do not write the
+// same set of rows. A bet writes four tables; a refund writes those and takes a
+// row in active_reversal, which no caller here asks for — the trigger takes it
+// on the settle door's UPDATE, while the wallet is held. That is the write most
+// easily left behind, because nothing in the application layer knows it
+// happened.
 func TestACommandThatFailsPartwayLeavesNothingBehind(t *testing.T) {
 	t.Parallel()
 
-	cases := []struct {
+	faults := []struct {
 		name string
 		// inject installs the failure and says what the service should be
 		// wired with to meet it.
@@ -115,6 +143,11 @@ func TestACommandThatFailsPartwayLeavesNothingBehind(t *testing.T) {
 						// case says it does rather than somewhere earlier.
 						refusedWith(t, err, pgerrcode.InsufficientPrivilege)
 					},
+					repair: func(t *testing.T, w *world) useCases {
+						t.Helper()
+						w.exec(t, `GRANT INSERT ON wagering.outbox TO wagering_app`)
+						return w.wire(t, at(2))
+					},
 				}
 			},
 		},
@@ -139,84 +172,144 @@ func TestACommandThatFailsPartwayLeavesNothingBehind(t *testing.T) {
 						// nothing, which errors.go is explicit about.
 						classifies(t, err, app.Retryable)
 					},
+					repair: func(t *testing.T, w *world) useCases {
+						t.Helper()
+						// Nothing to put right but the context: a fresh
+						// service reads the clock and mints identifiers the
+						// ordinary way.
+						return w.wire(t, at(2))
+					},
 				}
 			},
 		},
 	}
 
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			t.Parallel()
-			w := newWorld(t)
-			// Opened before the failure is installed. The opening writes to
-			// four of the same five tables, so a fixture set up afterwards
-			// would fail in place of the thing under test.
-			opened := w.wire(t, at(0))
-			wallet := opened.open(t, "player-atomic", "100.00")
-			before := w.footprintOf(t, wallet.ID)
+	operations := []struct {
+		name  string
+		build func(t *testing.T) app.SubmitOperation
+		// holds is how many rows in active_reversal this operation takes when
+		// it is allowed to finish. It is asserted after the repair, and it is
+		// what stops the refund case proving nothing: a refund that was
+		// quietly REJECTED rather than processed would leave no hold behind
+		// either, and would satisfy the absence for the wrong reason.
+		holds int
+	}{
+		{
+			name: "a bet",
+			build: func(t *testing.T) app.SubmitOperation {
+				return carrying(submission(t, wagering.Bet, atomicPlayer,
+					atomicExternal, "key-atomic", "40.00"), atomicMessage)
+			},
+		},
+		{
+			name: "a refund, which takes a hold on its reference",
+			build: func(t *testing.T) app.SubmitOperation {
+				return carrying(reversingSubmission(
+					submission(t, wagering.Refund, atomicPlayer,
+						atomicExternal, "key-atomic", atomicStake),
+					atomicReference), atomicMessage)
+			},
+			holds: 1,
+		},
+	}
 
-			injected := c.inject(t, w)
-			failing := wireOnto(t, w.tm, injected.ids, at(1))
+	for _, fault := range faults {
+		for _, operation := range operations {
+			t.Run(operation.name+", "+fault.name, func(t *testing.T) {
+				t.Parallel()
+				w := newWorld(t)
+				// The fixture is laid down before the failure is installed. It
+				// writes into four of the same five tables, so a fixture set up
+				// afterwards would fail in place of the thing under test.
+				opened := w.wire(t, at(0))
+				wallet := opened.open(t, atomicPlayer, "100.00")
+				opened.clock.moveTo(at(1))
+				opened.submit(t, submission(t, wagering.Bet, atomicPlayer,
+					atomicReference, "key-atomic-bet", atomicStake), wagering.Processed)
+				before := w.footprintOf(t, wallet.ID)
 
-			bet := carrying(
-				submission(t, wagering.Bet, "player-atomic", "ext-atomic", "key-atomic", "40.00"),
-				"message-atomic")
-			result, err := failing.wagers.Submit(injected.ctx, bet)
-			if err == nil {
-				t.Fatalf("the submission came to %s, wanted it to fail partway", result.Status)
-			}
-			injected.reachedTheEnd(t, err)
+				injected := fault.inject(t, w)
+				failing := wireOnto(t, w.tm, injected.ids, at(2))
 
-			if got := w.footprintOf(t, wallet.ID); got != before {
-				t.Fatalf("the failed command left %+v behind, wanted %+v", got, before)
-			}
-			// Named table by table as well. The footprint above would also be
-			// satisfied by a command that never reached the database at all;
-			// these say which rows in particular are not there.
-			absences := []struct {
-				what  string
-				query string
-				args  []any
-			}{
-				{
-					what:  "an inbox row",
-					query: `SELECT count(*) FROM wagering.inbox WHERE message_id = $1`,
-					args:  []any{"message-atomic"},
-				},
-				{
-					what: "a wager transaction",
-					query: `SELECT count(*) FROM wagering.wager_transaction ` +
-						`WHERE external_transaction_id = $1`,
-					args: []any{"ext-atomic"},
-				},
-				{
-					what: "a ledger entry",
-					query: `SELECT count(*) FROM wagering.wallet_ledger_entry ` +
-						`WHERE wallet_id = $1 AND direction = 'DEBIT'`,
-					args: []any{uuidOf(wallet.ID)},
-				},
-				{
-					// By instant rather than by name: the command would have
-					// emitted two events and only one of them carries the
-					// provider's identifier, so a predicate on that would pass
-					// over the balance change.
-					what: "an outbox event",
-					query: `SELECT count(*) FROM wagering.outbox ` +
-						`WHERE aggregate_id = $1 AND occurred_at > $2`,
-					args: []any{uuidOf(wallet.ID), at(0)},
-				},
-			}
-			for _, absent := range absences {
-				if got := w.count(t, absent.query, absent.args...); got != 0 {
-					t.Fatalf("the failed command left %d of %s behind", got, absent.what)
+				result, err := failing.wagers.Submit(injected.ctx, operation.build(t))
+				if err == nil {
+					t.Fatalf("the submission came to %s, wanted it to fail partway", result.Status)
 				}
-			}
-			// And the balance is the one the wallet opened with, read back
-			// through the use case rather than off the row.
-			if got := opened.balanceOf(t, wallet.ID); got != "100.00" {
-				t.Fatalf("the wallet holds %s, wanted the 100.00 it opened with", got)
-			}
-		})
+				injected.reachedTheEnd(t, err)
+
+				// One assertion covering every table at once, the hold
+				// included — see footprint.
+				if got := w.footprintOf(t, wallet.ID); got != before {
+					t.Fatalf("the failed command left %+v behind, wanted %+v", got, before)
+				}
+				// Named table by table as well. The footprint above would also
+				// be satisfied by a command that never reached the database at
+				// all; these say which rows in particular are not there.
+				//
+				// The ledger and the outbox are asked by instant rather than by
+				// name: the fixture wrote into both, and the command would have
+				// emitted two events of which only one carries the provider's
+				// identifier, so a predicate on that would pass over the
+				// balance change.
+				absences := []struct {
+					what  string
+					query string
+					args  []any
+				}{
+					{
+						what:  "an inbox row",
+						query: `SELECT count(*) FROM wagering.inbox WHERE message_id = $1`,
+						args:  []any{atomicMessage},
+					},
+					{
+						what: "a wager transaction",
+						query: `SELECT count(*) FROM wagering.wager_transaction ` +
+							`WHERE external_transaction_id = $1`,
+						args: []any{atomicExternal},
+					},
+					{
+						what: "a ledger entry",
+						query: `SELECT count(*) FROM wagering.wallet_ledger_entry ` +
+							`WHERE wallet_id = $1 AND created_at > $2`,
+						args: []any{uuidOf(wallet.ID), at(1)},
+					},
+					{
+						what: "an outbox event",
+						query: `SELECT count(*) FROM wagering.outbox ` +
+							`WHERE aggregate_id = $1 AND occurred_at > $2`,
+						args: []any{uuidOf(wallet.ID), at(1)},
+					},
+				}
+				for _, absent := range absences {
+					if got := w.count(t, absent.query, absent.args...); got != 0 {
+						t.Fatalf("the failed command left %d of %s behind", got, absent.what)
+					}
+				}
+				// And the balance is the one the fixture left, read back
+				// through the use case rather than off the row.
+				if got := opened.balanceOf(t, wallet.ID); got != "75.00" {
+					t.Fatalf("the wallet holds %s, wanted the 75.00 the fixture bet left", got)
+				}
+
+				// Put the fault right and send exactly the same submission
+				// again. Nothing was persisted, so the idempotency key is still
+				// the provider's to spend — and the rows that appear now are
+				// the ones the failed attempt had to undo, which is what makes
+				// their absence above a comparison rather than a tautology.
+				healed := injected.repair(t, w)
+				healed.submit(t, operation.build(t), wagering.Processed)
+				for _, present := range absences {
+					if got := w.count(t, present.query, present.args...); got == 0 {
+						t.Fatalf("the repeated command wrote no %s, so its absence after "+
+							"the failure proved nothing", present.what)
+					}
+				}
+				if got := w.count(t, `SELECT count(*) FROM wagering.active_reversal`); got != operation.holds {
+					t.Fatalf("%s took %d holds on a reference, wanted %d",
+						operation.name, got, operation.holds)
+				}
+			})
+		}
 	}
 }
 
@@ -237,11 +330,12 @@ func TestACommandThatFailsPartwayLeavesNothingBehind(t *testing.T) {
 // # How this one is known to contend
 //
 // The wallet's lock is held by a third transaction before either submission
-// starts, so both queue on it and both are in flight at the same instant.
-// [contended] asserts exactly that of each: it started before the lock was
-// released and it had not answered by then. Submitting them one after another
-// instead was tried, and it fails there — the second bet's window cannot begin
-// until the first has answered, and the first cannot answer until the release.
+// starts, and the hold is not released until the database itself reports that
+// BOTH of them are queued on that lock — see [hold.awaitWaiters], which is the
+// assertion that names what they were waiting for rather than only that they
+// were waiting. [contended] then adds the window: each started before the
+// release and neither had answered by it. Submitting them one after another
+// instead was tried, and fails on both counts.
 func TestTwoConcurrentBetsSpendOneBalanceOnce(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
@@ -254,11 +348,10 @@ func TestTwoConcurrentBetsSpendOneBalanceOnce(t *testing.T) {
 		submission(t, wagering.Bet, "player-spec", "ext-spec-b", "key-spec-b", "80.00"),
 	}
 
-	release := w.holdWallet(t, "player-spec")
+	held := w.holdWallet(t, "player-spec")
 	collect := u.racing(t, bets)
-	// Long enough that a submission which was not blocked would have finished.
-	time.Sleep(contentionPause)
-	releasedAt := release()
+	held.awaitWaiters(t, len(bets))
+	releasedAt := held.release(t)
 	attempts := collect()
 
 	processed, rejected := 0, 0
@@ -278,6 +371,12 @@ func TestTwoConcurrentBetsSpendOneBalanceOnce(t *testing.T) {
 			if got := a.result.FailureCode; got != failure.InsufficientFunds {
 				t.Fatalf("the rejected bet carries %q, wanted %s", got, failure.InsufficientFunds)
 			}
+			// ports.go: Balance is non-nil EXACTLY when the status is
+			// PROCESSED. A rejection reporting one would be reporting a
+			// balance the operation never produced.
+			if got := renderedBalance(a.result); got != "none" {
+				t.Fatalf("the rejected bet reported a balance of %s, wanted none", got)
+			}
 		default:
 			t.Fatalf("bet %d came to %s, wanted PROCESSED or REJECTED", i, a.result.Status)
 		}
@@ -293,7 +392,21 @@ func TestTwoConcurrentBetsSpendOneBalanceOnce(t *testing.T) {
 	if got := w.debitsOf(t, wallet.ID); got != 1 {
 		t.Fatalf("the ledger holds %d debits, wanted the one bet that was paid for", got)
 	}
+	// What is there, absolutely, rather than only what the resends below do not
+	// change. Stated as one literal because each number is a claim: three
+	// operations and not four, two entries and not three, five events and not
+	// six — a rejection is announced but moves nothing.
 	settled := w.footprintOf(t, wallet.ID)
+	want := footprint{
+		Balance:      2000, // minor units: 20.00 BRL
+		Version:      2,    // opened, then moved once
+		Transactions: 3,    // the opening and the two bets
+		Entries:      2,    // the opening credit and the one debit
+		Events:       5,    // two for the opening, two for the bet, one for the rejection
+	}
+	if settled != want {
+		t.Fatalf("the two bets left %+v behind, wanted %+v", settled, want)
+	}
 
 	// Resent unchanged, under the same keys. The rejected one too: a definitive
 	// rejection binds its idempotency key to that payload for good, so the
@@ -316,6 +429,11 @@ func TestTwoConcurrentBetsSpendOneBalanceOnce(t *testing.T) {
 		case again.FailureCode != first.FailureCode:
 			t.Fatalf("resending bet %d answered %q, wanted %q",
 				i, again.FailureCode, first.FailureCode)
+		case renderedBalance(again) != renderedBalance(first):
+			// The balance the first submission answered with, not the wallet's
+			// balance now — which for the rejected bet is none at all.
+			t.Fatalf("resending bet %d reported a balance of %s, wanted %s",
+				i, renderedBalance(again), renderedBalance(first))
 		}
 	}
 
@@ -345,19 +463,32 @@ func TestTwoConcurrentBetsSpendOneBalanceOnce(t *testing.T) {
 // # How this one is known to contend
 //
 // As with the two bets above, the wallet's lock is held before any submission
-// starts, so all fifty queue on it rather than arriving one after another, and
-// [contended] says so of each of them. A submission that arrived after the
-// winner had committed would replay without ever having contended, and a suite
-// of forty-nine of those is the weaker test this one is written not to be:
-// sending them one after another instead was tried, and fails on the second.
+// starts, and the hold is released only once the database reports all FIFTY
+// backends queued on that lock — [hold.awaitWaiters]. That is the assertion the
+// whole scenario rests on, and it is the one that makes the pool's width
+// something the test enforces rather than something a reader has to trust: a
+// submission still waiting for a connection has begun no transaction and holds
+// nothing, so a pool narrowed to eight would leave forty-two of them invisible
+// and fail here rather than passing green on eight-way contention. [contended]
+// then adds the window for each. Sending them one after another instead was
+// tried, and fails on the second.
+//
+// # Why it does not run in parallel
+//
+// Fifty connections is most of a default cluster's hundred, and a test holding
+// that many alongside the rest of a parallel suite exhausts the cluster and
+// fails SOMEBODY ELSE — which presents as an unrelated flake. A test that does
+// not call t.Parallel runs with every parallel test paused, so the fifty are
+// the only connections there are. That is a bound rather than a margin: it does
+// not move when -parallel does.
 func TestFiftyIdenticalBetsProduceOneDebit(t *testing.T) {
-	t.Parallel()
 	w := newWorld(t)
 	const bets = 50
 	// A pool as wide as the race, so that fifty submissions are fifty
 	// connections rather than fifty goroutines taking turns on sixteen, and a
-	// lock timeout that bounds the queue rather than one hand-off.
-	u := wireOnto(t, w.wideManager(t, bets+1, time.Minute), mintedIDs{}, at(0))
+	// lock timeout that bounds the queue rather than one hand-off. The hold
+	// itself comes from the world's own pool, so the race gets all of this one.
+	u := wireOnto(t, w.wideManager(t, bets, time.Minute), mintedIDs{}, at(0))
 	wallet := u.open(t, "player-fifty", "100.00")
 	u.clock.moveTo(at(1))
 
@@ -373,10 +504,10 @@ func TestFiftyIdenticalBetsProduceOneDebit(t *testing.T) {
 		identical[i] = one
 	}
 
-	release := w.holdWallet(t, "player-fifty")
+	held := w.holdWallet(t, "player-fifty")
 	collect := u.racing(t, identical)
-	time.Sleep(contentionPause)
-	releasedAt := release()
+	held.awaitWaiters(t, bets)
+	releasedAt := held.release(t)
 	attempts := collect()
 
 	var (
@@ -434,7 +565,7 @@ func TestFiftyIdenticalBetsProduceOneDebit(t *testing.T) {
 	}
 }
 
-// TestASecondReversalIsRejectedAsAnOutcome takes a bet, returns it with a
+// TestAHeldReferenceRejectsFurtherReversals takes a bet, returns it with a
 // refund, and then tries to reverse the same bet again — twice, once with
 // another refund and once with a rollback, because the rule is about reversals
 // and not about one kind of them.
@@ -448,7 +579,7 @@ func TestFiftyIdenticalBetsProduceOneDebit(t *testing.T) {
 // backstop for a reference view built wrongly, and reaching it would mean the
 // rule now lives only in the schema — so an error from either attempt is a
 // finding about the adapter's reference view rather than a result to assert.
-func TestASecondReversalIsRejectedAsAnOutcome(t *testing.T) {
+func TestAHeldReferenceRejectsFurtherReversals(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
 	u := w.wire(t, at(0))
@@ -458,7 +589,7 @@ func TestASecondReversalIsRejectedAsAnOutcome(t *testing.T) {
 	u.submit(t, submission(t, wagering.Bet, "player-reversed", "ext-bet", "key-bet", "30.00"),
 		wagering.Processed)
 	u.clock.moveTo(at(2))
-	u.submit(t, against(
+	u.submit(t, reversingSubmission(
 		submission(t, wagering.Refund, "player-reversed", "ext-refund", "key-refund", "30.00"),
 		"ext-bet"), wagering.Processed)
 
@@ -466,7 +597,6 @@ func TestASecondReversalIsRejectedAsAnOutcome(t *testing.T) {
 	if got := u.balanceOf(t, wallet.ID); got != "100.00" {
 		t.Fatalf("the wallet holds %s, wanted the 100.00 the refund restored", got)
 	}
-	settled := w.footprintOf(t, wallet.ID)
 
 	attempts := []struct {
 		name     string
@@ -479,8 +609,15 @@ func TestASecondReversalIsRejectedAsAnOutcome(t *testing.T) {
 	}
 	for i, attempt := range attempts {
 		t.Run(attempt.name, func(t *testing.T) {
+			// Read here rather than once outside the loop, so that each
+			// subtest's expectation is a delta on the state IT found. The two
+			// attempts are independent — a rejected reversal changes nothing
+			// the next one reads — and an expectation counted from the top
+			// would make the second subtest unrunnable on its own, which t.Run
+			// promises it is.
+			before := w.footprintOf(t, wallet.ID)
 			u.clock.moveTo(at(3 + i))
-			result, err := u.wagers.Submit(t.Context(), against(
+			result, err := u.wagers.Submit(t.Context(), reversingSubmission(
 				submission(t, attempt.kind, "player-reversed",
 					attempt.external, attempt.key, "30.00"),
 				"ext-bet"))
@@ -541,13 +678,13 @@ func TestASecondReversalIsRejectedAsAnOutcome(t *testing.T) {
 					attempt.name, total, held)
 			}
 
-			// Exactly one more operation and one more event than the settled
-			// pair left behind, and not a minor unit of movement: the balance,
-			// the wallet version and the ledger are all where the refund left
-			// them.
-			want := settled
-			want.Transactions += i + 1
-			want.Events += i + 1
+			// Exactly one more operation and one more event than were there
+			// when this attempt started, and not a minor unit of movement: the
+			// balance, the wallet version, the ledger and the hold are all
+			// where the refund left them.
+			want := before
+			want.Transactions++
+			want.Events++
 			if got := w.footprintOf(t, wallet.ID); got != want {
 				t.Fatalf("after %s the wallet shows %+v, wanted %+v", attempt.name, got, want)
 			}

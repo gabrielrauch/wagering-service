@@ -245,8 +245,14 @@ func command(
 	return cmd
 }
 
-// reversing returns cmd pointed at the operation it undoes.
-func reversing(cmd wagering.Command, reference string) wagering.Command {
+// reversingCommand returns cmd pointed at the operation it undoes.
+//
+// Twin of [reversingSubmission], which does the same to a submission that has
+// not been parsed yet. Two of them because the two fixtures work at different
+// levels — this one builds the domain value a port-level test applies directly,
+// that one the strings a provider sends — and naming them apart by level rather
+// than by nothing is what keeps a reader from assuming there is only one.
+func reversingCommand(cmd wagering.Command, reference string) wagering.Command {
 	cmd.ReferenceExternalTransactionID = wagering.ExternalTransactionID(reference)
 	return cmd
 }
@@ -364,7 +370,7 @@ func (w *world) park(
 	now time.Time,
 ) wagering.TransactionID {
 	t.Helper()
-	cmd := reversing(command(t, wagering.Refund, player, external, "10.00", "BRL"), reference)
+	cmd := reversingCommand(command(t, wagering.Refund, player, external, "10.00", "BRL"), reference)
 	outcome := w.apply(t, cmd, now)
 	if got := outcome.Transaction.Status(); got != wagering.PendingReference {
 		t.Fatalf("the operation is %s, wanted PENDING_REFERENCE", got)
@@ -476,6 +482,27 @@ func (w *world) wideManager(t *testing.T, conns int32, lock time.Duration) *TxMa
 	}
 	return tm
 }
+
+// The ports this package does not implement, in the smallest form that proves
+// the wiring. Their real adapters are somebody else's task; what matters here
+// is that nothing about them is this package's problem.
+//
+// mintedIDs mints a fresh identifier on every call rather than answering a
+// fixed one, and that is load-bearing for the scenarios that submit the same
+// operation from fifty goroutines: a source handing them all one transaction id
+// would make "fifty callers, one identifier" true of the fixture instead of
+// true of the database.
+type (
+	mintedIDs      struct{}
+	discardDefects struct{}
+)
+
+func (mintedIDs) WalletID() wagering.WalletID           { return wagering.NewWalletID() }
+func (mintedIDs) TransactionID() wagering.TransactionID { return wagering.NewTransactionID() }
+func (mintedIDs) LedgerEntryID() wagering.LedgerEntryID { return wagering.NewLedgerEntryID() }
+func (mintedIDs) EventID() app.EventID                  { return app.NewEventID() }
+
+func (discardDefects) CannotCarryForward(context.Context, wagering.TransactionID, error) {}
 
 // tickingClock is the clock the use cases read, moved by hand.
 //
@@ -639,8 +666,9 @@ func submission(
 	}
 }
 
-// against points a submission at the operation it acts on.
-func against(s app.SubmitOperation, reference string) app.SubmitOperation {
+// reversingSubmission returns a submission pointed at the operation it undoes.
+// Twin of [reversingCommand]; see the note there.
+func reversingSubmission(s app.SubmitOperation, reference string) app.SubmitOperation {
 	s.Fields.ReferenceExternalTransactionID = reference
 	return s
 }
@@ -662,18 +690,34 @@ func carrying(s app.SubmitOperation, messageID string) app.SubmitOperation {
 	return s
 }
 
-// footprint is everything one wallet has left behind in the database.
+// renderedBalance is an operation result's balance as a caller would read it,
+// and "none" when it carries none — which ports.go says is exactly when the
+// operation is anything but PROCESSED.
+func renderedBalance(r app.OperationResult) string {
+	if r.Balance == nil {
+		return "none"
+	}
+	return r.Balance.Amount()
+}
+
+// footprint is everything one wallet has left behind in the database: every
+// table a command writes into, counted, plus what the wallet row itself says.
 //
 // It is compared whole rather than field by field, so that a test meaning "the
-// database is exactly where it was" says so in one assertion instead of six
-// that could each be forgotten. Inbox is not wallet-scoped and counts every row
-// in the database, which is this test's alone.
+// database is exactly where it was" says so in one assertion instead of seven
+// that could each be forgotten. Holds is the one that is easy to leave out and
+// the one worth most: a reversal's write set includes a row the active_reversal
+// trigger takes on its behalf, which no caller here writes and which a rollback
+// therefore has to undo without anything in the application having asked for
+// it. Inbox is not wallet-scoped and counts every row in the database, which is
+// this test's alone.
 type footprint struct {
 	Balance      int64
 	Version      int64
 	Transactions int
 	Entries      int
 	Events       int
+	Holds        int
 	Inbox        int
 }
 
@@ -687,9 +731,13 @@ func (w *world) footprintOf(t *testing.T, id wagering.WalletID) footprint {
 			`(SELECT count(*) FROM wagering.wager_transaction WHERE wallet_id = w.id), `+
 			`(SELECT count(*) FROM wagering.wallet_ledger_entry WHERE wallet_id = w.id), `+
 			`(SELECT count(*) FROM wagering.outbox WHERE aggregate_id = w.id), `+
+			`(SELECT count(*) FROM wagering.active_reversal a `+
+			`   JOIN wagering.wager_transaction r ON r.id = a.reversal_id `+
+			`  WHERE r.wallet_id = w.id), `+
 			`(SELECT count(*) FROM wagering.inbox) `+
 			`FROM wagering.wallet w WHERE w.id = $1`, uuidOf(id)).
-		Scan(&f.Balance, &f.Version, &f.Transactions, &f.Entries, &f.Events, &f.Inbox)
+		Scan(&f.Balance, &f.Version, &f.Transactions, &f.Entries, &f.Events,
+			&f.Holds, &f.Inbox)
 	if err != nil {
 		t.Fatalf("read what wallet %s has left behind: %v", id, err)
 	}
@@ -706,24 +754,57 @@ func (w *world) debitsOf(t *testing.T, id wagering.WalletID) int {
 			`WHERE wallet_id = $1 AND direction = 'DEBIT'`, uuidOf(id))
 }
 
-// holdWallet takes a wallet's movement lock and holds it until the returned
-// function is called, reporting through released what it was holding for.
+// queuedOnARowLock counts the backends waiting for a row lock in this test's
+// database.
+//
+// transactionid and tuple are the two waits a row lock produces: a contender
+// queues on the tuple to take its turn, and the one whose turn it is waits on
+// the transaction that holds the row. Nothing else in this database locks a row
+// while a hold is in place, so a backend in either wait is a backend waiting
+// for the held wallet.
+//
+// The holder itself is never counted. It is blocked on a Go channel with its
+// transaction open, which the server reports as waiting on the client.
+const queuedOnARowLock = `SELECT count(*) FROM pg_stat_activity ` +
+	`WHERE datname = current_database() AND wait_event_type = 'Lock' ` +
+	`AND wait_event IN ('transactionid', 'tuple')`
+
+// hold is one wallet's movement lock, taken by a transaction of the test's own
+// and kept until [hold.release].
 //
 // It is the barrier the concurrency scenarios are released from. Starting
 // goroutines together is not enough on its own: the first to arrive would take
 // the lock, finish and commit while the rest were still being scheduled, and
 // the contention the test is written for would never happen. With the lock
-// already held every submission queues on it, and every one of them is
-// therefore in flight at the same instant — which is what makes "each of them
-// started before the lock was released, and none of them answered before" a
-// statement about concurrency rather than about timing.
-func (w *world) holdWallet(t *testing.T, player string) (release func() time.Time) {
+// already held, every submission queues on it instead.
+type hold struct {
+	world  *world
+	player string
+	let    chan struct{}
+	letGo  sync.Once
+	done   chan error
+}
+
+// holdWallet takes a wallet's movement lock and keeps it.
+func (w *world) holdWallet(t *testing.T, player string) *hold {
 	t.Helper()
-	held := make(chan struct{})
-	let := make(chan struct{})
-	done := make(chan error, 1)
+	h := &hold{
+		world:  w,
+		player: player,
+		let:    make(chan struct{}),
+		done:   make(chan error, 1),
+	}
+	// Released whatever happens, and before the pools are closed: cleanups run
+	// last in, first out and this world's pools registered theirs first. A test
+	// that fails before it gets to release — awaitWaiters timing out is exactly
+	// that — would otherwise leave this goroutine parked on a channel nothing
+	// will ever close, holding a connection the pool's Close then waits for,
+	// and a test that should have failed in fifteen seconds instead hangs until
+	// the whole binary is killed. Observed, before this line existed.
+	t.Cleanup(h.free)
+	taken := make(chan struct{})
 	go func() {
-		done <- w.tm.WithinMovement(t.Context(), func(ctx context.Context, r *app.Repos) error {
+		h.done <- w.tm.WithinMovement(t.Context(), func(ctx context.Context, r *app.Repos) error {
 			wallet, err := r.Wallets.LockForMovement(ctx, wagering.WalletKey{
 				PlayerID: mustPlayer(t, player),
 				Currency: mustMoney(t, "0.00", "BRL").Currency(),
@@ -734,22 +815,71 @@ func (w *world) holdWallet(t *testing.T, player string) (release func() time.Tim
 			if wallet == nil {
 				return errors.New("there is no wallet to hold")
 			}
-			close(held)
-			<-let
+			close(taken)
+			<-h.let
 			return nil
 		})
 	}()
-	<-held
-	return func() time.Time {
-		// Read before the lock goes, so that "answered after this" cannot be
-		// satisfied by a submission that was never blocked.
-		at := time.Now()
-		close(let)
-		if err := <-done; err != nil {
-			t.Errorf("hold %q's wallet: %v", player, err)
+	<-taken
+	return h
+}
+
+// awaitWaiters blocks until exactly n backends are queued on the held wallet,
+// and fails the test if they never are.
+//
+// This is what tells "queued on the wallet" apart from "queued on something
+// else", and it is what the concurrency scenarios actually rest on. A
+// submission still waiting for a connection from its pool has not begun a
+// transaction and holds nothing, so it is invisible here — which means a pool
+// too narrow to carry the whole race fails this outright instead of quietly
+// reducing the contention to whatever the pool happened to allow. The pool's
+// width stops being a constant a reader has to trust and becomes one this
+// assertion enforces.
+//
+// It also replaces a sleep. That the queue has formed is a thing the database
+// can be asked; that 250 milliseconds is long enough for it to have formed is a
+// guess, and one that gets worse on a slower machine.
+func (h *hold) awaitWaiters(t *testing.T, n int) {
+	t.Helper()
+	const (
+		budget = 15 * time.Second
+		poll   = 2 * time.Millisecond
+	)
+	deadline := time.Now().Add(budget)
+	most := 0
+	for time.Now().Before(deadline) {
+		queued := h.world.count(t, queuedOnARowLock)
+		if queued == n {
+			return
 		}
-		return at
+		// The highest seen rather than the last seen. A queue that formed and
+		// then drained — every contender timing out on the lock, one after
+		// another — reads as nought at the deadline, which says the opposite
+		// of what happened.
+		most = max(most, queued)
+		time.Sleep(poll)
 	}
+	t.Fatalf("at most %d backends were ever queued on %q's wallet within %s, wanted %d: "+
+		"the submissions are not all contending for the lock",
+		most, h.player, budget, n)
+}
+
+// free lets the hold go without waiting for it, and may be called any number of
+// times. It is what the cleanup above uses.
+func (h *hold) free() { h.letGo.Do(func() { close(h.let) }) }
+
+// release lets the hold go, waits for its transaction to commit, and reports
+// the instant just before it let go.
+func (h *hold) release(t *testing.T) time.Time {
+	t.Helper()
+	// Read before the lock goes, so that "answered after this" cannot be
+	// satisfied by a submission that was never blocked.
+	at := time.Now()
+	h.free()
+	if err := <-h.done; err != nil {
+		t.Fatalf("hold %q's wallet: %v", h.player, err)
+	}
+	return at
 }
 
 // attempt is one submission's result and the window it ran in.

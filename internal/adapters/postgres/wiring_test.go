@@ -3,9 +3,7 @@
 package postgres
 
 import (
-	"context"
 	"testing"
-	"time"
 
 	"github.com/gabrielrauch/wagering-service/internal/app"
 	"github.com/gabrielrauch/wagering-service/internal/domain/wagering"
@@ -32,30 +30,12 @@ func TestTheAdapterWiresIntoTheUseCases(t *testing.T) {
 	w.apply(t, command(t, wagering.Bet, "player-wired", "ext-w-1", "10.00", "BRL"), at(1))
 	w.apply(t, command(t, wagering.Bet, "player-wired", "ext-w-2", "20.00", "BRL"), at(2))
 
-	wagers, err := app.NewWagering(app.WageringDeps{
-		Tx:        w.tm,
-		Processor: processor(t),
-		Clock:     fixedClock{at: at(9)},
-		IDs:       mintedIDs{},
-		Backoff:   app.BackoffPolicy{Initial: time.Second, Factor: 2, Max: time.Minute},
-		Defects:   discardDefects{},
-	})
-	if err != nil {
-		t.Fatalf("wire the wagering service: %v", err)
-	}
-	wallets, err := app.NewWallets(w.tm, fixedClock{at: at(9)}, mintedIDs{}, nil)
-	if err != nil {
-		t.Fatalf("wire the wallets service: %v", err)
-	}
-
-	service, err := app.NewServicePrincipal("t1")
-	if err != nil {
-		t.Fatalf("service principal: %v", err)
-	}
-	provider, err := app.NewProviderPrincipal("acme", "t1")
-	if err != nil {
-		t.Fatalf("provider principal: %v", err)
-	}
+	// Through the same fixture the end-to-end scenarios wire themselves with,
+	// so the package has one way of assembling the application layer rather
+	// than two that could drift.
+	u := w.wire(t, at(9))
+	wagers, wallets := u.wagers, u.wallets
+	service, provider := servicePrincipal(t), providerPrincipal(t)
 
 	view, err := wallets.ByID(t.Context(), service, wallet.ID())
 	if err != nil {
@@ -123,21 +103,3 @@ func TestTheAdapterWiresIntoTheUseCases(t *testing.T) {
 		t.Fatalf("resume claimed %s with nothing parked", resumed.Result.TransactionID)
 	}
 }
-
-// The ports this package does not implement, in the smallest form that proves
-// the wiring. Their real adapters are somebody else's task; what matters here
-// is that nothing about them is this package's problem.
-type (
-	fixedClock     struct{ at time.Time }
-	mintedIDs      struct{}
-	discardDefects struct{}
-)
-
-func (c fixedClock) Now() time.Time { return c.at }
-
-func (mintedIDs) WalletID() wagering.WalletID           { return wagering.NewWalletID() }
-func (mintedIDs) TransactionID() wagering.TransactionID { return wagering.NewTransactionID() }
-func (mintedIDs) LedgerEntryID() wagering.LedgerEntryID { return wagering.NewLedgerEntryID() }
-func (mintedIDs) EventID() app.EventID                  { return app.NewEventID() }
-
-func (discardDefects) CannotCarryForward(context.Context, wagering.TransactionID, error) {}

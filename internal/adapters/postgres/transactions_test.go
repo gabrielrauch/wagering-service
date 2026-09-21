@@ -190,7 +190,7 @@ func TestTheReferenceViewCarriesWhateverHoldsTheReference(t *testing.T) {
 		t.Fatal("an unreversed bet reports a reversal holding it")
 	}
 
-	refund := reversing(
+	refund := reversingCommand(
 		command(t, wagering.Refund, "player-view", "ext-refund", "80.00", "BRL"), "ext-bet")
 	settled := w.apply(t, refund, at(2))
 

@@ -249,14 +249,14 @@ func TestASecondReversalOfOneReferenceIsRefused(t *testing.T) {
 	wallet := w.openWallet(t, "player-reversed", "100.00", "BRL")
 
 	bet := w.apply(t, command(t, wagering.Bet, "player-reversed", "ext-bet", "80.00", "BRL"), at(1))
-	refund := reversing(
+	refund := reversingCommand(
 		command(t, wagering.Refund, "player-reversed", "ext-refund", "80.00", "BRL"), "ext-bet")
 	settled := w.apply(t, refund, at(2))
 	if settled.Transaction.Status() != wagering.Processed {
 		t.Fatalf("the refund is %s, wanted PROCESSED", settled.Transaction.Status())
 	}
 
-	rollback := reversing(
+	rollback := reversingCommand(
 		command(t, wagering.Rollback, "player-reversed", "ext-rollback", "80.00", "BRL"), "ext-bet")
 	// The view the domain is given omits the hold that is really there.
 	blind := &wagering.ReferenceView{Transaction: bet.Transaction}
