@@ -25,6 +25,17 @@ const (
 	// wrong — a variable is — and a supervisor that restarts on one should not
 	// restart on the other.
 	ExitConfig = 2
+	// ExitUnclean is a process that started, ran, and then failed to give its
+	// work back inside the shutdown budget.
+	//
+	// Its own code because it needs two different audiences to do two different
+	// things. A supervisor should restart it, exactly as it would on
+	// ExitFailed; an operator should also look, because messages were abandoned
+	// mid-flight or outbox claims were left held, and that is a latency
+	// incident somebody will otherwise meet as a mystery. Collapsed into
+	// ExitFailed it is invisible, because a failed start and an abandoned drain
+	// then look identical from outside.
+	ExitUnclean = 3
 )
 
 // API is the graph cmd/api runs: the HTTP routes, the two application services
@@ -37,6 +48,9 @@ const (
 func API(cfg config.Config) fx.Option {
 	return fx.Options(
 		lifecycle(cfg),
+		// It has somewhere to report an outage, so an outage does not stop it
+		// starting. See [queueStartUp].
+		fx.Supply(queueStartUp{tolerateOutage: true}),
 		Telemetry(),
 		Config(cfg),
 		Postgres(),
@@ -82,13 +96,55 @@ func Worker(cfg config.Config) fx.Option {
 
 	return fx.Options(append([]fx.Option{
 		lifecycle(cfg),
+		// It has no readiness endpoint to shed traffic through and no buffer of
+		// its own, so a queue it cannot reach stops it. See [queueStartUp].
+		fx.Supply(queueStartUp{tolerateOutage: false}),
 		Telemetry(),
 		Config(cfg),
 		Postgres(),
 		SQS(),
 		App(),
+		// Before the loops, deliberately. See [checks].
+		checks(cfg),
 	}, loops...)...)
 }
+
+// checks forces every start-up validation this binary makes to be registered
+// before any loop's Start hook is.
+//
+// Without it the order is the order Fx happens to construct things in, and that
+// interleaves: the consumer module's invoke builds the inbound queue and then
+// appends the consumer's Start, so the outbound queue is resolved AFTER the
+// consumer has begun handling messages. A worker with a wrong
+// SQS_OUTBOUND_QUEUE would consume operations, commit transactions and write
+// outbox rows and only then fail to start. Nothing is corrupted by that — the
+// drain releases what is held, the outbox is durable and the inbox absorbs the
+// replays — but it is not "nothing starts half up", which is what this package
+// promises.
+//
+// It is conditional on the same flags [Worker] is, so it forces exactly the
+// queues this binary will use and no others: a worker running only the
+// reference loop still resolves nothing.
+//
+// A module rather than bare invokes, and that is load-bearing rather than
+// tidiness. Fx runs every CHILD module's invokes before the parent's own, so a
+// root-level fx.Invoke listed here would run last of all — after every loop had
+// started, which is the ordering this exists to prevent. Inside a module it
+// runs in declaration order with the rest.
+func checks(cfg config.Config) fx.Option {
+	forced := make([]fx.Option, 0, 2)
+	if cfg.Consumer.Enabled {
+		forced = append(forced, fx.Invoke(resolveInboundFirst))
+	}
+	if cfg.Publisher.Enabled {
+		forced = append(forced, fx.Invoke(resolveOutboundFirst))
+	}
+	return fx.Module("checks", forced...)
+}
+
+// The two invokes that do nothing but exist earlier than a loop does.
+func resolveInboundFirst(inboundQueue)   {}
+func resolveOutboundFirst(outboundQueue) {}
 
 // lifecycle bounds start-up and shutdown as a whole.
 //
@@ -138,13 +194,22 @@ func Run(
 		return ExitFailed
 	}
 
-	<-ctx.Done()
+	// Two ways to end, not one. A signal is the ordinary one; the other is a
+	// component deciding this process can no longer do its job and asking for
+	// it through the fx.Shutdowner every graph here is given. Without the
+	// second there is no way for a graph that has stopped working to say so,
+	// and the only failure mode left is the worst one — a process that is up,
+	// healthy-looking and doing nothing.
+	select {
+	case <-ctx.Done():
+	case <-application.Wait():
+	}
 
 	stopCtx, cancelStop := stopContext(ctx, application.StopTimeout())
 	defer cancelStop()
 	if err := application.Stop(stopCtx); err != nil {
 		_, _ = fmt.Fprintf(stderr, "%s: stop: %v\n", name, err)
-		return ExitFailed
+		return ExitUnclean
 	}
 	return ExitOK
 }

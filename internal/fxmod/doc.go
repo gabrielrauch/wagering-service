@@ -39,20 +39,60 @@
 //     not exist is a start-up failure rather than a wall of 401s.
 //
 // A hook that fails stops the start, Fx rolls back the hooks that had already
-// run, and the process exits. Nothing starts half up.
+// run, and the process exits.
+//
+// All three are registered before any loop's Start hook, which does not happen
+// on its own: Fx appends hooks in the order it constructs things, and the
+// consumer module builds its queue and then appends its own Start, so the
+// OUTBOUND queue would be resolved after the consumer had begun handling
+// messages. [checks] is what orders them, and it is why "nothing starts half
+// up" is a true sentence about this package rather than a hopeful one.
+//
+// Not every failure to reach a queue stops every process, and the line is the
+// adapter's own classification rather than a judgement made here: a queue that
+// does not exist is Unretryable and stops both binaries, while a queue that is
+// momentarily unreachable is Retryable and stops only the binary that has
+// nowhere to report it. See [queueStartUp], which is the whole of that
+// reasoning.
+//
+// A loop is started on a context that outlives the start-up budget, not on the
+// one the hook is handed. All three root their run context in whatever they are
+// given, so a loop started on the start-up context stops receiving the moment
+// START_TIMEOUT expires — seconds after the process came up, silently, with
+// every Stop afterwards reporting a clean shutdown of a loop that had been dead.
+// See [outlivesStartUp].
 //
 // # Shutdown, and why nothing here orders it by hand
 //
 // Fx runs OnStop hooks in the reverse of the order they were appended, and this
-// package relies on that deliberately rather than hand-rolling a sequence. What
-// makes it reliable is that the order hooks are appended in is not a convention
-// anybody has to maintain: a constructor cannot run before the constructors it
-// depends on, so appending each hook where its component is built makes the
-// dependency graph itself the ordering.
+// package relies on that deliberately rather than hand-rolling a sequence.
+// Three facts make the append order something nobody has to maintain, and it is
+// worth being exact about which, because the obvious argument — that every
+// hook-appending constructor takes the logger — is not true: four of them do
+// not.
 //
-// The chain is [newLogger] -> [newPool] -> the transaction manager and the
-// outbox claims -> the application services -> the loops or the server. Reversed,
-// that is:
+//  1. Only four things here append an OnStop hook at all: [newLogger],
+//     [newPool], the three run* invokes and [serve]. The constructors that do
+//     not take the logger — [newDatabaseHealth], [newInboundQueue],
+//     [newOutboundQueue], [newAuthenticator] — append OnStart and nothing else,
+//     and Fx skips a nil OnStop, so where they sit cannot matter.
+//  2. [newLogger] is forced during fx.New by fx.WithLogger, before any invoke
+//     runs and before any other constructor is asked for. Its hook is therefore
+//     the first appended and the last run, unconditionally — a stronger
+//     guarantee than depending on it would give.
+//  3. Everything that appends an OnStop hook after that is built FROM the pool:
+//     the loops through the application services and the outbox claims, the
+//     server through the API. A constructor cannot run before the constructors
+//     it depends on, so [newPool] runs before all of them and its hook runs
+//     after all of theirs.
+//
+// The three run* hooks and [serve]'s are appended from fx.Invoke rather than
+// from a constructor, and that is not in tension with the above: they are the
+// leaves of the graph, nothing depends on them, so an invoke is the only thing
+// that can force them into existence — and their position is fixed anyway by
+// the fact that their dependencies were constructed first.
+//
+// Reversed, the order is:
 //
 //	the server drains, or the loops stop and give their work back
 //	  -> the pool closes

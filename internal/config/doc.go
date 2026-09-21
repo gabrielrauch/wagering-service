@@ -31,12 +31,14 @@
 //
 // The one exception is [Backoff.Factor], and it is an exception for a reason
 // worth writing down. strconv.ParseFloat("NaN", 64) succeeds with no error, so
-// a factor of NaN is a value this package would otherwise hand on. workers.Backoff
-// refuses it at construction; app.BackoffPolicy does not, because its only
-// check is Factor < 1 and NaN is not less than anything. A NaN there survives
-// every downstream check and turns the reference worker's schedule into "due
-// immediately, for ever". It is refused here, once, for every factor, so that
-// neither consumer has to be the one that remembers.
+// a factor of NaN is a value this package would otherwise hand on, and NaN is
+// not less than anything — so a check of the form "the factor must be at least
+// one" lets it straight through. Both consumers now refuse it where they use
+// it, which is where the invariant belongs; this package refuses it as well,
+// and the difference is what an operator is told. A constructor can say that a
+// worker's backoff factor is not a number. Only the loader can say which
+// VARIABLE carried it, and only the loader refuses it before anything has been
+// built from it.
 //
 // # Every value is reported, not the first
 //

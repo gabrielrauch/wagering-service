@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/fx"
+
 	"github.com/gabrielrauch/wagering-service/internal/config"
 )
 
@@ -164,5 +166,102 @@ func TestTheShutdownBudgetSurvivesTheSignalThatStartedIt(t *testing.T) {
 	// lines the shutdown writes.
 	if stop.Value(key{}) != "correlation" {
 		t.Error("the shutdown lost the context's values along with its cancellation")
+	}
+}
+
+// TestRunTellsACleanShutdownFromOneThatLeftWorkBehind is why there is a third
+// non-zero exit code.
+//
+// A drain that ran out of time and a start that failed want the same thing from
+// a supervisor — restart — and different things from an operator: the second is
+// a deployment that never came up, the first is messages abandoned mid-flight
+// and outbox claims left held, which is a latency incident somebody will
+// otherwise meet as a mystery. Collapsed into one code they are
+// indistinguishable from outside the process.
+//
+// The graph is this test's own, because what is under test is [Run]'s reading
+// of what Fx gives it and not any particular component's shutdown.
+func TestRunTellsACleanShutdownFromOneThatLeftWorkBehind(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		stop error
+		want int
+	}{
+		{"a drain that finished", nil, ExitOK},
+		{"a drain that did not", errors.New("2 receivers still working"), ExitUnclean},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Ended through the Shutdowner rather than by cancelling the
+			// context, because a cancellation that lands while Fx is still
+			// running OnStart hooks fails the START — which is a different
+			// exit code and not the one under test. The signal path is proved
+			// end to end by TestRunCarriesTheWorkerFromTheEnvironmentToACleanExit.
+			graph := func(config.Config) fx.Option {
+				return fx.Options(
+					fx.StopTimeout(5*time.Second),
+					fx.Invoke(func(lc fx.Lifecycle, shutdowner fx.Shutdowner) {
+						lc.Append(fx.Hook{
+							OnStart: func(context.Context) error {
+								go func() { _ = shutdowner.Shutdown() }()
+								return nil
+							},
+							OnStop: func(context.Context) error { return tc.stop },
+						})
+					}),
+				)
+			}
+
+			var reported strings.Builder
+			code := Run(context.Background(), &reported, "worker",
+				config.Static(minimalEnvironment()), graph)
+			if code != tc.want {
+				t.Fatalf("exited %d, want %d: %s", code, tc.want, reported.String())
+			}
+		})
+	}
+}
+
+// TestAComponentCanEndTheProcess is the other way out of [Run].
+//
+// Without it a graph that has stopped doing its job has no way to say so, and
+// the only failure mode left is the worst one this system has: a process that
+// is up, looks healthy and is doing nothing. Fx puts an fx.Shutdowner in every
+// graph here; this is what makes asking it for anything.
+func TestAComponentCanEndTheProcess(t *testing.T) {
+	t.Parallel()
+
+	// Never cancelled. The process must end on the component's word alone.
+	graph := func(config.Config) fx.Option {
+		return fx.Options(
+			fx.StopTimeout(5*time.Second),
+			fx.Invoke(func(lc fx.Lifecycle, shutdowner fx.Shutdowner) {
+				lc.Append(fx.Hook{OnStart: func(context.Context) error {
+					go func() { _ = shutdowner.Shutdown() }()
+					return nil
+				}})
+			}),
+		)
+	}
+
+	done := make(chan int, 1)
+	go func() {
+		var reported strings.Builder
+		done <- Run(context.Background(), &reported, "worker",
+			config.Static(minimalEnvironment()), graph)
+	}()
+
+	select {
+	case code := <-done:
+		if code != ExitOK {
+			t.Fatalf("a component asked the process to stop and it exited %d, want %d",
+				code, ExitOK)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("a component asked the process to stop and nothing happened; only a " +
+			"signal can end it")
 	}
 }

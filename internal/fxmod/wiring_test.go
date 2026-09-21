@@ -31,6 +31,7 @@ var (
 	_ httpapi.Authenticator   = (*oidc.Authenticator)(nil)
 	_ httpapi.ReadinessCheck  = (*postgres.Health)(nil)
 	_ httpapi.ReadinessCheck  = (*sqs.Health)(nil)
+	_ httpapi.ReadinessCheck  = queueReadiness{}
 
 	_ app.Clock                  = systemClock{}
 	_ app.IDs                    = mintedIDs{}

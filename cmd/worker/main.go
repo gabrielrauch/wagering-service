@@ -10,19 +10,20 @@
 // process holding a pool open and consuming nothing looks exactly like a
 // healthy deployment while its queues fill.
 //
-// Exit codes, which are cmd/migrate's:
+// Exit codes. Nought, one and two are cmd/migrate's:
 //
 //	0  started, ran and stopped cleanly
-//	1  the graph would not build, a dependency could not be reached at
-//	   start-up, or the shutdown left work behind
+//	1  the graph would not build, or a dependency could not be reached at
+//	   start-up
 //	2  the environment is not one this service can be configured from
+//	3  it ran, and then failed to give its work back inside STOP_TIMEOUT
 //
 // An interrupt or a SIGTERM begins the shutdown: each loop stops receiving at
 // once and drains what it has in hand within its own drain timeout, handing
 // back whatever it did not finish — messages released for immediate
 // redelivery, outbox claims returned — then the database pool closes, then
 // telemetry is flushed. A loop that ran out of drain time says so, and the
-// process exits 1 rather than pretending the deployment was clean.
+// process exits 3 rather than pretending the deployment was clean.
 package main
 
 import (

@@ -8,7 +8,6 @@ import (
 	httpapi "github.com/gabrielrauch/wagering-service/internal/adapters/http"
 	"github.com/gabrielrauch/wagering-service/internal/adapters/oidc"
 	"github.com/gabrielrauch/wagering-service/internal/adapters/postgres"
-	"github.com/gabrielrauch/wagering-service/internal/adapters/sqs"
 	"github.com/gabrielrauch/wagering-service/internal/app"
 	"github.com/gabrielrauch/wagering-service/internal/config"
 )
@@ -33,7 +32,7 @@ func HTTPServer() fx.Option {
 // neither ready nor unready to an orchestrator that set none, which is the one
 // answer nothing can act on.
 func newReadiness(
-	database *postgres.Health, queue *sqs.Health,
+	database *postgres.Health, queue queueReadiness,
 ) map[string]httpapi.ReadinessCheck {
 	return map[string]httpapi.ReadinessCheck{
 		"postgres": database,

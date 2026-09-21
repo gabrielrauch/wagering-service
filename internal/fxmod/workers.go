@@ -89,7 +89,7 @@ func consumerSettings(cfg config.Consumer, queues config.SQS) workers.ConsumerCo
 // runConsumer starts the loop and stops it within its drain deadline.
 func runConsumer(lc fx.Lifecycle, consumer *workers.Consumer) {
 	lc.Append(fx.Hook{
-		OnStart: consumer.Start,
+		OnStart: outlivesStartUp(consumer.Start),
 		OnStop:  stopWorker("consumer", consumer.Stop),
 	})
 }
@@ -135,7 +135,7 @@ func publisherSettings(cfg config.Publisher) workers.PublisherConfig {
 // why the pool's close hook is appended where it is. See [newPool].
 func runPublisher(lc fx.Lifecycle, publisher *workers.Publisher) {
 	lc.Append(fx.Hook{
-		OnStart: publisher.Start,
+		OnStart: outlivesStartUp(publisher.Start),
 		OnStop:  stopWorker("publisher", publisher.Stop),
 	})
 }
@@ -166,9 +166,35 @@ func referenceSettings(cfg config.Reference) workers.ReferenceConfig {
 // runReferenceWorker starts the loop and stops it within its drain deadline.
 func runReferenceWorker(lc fx.Lifecycle, worker *workers.ReferenceWorker) {
 	lc.Append(fx.Hook{
-		OnStart: worker.Start,
+		OnStart: outlivesStartUp(worker.Start),
 		OnStop:  stopWorker("reference worker", worker.Stop),
 	})
+}
+
+// outlivesStartUp is the other half of [stopContext], and it exists for the
+// same reason at the other end of the process's life.
+//
+// Fx hands an OnStart hook the context [Run] built from START_TIMEOUT, and all
+// three loops root their run context in the one they are given — Consumer.Start
+// says so outright: "a composition root that cancels it stops this consumer the
+// way a crash would". A loop started on that context therefore stops receiving
+// the instant the start-up budget expires, a few seconds after the process came
+// up, and nothing reports it: the process stays alive, keeps its pool, and each
+// Stop then reports a clean shutdown of a loop that had been dead for hours.
+// That is the same silent no-op cmd/worker's "no loops is refused" guard exists
+// to prevent, reached by another road.
+//
+// WithoutCancel keeps the values — a correlation or a trace established at
+// start-up belongs on the lines a loop writes — and drops the cancellation,
+// which the loop does not need: Stop owns the shutdown, cancels the loop's own
+// context and waits for the drain.
+//
+// This is not applied to the HTTP server, and that is not an oversight.
+// httpapi.Server.Start uses its context for net.Listen alone and detaches what
+// it keeps, so the start-up budget bounds the bind — which is exactly what
+// should be bounded.
+func outlivesStartUp(start func(context.Context) error) func(context.Context) error {
+	return func(ctx context.Context) error { return start(context.WithoutCancel(ctx)) }
 }
 
 // backoffOf is the one conversion internal/config's independence costs.

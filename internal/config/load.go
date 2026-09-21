@@ -186,16 +186,16 @@ func (r *reader) required(key string) string {
 
 // secret reads a required value that must never be rendered.
 //
-// It is [reader.required] with the value kept out of every message it could
-// reach. DATABASE_URL is the only one, and a message quoting the DSN that could
-// not be read would be a message quoting a password.
-func (r *reader) secret(key string) string {
-	value, ok := r.value(key)
-	if !ok {
-		r.refuse(key, "is required and was not set")
-	}
-	return value
-}
+// It is [reader.required], and today the two bodies are identical — because
+// nothing in this package renders a required value in the first place. This is
+// therefore a MARKER and not a mechanism, and it is worth being plain about
+// that rather than leaving somebody to discover it: it makes every secret in
+// this configuration greppable, and it is the place a check belongs if one is
+// ever needed. What actually keeps the password out of a message is that
+// [reader.refuse] is never handed a value on this path and that
+// [Postgres.Redacted] is the only rendering of a DSN anywhere — both of which
+// TestARefusalNeverQuotesTheDSN and TestRedactedKeepsThePasswordOut pin.
+func (r *reader) secret(key string) string { return r.required(key) }
 
 // duration reads a positive duration in Go's own notation.
 //
@@ -220,13 +220,21 @@ func (r *reader) duration(key string, fallback time.Duration) time.Duration {
 	return parsed
 }
 
-// maxCount is the largest number any count or size here may take.
-//
-// Every one of them is a pool size, a batch, a concurrency or a byte limit, and
-// each is eventually narrowed to an int32 or to an int that must not overflow
-// on a 32-bit build. Bounding them all at one place means the narrowing is
-// provably lossless rather than checked at each conversion.
-const maxCount = math.MaxInt32
+// The ceilings, one per kind, because the two have different reasons.
+const (
+	// maxCount bounds a pool size, a batch and a concurrency. It is
+	// math.MaxInt32 because each of them is narrowed to an int32 — pgx's pool
+	// limit — or to an int that must not overflow a 32-bit build, and bounding
+	// them in one place makes every one of those narrowings provably lossless
+	// rather than checked at each conversion.
+	maxCount = math.MaxInt32
+	// maxSize bounds a request limit in bytes. Two gigabytes, and not because
+	// anything is narrowed: net/http takes MaxHeaderBytes as an int, so this is
+	// what keeps a 32-bit build honest, and a body limit larger than this is
+	// not a limit — the process would be out of memory long before a request
+	// reached it.
+	maxSize = math.MaxInt32
+)
 
 // count reads a positive count.
 func (r *reader) count(key string, fallback int) int {
@@ -239,17 +247,20 @@ func (r *reader) count(key string, fallback int) int {
 
 // size reads a positive size in bytes.
 func (r *reader) size(key string, fallback int64) int64 {
-	parsed, ok := r.number(key)
+	parsed, ok := r.bounded(key, maxSize)
 	if !ok {
 		return fallback
 	}
 	return parsed
 }
 
-// number reads a positive integer within [maxCount], reporting whether it read
-// one. A value it refused reports false, so the caller keeps its default and
-// the joined error is what stops the process.
-func (r *reader) number(key string) (int64, bool) {
+// number reads a positive count within [maxCount].
+func (r *reader) number(key string) (int64, bool) { return r.bounded(key, maxCount) }
+
+// bounded reads a positive integer no larger than ceiling, reporting whether it
+// read one. A value it refused reports false, so the caller keeps its default
+// and the joined error is what stops the process.
+func (r *reader) bounded(key string, ceiling int64) (int64, bool) {
 	raw, ok := r.value(key)
 	if !ok {
 		return 0, false
@@ -259,8 +270,8 @@ func (r *reader) number(key string) (int64, bool) {
 		r.refuse(key, "%q is not a whole number", raw)
 		return 0, false
 	}
-	if parsed < 1 || parsed > maxCount {
-		r.refuse(key, "must be between 1 and %d, got %d", maxCount, parsed)
+	if parsed < 1 || parsed > ceiling {
+		r.refuse(key, "must be between 1 and %d, got %d", ceiling, parsed)
 		return 0, false
 	}
 	return parsed, true
@@ -280,13 +291,17 @@ func (r *reader) conns(key string, fallback int32) int32 {
 //
 // This is the one rule here that duplicates a check downstream, and it is
 // deliberate. strconv.ParseFloat("NaN", 64) succeeds, so NaN is a value the
-// environment can hand over without anybody typing anything odd.
-// workers.Backoff refuses it at construction; app.BackoffPolicy does not,
-// because its only check is Factor < 1 and NaN is not less than anything — so a
-// NaN there passes every test the schedule makes of itself and turns "when
-// should this parked operation be looked at again" into "now, for ever".
-// Refusing non-finite values here closes it once, for both, and names the
-// variable that carried it.
+// environment can hand over without anybody typing anything odd, and NaN is not
+// less than anything, so "the factor must be at least one" does not catch it —
+// which is how it reached app.BackoffPolicy, where Pow(x, 0) is 1 for any x, so
+// the first attempt was scheduled normally and every one after it for now, for
+// ever.
+//
+// Both workers.Backoff and app.BackoffPolicy refuse it now, at the point of
+// use, where the invariant belongs. It is refused here too because the two
+// refusals say different things: a constructor can report that a worker's
+// backoff factor is not a number, and only this can report which variable
+// carried it, before anything has been built from it.
 //
 // How small a factor may be is left to those two, which both refuse anything
 // below 1 with a sentence naming the loop.

@@ -8,9 +8,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -108,6 +110,32 @@ func (h *hooks) ranStart(t *testing.T, constructor string) int {
 	return -1
 }
 
+// firstStartFrom is the earliest start hook any of the named constructors
+// registered.
+func (h *hooks) firstStartFrom(t *testing.T, constructors ...string) int {
+	t.Helper()
+	first := -1
+	for _, constructor := range constructors {
+		if at := h.ranStart(t, constructor); first < 0 || at < first {
+			first = at
+		}
+	}
+	return first
+}
+
+// lastStartFrom is the latest start hook any of the named constructors
+// registered.
+func (h *hooks) lastStartFrom(t *testing.T, constructors ...string) int {
+	t.Helper()
+	last := -1
+	for _, constructor := range constructors {
+		if at := h.ranStart(t, constructor); at > last {
+			last = at
+		}
+	}
+	return last
+}
+
 // startUp is the order the start hooks ran in.
 func (h *hooks) startUp() []string {
 	h.mu.Lock()
@@ -151,15 +179,40 @@ func callersOf(runs []hookRun) []string {
 // TestTheWorkerStartsAndStopsAgainstTheRealStack is the start-and-stop proof
 // for cmd/worker.
 //
-// It asserts four things the graph is only ever wrong about at run time: that
-// every start-up check passes against real infrastructure, that every loop
-// stops within its drain deadline and says so, that the pool is closed
-// afterwards, and that it was closed AFTER the loops rather than before.
+// The version that shipped in a3c132c asserted "every loop stopped and stopped
+// cleanly" and could not fail. fxtest.RequireStart cancels the context it
+// started with, and that was the context the loops were running on, so they
+// were already dead before the first assertion and Stop reported a clean
+// shutdown of a corpse. Its runtime against three containers was sixty
+// milliseconds, which was the tell.
+//
+// So it asks the queue instead, twice: once while the process is running, to
+// prove something is receiving, and once after the stop, to prove nothing is.
+// The start-up budget is deliberately short and deliberately spent before the
+// first of those, because a loop rooted in the start-up context is exactly the
+// defect that version had.
 func TestTheWorkerStartsAndStopsAgainstTheRealStack(t *testing.T) {
 	requireDatabase(t)
 	requireQueues(t)
 
-	cfg := loaded(t, nil)
+	// Short enough that the alive check below is unambiguously past it, and
+	// long enough for the real start-up work: a pool ping, two queue
+	// resolutions and three loops starting, measured together at about fifty
+	// milliseconds.
+	const startBudget = 2 * time.Second
+
+	cfg := loaded(t, map[string]string{
+		"START_TIMEOUT": startBudget.String(),
+		// Three seconds rather than the thirty a deployment provisions, and
+		// the reason is a FIFO queue's head-of-line rule rather than anything
+		// under test. A message this consumer refuses is left in flight, which
+		// locks its group, and LocalStack will not hand out another group's
+		// message while it is; the probe below would then wait out the full
+		// visibility timeout before it could be taken back. Nothing here turns
+		// on the number — the drain timeout, which is what the shutdown
+		// assertions are about, is left alone.
+		"SQS_VISIBILITY_TIMEOUT": "3s",
+	})
 	recorded := &hooks{}
 
 	var pool *pgxpool.Pool
@@ -169,20 +222,69 @@ func TestTheWorkerStartsAndStopsAgainstTheRealStack(t *testing.T) {
 		fx.WithLogger(recorded.logger),
 	)
 	app.RequireStart()
+	startedAt := time.Now()
 
-	// The pool reaches the cluster. This is the state the start-up check
-	// claimed, read back rather than taken on the hook's word.
+	// The pool reaches the cluster: the state the start-up check claimed, read
+	// back rather than taken on the hook's word.
 	if err := pool.Ping(t.Context()); err != nil {
 		t.Fatalf("the worker started and its pool cannot reach the database: %v", err)
 	}
-	// Both queues resolved, which is what makes a queue nobody provisioned a
-	// start-up failure rather than a consumer that receives nothing.
-	for _, queue := range []string{"newInboundQueue", "newOutboundQueue"} {
-		recorded.ranStart(t, queue)
+	for _, check := range []string{"newDatabaseHealth", "newInboundQueue", "newOutboundQueue"} {
+		recorded.ranStart(t, check)
 	}
-	recorded.ranStart(t, "newDatabaseHealth")
+
+	// Nothing starts half up: every dependency is validated before any loop
+	// begins handling real messages. Without [checks] the outbound queue is
+	// resolved after the consumer has already committed transactions.
+	firstLoop := recorded.firstStartFrom(t, "runConsumer", "runPublisher", "runReferenceWorker")
+	lastCheck := recorded.lastStartFrom(t, "newDatabaseHealth", "newInboundQueue",
+		"newOutboundQueue")
+	if lastCheck > firstLoop {
+		t.Errorf("a loop began before every start-up check had run; the start-up was %v",
+			recorded.startUp())
+	}
+
+	inbound := queueURLOf(t, inboundName)
+
+	// Well past the start-up budget, because that is the window a loop rooted
+	// in the start-up context dies in.
+	time.Sleep(startBudget + time.Second)
+	elapsed := time.Since(startedAt)
+	if elapsed <= startBudget {
+		t.Fatalf("only %s has passed of a %s budget; this proves nothing", elapsed, startBudget)
+	}
+
+	held := inFlight(t, inbound)
+	put(t, inbound, "alive-"+runID, `{"not":"an envelope"}`)
+	took := awaitInFlight(t, inbound, held, 30*time.Second)
+	t.Logf("the consumer received a message %s after start-up, against a START_TIMEOUT of %s",
+		elapsed+took, startBudget)
 
 	app.RequireStop()
+
+	// And now nothing receives.
+	//
+	// The wait first, and it is not padding. Stop cancels a long poll that SQS
+	// is already serving, and the server goes on serving it for the rest of its
+	// second — so a message sent in that window is delivered to a receive whose
+	// client has gone, and counted as delivered. Waiting the poll out excludes
+	// an artefact of the receive BEFORE the stop, which is not what this
+	// asserts; the probe below still fails if anything receives after it.
+	//
+	// Then a message in a group of its own, so a FIFO head-of-line lock cannot
+	// hold it back, left for four times the poll four receivers would have
+	// answered it in, and then taken by this test — which is the only way to
+	// ask whether anything else had it first. One delivery is one: this test's.
+	time.Sleep(3 * time.Second)
+	drain(t, inbound, 2*time.Second)
+
+	marker := "stopped-" + runID
+	put(t, inbound, marker, `{"marker":"`+marker+`"}`)
+	time.Sleep(4 * time.Second)
+	if taken := deliveries(t, inbound, marker, 30*time.Second); taken != 1 {
+		t.Errorf("the worker stopped and something received the next message: it had been "+
+			"delivered %d times before this test took it", taken)
+	}
 
 	// Every loop stopped, and stopped cleanly. stopWorker turns a drain that
 	// ran out of time into an error on the hook, so a hook that ran and
@@ -201,15 +303,14 @@ func TestTheWorkerStartsAndStopsAgainstTheRealStack(t *testing.T) {
 	}
 
 	// And it closed after the loops. Fx runs OnStop in the reverse of the order
-	// the hooks were appended, and the appending order is the dependency graph:
-	// every loop is built from the pool, so every loop's hook is appended after
-	// the pool's and runs before it. The failure this prevents is concrete —
-	// Publisher.Stop hands its outbox claims back through this pool, and a pool
-	// closed first leaves each claimed row holding up its wallet's whole event
-	// stream until the hold expires.
+	// the hooks were appended, and every loop is built FROM the pool, so every
+	// loop's hook is appended after the pool's and runs before it. The failure
+	// this prevents is concrete — Publisher.Stop hands its outbox claims back
+	// through this pool, and a pool closed first leaves each claimed row
+	// holding up its wallet's whole event stream until the hold expires.
 	closed := recorded.ranStop(t, "newPool")
 	for _, loop := range []string{"runConsumer", "runPublisher", "runReferenceWorker"} {
-		if stopped := recorded.ranStop(t, loop); stopped > closed {
+		if at := recorded.ranStop(t, loop); at > closed {
 			t.Errorf("the pool closed before %s stopped; the shutdown was %v",
 				loop, recorded.shutdown())
 		}
@@ -360,38 +461,6 @@ func TestAQueueIsResolvedOnlyForALoopThatUsesOne(t *testing.T) {
 			t.Fatal("a consumer started against a queue it cannot reach")
 		}
 	})
-}
-
-// TestAQueueNobodyProvisionedStopsStartUp is the start-up check doing its job.
-//
-// The queues exist and one name is wrong, so this is not "SQS is down" but the
-// case that actually happens: a deployment pointed at a queue that was never
-// created. Without the check the consumer would receive nothing, report
-// nothing, and look healthy.
-func TestAQueueNobodyProvisionedStopsStartUp(t *testing.T) {
-	requireDatabase(t)
-	requireQueues(t)
-
-	cfg := loaded(t, map[string]string{
-		"SQS_INBOUND_QUEUE":        "nobody-provisioned-this.fifo",
-		"PUBLISHER_ENABLED":        "false",
-		"REFERENCE_WORKER_ENABLED": "false",
-	})
-	app := fx.New(Worker(cfg), fx.NopLogger)
-	if err := app.Err(); err != nil {
-		t.Fatalf("the graph would not build: %v", err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), app.StartTimeout())
-	defer cancel()
-
-	err := app.Start(ctx)
-	if err == nil {
-		_ = app.Stop(context.Background())
-		t.Fatal("the worker started against a queue that does not exist")
-	}
-	if !strings.Contains(err.Error(), "nobody-provisioned-this.fifo") {
-		t.Errorf("the refusal did not name the queue: %v", err)
-	}
 }
 
 // TestARealmThatDoesNotExistStopsStartUp is the other start-up check doing its
@@ -589,4 +658,235 @@ func (w *safeWriter) String() string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.written.String()
+}
+
+// TestAQueueOutageAndAQueueTypoAreDifferentMornings is the start-up rule.
+//
+// Both are "SQS did not answer" from a distance and they want opposite
+// treatment, so the rule turns on the classification the adapter already makes:
+// a queue that does not exist is Unretryable and stops every process, because
+// no amount of waiting fixes a deployment pointed at the wrong name; a queue
+// that is momentarily unreachable is Retryable, and stops only the process with
+// nowhere to report it.
+//
+// The API's half is the one worth having. It never calls SQS on the request
+// path — a submission becomes a row and an outbox row — so the outbox is
+// precisely the buffer the outage should be absorbed by, and an API that
+// refused to start would throw it away and crash-loop besides, leaving no warm
+// capacity for the moment SQS returns.
+func TestAQueueOutageAndAQueueTypoAreDifferentMornings(t *testing.T) {
+	requireDatabase(t)
+	requireQueues(t)
+	requireIdentityProvider(t)
+
+	// Short, because two of the three cases below wait this out on purpose.
+	const bounds = "1s"
+
+	t.Run("a queue that does not exist stops the worker", func(t *testing.T) {
+		cfg := loaded(t, map[string]string{
+			"SQS_INBOUND_QUEUE":        "nobody-provisioned-this.fifo",
+			"PUBLISHER_ENABLED":        "false",
+			"REFERENCE_WORKER_ENABLED": "false",
+		})
+		err := startAndFail(t, Worker(cfg))
+		if !strings.Contains(err.Error(), "nobody-provisioned-this.fifo") {
+			t.Errorf("the refusal did not name the queue: %v", err)
+		}
+	})
+
+	t.Run("a queue that does not exist stops the API too", func(t *testing.T) {
+		// Although the API tolerates an outage. A name nobody provisioned is
+		// not an outage, and the whole point of the rule is that it can tell.
+		cfg := loaded(t, map[string]string{
+			"SQS_OUTBOUND_QUEUE": "nobody-provisioned-this-either.fifo",
+		})
+		err := startAndFail(t, API(cfg))
+		if !strings.Contains(err.Error(), "nobody-provisioned-this-either.fifo") {
+			t.Errorf("the refusal did not name the queue: %v", err)
+		}
+	})
+
+	t.Run("an unreachable queue stops the worker", func(t *testing.T) {
+		// It has no readiness endpoint to shed work through, and every loop it
+		// runs is the queue, so a worker that started would be the silent no-op
+		// the "no loops" guard exists to prevent.
+		proxy := newBrokenProxy(t)
+		cfg := loaded(t, map[string]string{
+			"AWS_ENDPOINT_URL":         proxy.endpoint(),
+			"SQS_RESOLVE_TIMEOUT":      bounds,
+			"PUBLISHER_ENABLED":        "false",
+			"REFERENCE_WORKER_ENABLED": "false",
+		})
+		if err := startAndFail(t, Worker(cfg)); err == nil {
+			t.Fatal("no error")
+		}
+	})
+
+	t.Run("an unreachable queue leaves the API up and unready", func(t *testing.T) {
+		proxy := newBrokenProxy(t)
+		cfg := loaded(t, map[string]string{
+			"AWS_ENDPOINT_URL":       proxy.endpoint(),
+			"SQS_RESOLVE_TIMEOUT":    bounds,
+			"SQS_HEALTH_TIMEOUT":     bounds,
+			"HTTP_READINESS_TIMEOUT": "10s",
+		})
+
+		var server *httpapi.Server
+		app := fxtest.New(t, API(cfg), fx.Populate(&server))
+		app.RequireStart()
+		defer app.RequireStop()
+
+		base := "http://" + server.Addr()
+
+		// Up, and saying so honestly: the database is fine, the queue is not,
+		// and the load balancer has what it needs to route around this replica.
+		status, checks := readiness(t, base)
+		if status != http.StatusServiceUnavailable {
+			t.Fatalf("an API that cannot reach its queue answered %d, want %d",
+				status, http.StatusServiceUnavailable)
+		}
+		if checks["postgres"] != "ok" {
+			t.Errorf("readiness reports postgres as %q during an SQS outage", checks["postgres"])
+		}
+		if checks["sqs"] != "failed" {
+			t.Errorf("readiness reports sqs as %q during an SQS outage", checks["sqs"])
+		}
+
+		// And back, without a restart and without a human. This is the half
+		// that makes starting during an outage worth anything: the queue was
+		// never resolved, so something has to resolve it now — see
+		// [queueReadiness].
+		proxy.repair()
+		became := time.Now()
+		deadline := became.Add(45 * time.Second)
+		for {
+			status, checks = readiness(t, base)
+			if status == http.StatusOK {
+				t.Logf("the API reported ready %s after the queue came back",
+					time.Since(became))
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("the queue came back and the API is still answering %d: %v",
+					status, checks)
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		if checks["sqs"] != "ok" {
+			t.Errorf("readiness reports sqs as %q after the queue came back", checks["sqs"])
+		}
+	})
+}
+
+// startAndFail builds a graph, insists its start fails, and returns why.
+func startAndFail(t *testing.T, graph fx.Option) error {
+	t.Helper()
+
+	app := fx.New(graph, fx.NopLogger)
+	if err := app.Err(); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), app.StartTimeout())
+	defer cancel()
+
+	err := app.Start(ctx)
+	if err == nil {
+		_ = app.Stop(context.Background())
+		t.Fatal("the process started")
+	}
+	return err
+}
+
+// readiness asks /health/ready and reads what it said.
+func readiness(t *testing.T, base string) (int, map[string]string) {
+	t.Helper()
+
+	status, body := get(t, base+"/health/ready")
+	var answer struct {
+		Status string            `json:"status"`
+		Checks map[string]string `json:"checks"`
+	}
+	if err := json.Unmarshal(body, &answer); err != nil {
+		t.Fatalf("read the readiness body %q: %v", body, err)
+	}
+	return status, answer.Checks
+}
+
+// brokenProxy is an address in front of LocalStack that carries nothing until
+// it is repaired.
+//
+// Broken means accepting the connection and then saying nothing, rather than
+// refusing it. Both are transient failures and the adapter classifies both as
+// Retryable, but a hang is the one that is certainly classified that way and it
+// is bounded here by SQS_RESOLVE_TIMEOUT, so the test spends exactly that and
+// not a retry schedule's worth of it.
+type brokenProxy struct {
+	address  string
+	target   string
+	repaired atomic.Bool
+}
+
+// newBrokenProxy starts one in front of this suite's LocalStack.
+func newBrokenProxy(t *testing.T) *brokenProxy {
+	t.Helper()
+	requireQueues(t)
+
+	parsed, err := url.Parse(queueEndpoint)
+	if err != nil {
+		t.Fatalf("parse the queue endpoint: %v", err)
+	}
+
+	var config net.ListenConfig
+	listener, err := config.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	proxy := &brokenProxy{address: listener.Addr().String(), target: parsed.Host}
+	go proxy.serve(listener)
+	return proxy
+}
+
+// endpoint is the address to point AWS_ENDPOINT_URL at.
+func (p *brokenProxy) endpoint() string { return "http://" + p.address }
+
+// repair starts carrying traffic.
+func (p *brokenProxy) repair() { p.repaired.Store(true) }
+
+func (p *brokenProxy) serve(listener net.Listener) {
+	for {
+		from, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		go p.carry(from)
+	}
+}
+
+func (p *brokenProxy) carry(from net.Conn) {
+	defer func() { _ = from.Close() }()
+
+	if !p.repaired.Load() {
+		// Held, not closed: a caller waiting on an answer that never comes is
+		// what an unreachable service looks like from inside a timeout.
+		for !p.repaired.Load() {
+			time.Sleep(50 * time.Millisecond)
+		}
+		return
+	}
+	var dialer net.Dialer
+	to, err := dialer.DialContext(context.Background(), "tcp", p.target)
+	if err != nil {
+		return
+	}
+	defer func() { _ = to.Close() }()
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(to, from)
+		close(done)
+	}()
+	_, _ = io.Copy(from, to)
+	<-done
 }

@@ -461,12 +461,15 @@ func TestARefusalNeverQuotesTheDSN(t *testing.T) {
 func TestExampleEnvironmentMatchesTheLoader(t *testing.T) {
 	t.Parallel()
 
-	// Read by the AWS SDK's own credential chain rather than by this package,
-	// and in the file because a local stack does not work without them.
-	sdkOwned := map[string]bool{
+	// Not this package's to put in the file, for two different reasons. The
+	// first three are read by the AWS SDK's own credential chain and are in the
+	// file because a local stack does not work without them; HOSTNAME is set by
+	// the container runtime and would be wrong in a file that is copied.
+	elsewhere := map[string]bool{
 		"AWS_ACCESS_KEY_ID":         true,
 		"AWS_SECRET_ACCESS_KEY":     true,
 		"AWS_EC2_METADATA_DISABLED": true,
+		"HOSTNAME":                  true,
 	}
 
 	example := readExample(t, "../../.env.example")
@@ -481,13 +484,33 @@ func TestExampleEnvironmentMatchesTheLoader(t *testing.T) {
 		t.Fatalf(".env.example does not load: %v", err)
 	}
 
+	// Twice, the second time without PUBLISHER_NAME. Every other variable is
+	// read on every load, but the HOSTNAME fallback is only reached when
+	// PUBLISHER_NAME is absent — and the file sets it, so a single load leaves
+	// the one branch this check would otherwise be blind to unvisited.
+	without := map[string]string{}
+	maps.Copy(without, example)
+	delete(without, "PUBLISHER_NAME")
+	recordingWithout := func(key string) (string, bool) {
+		asked[key] = true
+		value, present := without[key]
+		return value, present
+	}
+	if _, err := Load(recordingWithout); err == nil {
+		t.Error(".env.example without PUBLISHER_NAME loaded, so the HOSTNAME branch " +
+			"was not reached and this check is still blind to it")
+	}
+	if !asked["HOSTNAME"] {
+		t.Error("the HOSTNAME fallback was never consulted, so this check cannot see it")
+	}
+
 	for key := range asked {
-		if _, ok := example[key]; !ok {
+		if _, ok := example[key]; !ok && !elsewhere[key] {
 			t.Errorf("%s is read by this package and is not in .env.example", key)
 		}
 	}
 	for key := range example {
-		if !asked[key] && !sdkOwned[key] {
+		if !asked[key] && !elsewhere[key] {
 			t.Errorf("%s is in .env.example and is read by nothing", key)
 		}
 	}

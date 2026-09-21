@@ -50,11 +50,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
+	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	"github.com/gabrielrauch/wagering-service/internal/adapters/sqs"
 	storage "github.com/gabrielrauch/wagering-service/internal/storage/postgres"
 )
 
@@ -93,6 +97,7 @@ var (
 	databaseErr error
 
 	queueEndpoint string
+	queueClient   *awssqs.Client
 	queueErr      error
 
 	identityBase string
@@ -146,6 +151,14 @@ func run(m *testing.M) int {
 	var dropDatabase func()
 	if databaseErr == nil {
 		serviceDSN, dropDatabase, databaseErr = migratedDatabase(ctx, ownerDSN)
+	}
+	if queueErr == nil {
+		// This suite's own client, quite separate from the one the composition
+		// root builds: it is how a test watches what the service's consumer did
+		// to a queue without standing between the two.
+		queueClient, queueErr = sqs.NewClient(ctx, sqs.ClientConfig{
+			Region: region, Endpoint: queueEndpoint,
+		})
 	}
 
 	code := m.Run()
@@ -471,4 +484,172 @@ func repositoryFile(rest ...string) (string, error) {
 		return "", fmt.Errorf("working directory: %w", err)
 	}
 	return filepath.Abs(filepath.Join(append([]string{cwd, "..", ".."}, rest...)...))
+}
+
+// The two attributes a test reads to see what the service's consumer is doing.
+//
+// Watching the queue rather than the service is deliberate: a decorator around
+// the queue the composition root built would be a decorator this suite had put
+// there, and what these tests are about is whether the loops the ROOT wired are
+// running. SQS counts a message as not visible from the moment somebody
+// receives it, so the count is the queue reporting on the consumer.
+const (
+	visibleAttribute  = types.QueueAttributeNameApproximateNumberOfMessages
+	inFlightAttribute = types.QueueAttributeNameApproximateNumberOfMessagesNotVisible
+)
+
+// queueURLOf resolves a provisioned queue's URL through this suite's own
+// client.
+func queueURLOf(t *testing.T, name string) string {
+	t.Helper()
+	requireQueues(t)
+
+	found, err := queueClient.GetQueueUrl(t.Context(), &awssqs.GetQueueUrlInput{
+		QueueName: aws.String(name),
+	})
+	if err != nil {
+		t.Fatalf("resolve the queue %s: %v", name, err)
+	}
+	return *found.QueueUrl
+}
+
+// put sends one message. The body is deliberately not a valid envelope: what
+// these tests want to know is whether anything RECEIVED it, and a consumer
+// refusing to parse a message has received it just as surely as one that
+// applies it.
+//
+// Both FIFO ids are the caller's to supply — the queues have no content-based
+// deduplication — and a distinct group per call is what keeps one test's
+// message from being stuck behind another's.
+func put(t *testing.T, url, group, body string) {
+	t.Helper()
+
+	_, err := queueClient.SendMessage(t.Context(), &awssqs.SendMessageInput{
+		QueueUrl:               aws.String(url),
+		MessageBody:            aws.String(body),
+		MessageGroupId:         aws.String(group),
+		MessageDeduplicationId: aws.String(group + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)),
+	})
+	if err != nil {
+		t.Fatalf("send to %s: %v", url, err)
+	}
+}
+
+// inFlight is how many messages the queue is holding invisible, which is how
+// many somebody has received and not yet finished with.
+func inFlight(t *testing.T, url string) int {
+	t.Helper()
+
+	answer, err := queueClient.GetQueueAttributes(t.Context(), &awssqs.GetQueueAttributesInput{
+		QueueUrl:       aws.String(url),
+		AttributeNames: []types.QueueAttributeName{inFlightAttribute, visibleAttribute},
+	})
+	if err != nil {
+		t.Fatalf("read the attributes of %s: %v", url, err)
+	}
+	held, err := strconv.Atoi(answer.Attributes[string(inFlightAttribute)])
+	if err != nil {
+		t.Fatalf("read %s of %s: %v", inFlightAttribute, url, err)
+	}
+	return held
+}
+
+// awaitInFlight waits for the queue to be holding more than it was, and reports
+// how long that took.
+func awaitInFlight(t *testing.T, url string, above int, within time.Duration) time.Duration {
+	t.Helper()
+
+	began := time.Now()
+	for {
+		if held := inFlight(t, url); held > above {
+			return time.Since(began)
+		}
+		if time.Since(began) > within {
+			t.Fatalf("waited %s for something to receive from %s; it is still holding %d",
+				within, url, above)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// deliveries takes a message off the queue itself and reports how many times it
+// had been delivered before this one.
+//
+// Per message, rather than the queue's aggregate counters, because the aggregate
+// cannot answer the question a stopped worker raises: "did anything receive THIS
+// one". SQS carries the count on the message, so one is a message nobody else
+// has seen and two is a message something took first.
+//
+// It deletes what it takes, so a test that sends a message leaves the queue as
+// it found it.
+func deliveries(t *testing.T, url, marker string, within time.Duration) int {
+	t.Helper()
+
+	deadline := time.Now().Add(within)
+	for {
+		received, err := queueClient.ReceiveMessage(t.Context(), &awssqs.ReceiveMessageInput{
+			QueueUrl:            aws.String(url),
+			MaxNumberOfMessages: 10,
+			WaitTimeSeconds:     1,
+			MessageSystemAttributeNames: []types.MessageSystemAttributeName{
+				types.MessageSystemAttributeNameApproximateReceiveCount,
+			},
+		})
+		if err != nil {
+			t.Fatalf("receive from %s: %v", url, err)
+		}
+		found := -1
+		for _, message := range received.Messages {
+			// Everything it sees is deleted, the match and the rest: a probe
+			// message left behind locks its group, and the next test to send
+			// one would be waiting behind it.
+			if strings.Contains(aws.ToString(message.Body), marker) {
+				count, err := strconv.Atoi(message.Attributes[string(
+					types.MessageSystemAttributeNameApproximateReceiveCount)])
+				if err != nil {
+					t.Fatalf("read the delivery count of %s: %v", marker, err)
+				}
+				found = count
+			}
+			if _, err := queueClient.DeleteMessage(t.Context(), &awssqs.DeleteMessageInput{
+				QueueUrl: aws.String(url), ReceiptHandle: message.ReceiptHandle,
+			}); err != nil {
+				t.Logf("could not delete a message from %s: %v", url, err)
+			}
+		}
+		if found >= 0 {
+			return found
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("waited %s for %s to come back to %s and it never did, so something "+
+				"else is holding it", within, marker, url)
+		}
+	}
+}
+
+// drain takes everything visible off the queue, for a moment, and deletes it.
+//
+// It is how a test starts from a clean queue without PurgeQueue, which SQS
+// allows only once a minute and which this suite would exceed.
+func drain(t *testing.T, url string, within time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		received, err := queueClient.ReceiveMessage(t.Context(), &awssqs.ReceiveMessageInput{
+			QueueUrl:            aws.String(url),
+			MaxNumberOfMessages: 10,
+			WaitTimeSeconds:     1,
+		})
+		if err != nil {
+			t.Fatalf("receive from %s: %v", url, err)
+		}
+		for _, message := range received.Messages {
+			if _, err := queueClient.DeleteMessage(t.Context(), &awssqs.DeleteMessageInput{
+				QueueUrl: aws.String(url), ReceiptHandle: message.ReceiptHandle,
+			}); err != nil {
+				t.Logf("could not delete a message from %s: %v", url, err)
+			}
+		}
+	}
 }

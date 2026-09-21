@@ -94,10 +94,15 @@ type telemetry struct {
 // part way through one. The OpenTelemetry SDK's Shutdown calls join it here —
 // see [Telemetry].
 //
-// The budget is applied on top of the caller's context rather than instead of
-// it, so a lifecycle that was given less keeps it.
+// The budget replaces the caller's cancellation rather than sitting on top of
+// it, and this is the one hook where that is right. It is the last thing that
+// runs, including on the rollback Fx performs when a START hook fails — and a
+// rollback after a start TIMEOUT is handed the context that just expired, so a
+// budget derived from it would be no budget at all and the last word of a
+// failed deployment would be the one thing not written. Values are kept, for
+// the reason [stopContext] keeps them.
 func (t *telemetry) flush(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, t.budget)
+	ctx, cancel := stopContext(ctx, t.budget)
 	defer cancel()
 
 	t.logger.InfoContext(ctx, "stopped")
