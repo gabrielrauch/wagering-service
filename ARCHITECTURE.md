@@ -487,27 +487,32 @@ its own and renames the incoming one. Every query above therefore selects
 series also carries `service_name="wagering"`, from the resource attribute the
 collector copies onto each metric.
 
+**`exported_instance` is the replica**, by the same rule twice over. Each process
+reports a `service.instance.id` — its hostname, which the container runtime makes
+distinct per replica — the collector maps that onto `instance`, and Prometheus
+renames it where it meets the scrape target's own, which is
+`otel-collector:8889`. Nothing above selects it: every query aggregates across
+processes with `sum by (...)` or `max(...)`, which is what makes three API
+replicas one number. A panel that wanted one replica would select
+`exported_instance`, and that is also the label that says how many processes are
+reporting at all.
+
 A rate over a counter that appeared once and never moved is zero — Prometheus
 cannot tell a counter's first sample from a counter that was always at that
 value. Three requests by hand therefore leave the rate panels flat; "Outcomes
 since start" is the panel that shows them at all. Traffic spread over more than
 one scrape interval fills the rest.
 
-**The counters are one process's counters, not five.** Three API replicas and
-two workers export a resource identified by `service.name` and nothing else, so
-the collector cannot tell them apart and keeps one series where there should be
-five. Three BETs, one to each replica, move `wagering_transactions_total` by
-one. Traces are unaffected — a span carries its own identity. See
-"Limitations"; again, no query here is what needs changing.
-
-**The percentile panel reads coarse, and the cause is upstream of this
-dashboard.** `wagering.processing.duration` is recorded in seconds and keeps the
-OpenTelemetry SDK's default bucket boundaries, which begin at 5 and were chosen
-for a duration in milliseconds. Every operation this service has performed falls
-in the first bucket, so `histogram_quantile` interpolates inside (0s, 5s] and
-answers 2.5 seconds for work whose exact mean — `_sum / _count`, which is not
-bucketed — is six milliseconds. See "Limitations"; the query is not what needs
-changing.
+This dashboard found two defects in the instrumentation that no test had,
+because both let the export succeed and only the numbers were wrong: the latency
+histogram carried millisecond-shaped default buckets for a value recorded in
+seconds, so every quantile was an interpolation inside one bucket that held
+everything and p50 read 2.5s where the mean was 0.006s; and every process
+exported the same resource identity, so five of them were one series and three
+BETs, one per replica, moved the counter by one. Both are fixed — the boundaries
+are named in the unit the instrument declares, and the resource carries
+`service.instance.id`. Neither fix changed a query here, which is the argument
+for reading a dashboard against a system you can make do something.
 
 ### Finding a trace by `correlationId`
 
@@ -705,28 +710,3 @@ does not exist. The following were derived from the task text plus the
 - **The SQS readiness check does not exist yet.** `/health/ready` takes a set of
   named checks and the composition root supplies them; until the queue adapter
   exists, the set names only PostgreSQL.
-- **`wagering.processing.duration` has millisecond-shaped buckets and
-  second-shaped values.** The instrument is created with `metric.WithUnit("s")`
-  and recorded with `Took.Seconds()`, but names no boundaries — so it takes the
-  SDK's defaults, `0, 5, 10, 25 … 10000`, which are the defaults for a duration
-  measured in milliseconds. Every observation lands in the first bucket. The sum
-  and the count stay exact, and every percentile the dashboard can compute is an
-  interpolation inside a single five-second bucket: p50 reads 2.5s where the
-  mean is 0.006s. The fix is one option on the instrument in
-  `internal/telemetry/metrics.go` —
-  `metric.WithExplicitBucketBoundaries(0.005, 0.01, 0.025, 0.05, 0.075, 0.1,
-  0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10)`, the boundary set the OpenTelemetry
-  semantic conventions give for a duration in seconds. The dashboard needs no
-  change when it lands.
-- **Only one process's measurements reach the dashboard.** Every process builds
-  its OpenTelemetry resource from `service.name` alone — `resource.Default()`
-  plus that one attribute, with no `service.instance.id`. The collector's
-  Prometheus exporter keys a series by its labels, and five processes reporting
-  the same metric under the same labels are one series to it: three BETs, one to
-  each API replica, move `wagering_transactions_total` by one, and the other two
-  are lost with no error anywhere. The fix is one attribute on the resource in
-  `internal/fxmod/telemetry.go` — `semconv.ServiceInstanceID` from the hostname,
-  which the container runtime already sets to something distinct per replica and
-  which the exporter maps to `instance`. Every query on the dashboard already
-  aggregates with `sum by (...)`, so none of them changes when it lands. Traces
-  never had this problem: a span identifies itself.
