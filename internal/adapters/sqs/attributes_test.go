@@ -1,6 +1,7 @@
 package sqs
 
 import (
+	"fmt"
 	"maps"
 	"strings"
 	"testing"
@@ -119,6 +120,11 @@ func TestAttributeRefusals(t *testing.T) {
 			attributes: map[string]string{"traceparent": ""},
 			because:    "has no value",
 		},
+		{
+			name:       "more attributes than a message may carry",
+			attributes: manyAttributes(maxAttributes + 1),
+			because:    "at most 10 attributes",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -149,5 +155,22 @@ func TestAttributesSize(t *testing.T) {
 	two := attributesSize(map[string]string{"id": "x", "ab": "y"})
 	if want := 2 * (9 + 13); two != want {
 		t.Errorf("two attributes = %d bytes, want %d", two, want)
+	}
+}
+
+// manyAttributes is a sound attribute set of the given size.
+func manyAttributes(n int) map[string]string {
+	attributes := make(map[string]string, n)
+	for i := range n {
+		attributes[fmt.Sprintf("attribute-%d", i)] = "value"
+	}
+	return attributes
+}
+
+// TestTheAttributeCountLimitIsAnUpperBound holds the boundary itself: exactly
+// ten is what SQS allows and must not be refused.
+func TestTheAttributeCountLimitIsAnUpperBound(t *testing.T) {
+	if err := checkAttributes(manyAttributes(maxAttributes)); err != nil {
+		t.Errorf("checkAttributes with exactly %d = %v, want it accepted", maxAttributes, err)
 	}
 }

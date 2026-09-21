@@ -40,6 +40,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
+	"github.com/aws/smithy-go/middleware"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
@@ -238,7 +239,9 @@ func fixtureQueue(t *testing.T, attributes map[string]string) string {
 func openQueue(t *testing.T, cfg Config) *Queue {
 	t.Helper()
 	requireLocalStack(t)
-	cfg.Client = sharedSDK
+	if cfg.Client == nil {
+		cfg.Client = sharedSDK
+	}
 	queue, err := NewQueue(cfg)
 	if err != nil {
 		t.Fatalf("build a queue for %s: %v", cfg.Name, err)
@@ -269,4 +272,32 @@ func send(t *testing.T, name, body, group, dedupe string,
 	}); err != nil {
 		t.Fatalf("send to %s: %v", name, err)
 	}
+}
+
+// countingClient is the shared client with a middleware that counts the
+// SendMessageBatch calls made through it.
+//
+// It exists because the call count is the only observable form the 256 KiB
+// batch bound takes here: LocalStack does not enforce it, so a chunker that
+// ignored the weight would have a 300 KiB call accepted and a test asserting
+// "SQS refused it" would be asserting something about a backend it is not
+// running against. How many calls were made is true of every backend, and it
+// is what this package actually promises.
+func countingClient(t *testing.T, calls *atomic.Int64) *awssqs.Client {
+	t.Helper()
+	requireLocalStack(t)
+	count := func(stack *middleware.Stack) error {
+		return stack.Initialize.Add(middleware.InitializeMiddlewareFunc("countSendMessageBatch",
+			func(ctx context.Context, in middleware.InitializeInput,
+				next middleware.InitializeHandler,
+			) (middleware.InitializeOutput, middleware.Metadata, error) {
+				if _, ok := in.Parameters.(*awssqs.SendMessageBatchInput); ok {
+					calls.Add(1)
+				}
+				return next.HandleInitialize(ctx, in)
+			}), middleware.Before)
+	}
+	return awssqs.New(sharedSDK.Options(), func(o *awssqs.Options) {
+		o.APIOptions = append(o.APIOptions, count)
+	})
 }

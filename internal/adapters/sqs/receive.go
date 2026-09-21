@@ -63,7 +63,25 @@ func (q *Queue) Receive(ctx context.Context) ([]Message, error) {
 		QueueUrl:            url,
 		MaxNumberOfMessages: q.settings.maxMessages,
 		WaitTimeSeconds:     q.settings.waitTime,
-		VisibilityTimeout:   aws.ToInt32(q.settings.visibilityTimeout),
+		// An open visibility timeout is modelled as a nil *int32 and flattened
+		// to a plain zero here, and that zero means "leave the queue's own
+		// timeout alone" only because the SDK omits a zero-valued
+		// VisibilityTimeout from the request — the generated serialiser guards
+		// it with `if v.VisibilityTimeout != 0`.
+		//
+		// This is worth stating because the SDK is not consistent about it.
+		// ChangeMessageVisibility's serialiser has no such guard and always
+		// writes the field, which is exactly why [Queue.Release] can hand a
+		// message back by asking for zero. Two opposite conventions, one SDK,
+		// and this package depends on both of them.
+		//
+		// The consequence of the omission going away is not subtle: every
+		// received message would be handed to the next consumer immediately,
+		// so a receive would no longer reserve anything. Both halves are
+		// pinned by tests against a real queue —
+		// TestAnOpenVisibilityTimeoutLeavesTheQueuesOwnInPlace for this one and
+		// TestReleaseHandsTheMessageBackAtOnce for the other.
+		VisibilityTimeout: aws.ToInt32(q.settings.visibilityTimeout),
 		// Without this, message attributes are simply absent from the response
 		// — not empty, absent — and the trace context a sender went to the
 		// trouble of attaching disappears silently.

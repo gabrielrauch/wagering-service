@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -44,8 +45,21 @@ func TestTheDeployedScriptProvisionsWhatTheAdapterAssumes(t *testing.T) {
 					"only in whitespace must be one message",
 					attributes["ContentBasedDeduplication"])
 			}
+			// Fourteen days, the SQS maximum, on all three. On the dead-letter
+			// queue it is the window an operator has to notice; on the other
+			// two it is what survives an outage over a long weekend.
+			if got := attributes["MessageRetentionPeriod"]; got != "1209600" {
+				t.Errorf("MessageRetentionPeriod = %q, want 1209600", got)
+			}
 		})
 	}
+
+	t.Run("the outbound queue also long-polls by default", func(t *testing.T) {
+		attributes := queueAttributes(t, outboundQueue)
+		if got := attributes["ReceiveMessageWaitTimeSeconds"]; got != "20" {
+			t.Errorf("ReceiveMessageWaitTimeSeconds = %q, want 20", got)
+		}
+	})
 
 	t.Run("the inbound queue's visibility and redrive", func(t *testing.T) {
 		attributes := queueAttributes(t, inboundQueue)
@@ -168,7 +182,24 @@ func silentEndpoint(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	t.Cleanup(func() { _ = listener.Close() })
+	// One cleanup, registered from the test's own goroutine and closing
+	// everything the accept loop took. Registering a cleanup per connection
+	// from inside that loop would be a cleanup registered after cleanups had
+	// begun for any connection accepted late, and that one would never run.
+	var (
+		mu   sync.Mutex
+		held []net.Conn
+		shut bool
+	)
+	t.Cleanup(func() {
+		_ = listener.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		shut = true
+		for _, conn := range held {
+			_ = conn.Close()
+		}
+	})
 
 	go func() {
 		for {
@@ -176,8 +207,16 @@ func silentEndpoint(t *testing.T) string {
 			if err != nil {
 				return
 			}
-			// Held open, never answered, and closed when the test ends.
-			t.Cleanup(func() { _ = conn.Close() })
+			// Held open and never answered. A connection accepted after the
+			// cleanup has run is closed on the spot rather than kept.
+			mu.Lock()
+			if shut {
+				mu.Unlock()
+				_ = conn.Close()
+				return
+			}
+			held = append(held, conn)
+			mu.Unlock()
 		}
 	}()
 	return "http://" + listener.Addr().String()

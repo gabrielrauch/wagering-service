@@ -58,14 +58,15 @@ set -euo pipefail
 #   it in the queue would put it at the head of its wallet's group forever.
 #
 # MessageRetentionPeriod: 1209600 seconds (14 days, the SQS maximum)
-#   On both queues. On the dead-letter queue it is the window an operator has
-#   to notice and act; on the source queue it is what survives an outage over
-#   a long weekend.
+#   On all three queues. On the dead-letter queue it is the window an operator
+#   has to notice and act; on the two live queues it is what survives an outage
+#   over a long weekend.
 #
 # ReceiveMessageWaitTimeSeconds: 20 seconds (the SQS maximum)
 #   Long polling, as the queue's own default, so that a consumer which does not
-#   ask for it still does not spin. The service always asks explicitly, and a
-#   request that names its own wait overrides this.
+#   ask for it still does not spin. On the two live queues and not on the
+#   dead-letter queue, which nothing polls in a loop. The service always asks
+#   explicitly, and a request that names its own wait overrides this.
 # ---------------------------------------------------------------------------
 
 # The dead-letter queue is created first because the source queue's redrive

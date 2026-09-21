@@ -347,28 +347,81 @@ func TestRecordIgnoresOutcomesForOtherCalls(t *testing.T) {
 	}
 }
 
-func TestAbortMarksWhatWasNeverOffered(t *testing.T) {
-	cause := app.AsRetryable(errors.New("sqs: connection refused"))
-	results := make([]SendResult, 4)
-	abort(results, [][]plan{{{index: 2}}, {{index: 3}}}, cause)
+// TestRecordAgainstAServiceThatSaidNothingUseful covers the two shapes of
+// response that should not arrive and must not be trusted if they do.
+func TestRecordAgainstAServiceThatSaidNothingUseful(t *testing.T) {
+	t.Run("a wholly empty answer fails every entry", func(t *testing.T) {
+		results := make([]SendResult, 3)
+		record(results, []plan{{index: 0}, {index: 1}, {index: 2}},
+			&awssqs.SendMessageBatchOutput{})
+		for i, result := range results {
+			if result.Sent() {
+				t.Errorf("results[%d] = %+v, want a failure: nothing said it was sent", i,
+					result)
+			}
+			if got := app.ClassOf(result.Err); got != app.Retryable {
+				t.Errorf("results[%d] class = %s, want %s", i, got, app.Retryable)
+			}
+		}
+	})
 
-	for _, index := range []int{2, 3} {
-		if !errors.Is(results[index].Err, ErrSendAborted) {
-			t.Errorf("results[%d] = %v, want it to carry ErrSendAborted", index,
-				results[index].Err)
+	t.Run("an id reported twice settles as the failure", func(t *testing.T) {
+		// Both lists naming one entry is a service contradicting itself. The
+		// failures are applied after the successes, so the entry ends up
+		// refused — which is the safe direction: a publisher that reschedules
+		// an event SQS did take republishes it, and the deduplication id makes
+		// that one message.
+		results := make([]SendResult, 1)
+		record(results, []plan{{index: 0}}, &awssqs.SendMessageBatchOutput{
+			Successful: []types.SendMessageBatchResultEntry{
+				{Id: aws.String("0"), MessageId: aws.String("queue-id-0")},
+			},
+			Failed: []types.BatchResultErrorEntry{
+				{Id: aws.String("0"), Code: aws.String("InternalError"),
+					Message: aws.String("the service could not make up its mind")},
+			},
+		})
+		if results[0].Sent() {
+			t.Fatalf("results[0] = %+v, want the refusal to win", results[0])
 		}
-		if !errors.Is(results[index].Err, cause) {
-			t.Errorf("results[%d] = %v, want it to keep the cause", index, results[index].Err)
-		}
-		if got := app.ClassOf(results[index].Err); got != app.Retryable {
-			t.Errorf("class = %s, want %s: not being attempted is evidence of nothing", got,
-				app.Retryable)
-		}
+	})
+}
+
+func TestAbortMarksWhatWasNeverOffered(t *testing.T) {
+	causes := map[string]error{
+		// The ordinary case: a call that did not reach a server.
+		"a retryable cause": app.AsRetryable(errors.New("sqs: connection refused")),
+		// The case abort exists for. A refusal that is permanent for the call
+		// that made it says nothing about a message that call never carried,
+		// so the class must not be inherited — a publisher told Unretryable
+		// would stop trying to publish an event SQS has never seen.
+		"an unretryable cause": app.AsUnretryable(errors.New("sqs: the request was malformed")),
 	}
-	for _, index := range []int{0, 1} {
-		if results[index] != (SendResult{}) {
-			t.Errorf("results[%d] = %+v, want it left alone", index, results[index])
-		}
+	for name, cause := range causes {
+		t.Run(name, func(t *testing.T) {
+			results := make([]SendResult, 4)
+			abort(results, [][]plan{{{index: 2}}, {{index: 3}}}, cause)
+
+			for _, index := range []int{2, 3} {
+				if !errors.Is(results[index].Err, ErrSendAborted) {
+					t.Errorf("results[%d] = %v, want it to carry ErrSendAborted", index,
+						results[index].Err)
+				}
+				if !errors.Is(results[index].Err, cause) {
+					t.Errorf("results[%d] = %v, want it to keep the cause", index,
+						results[index].Err)
+				}
+				if got := app.ClassOf(results[index].Err); got != app.Retryable {
+					t.Errorf("class = %s, want %s: not being attempted is evidence of nothing",
+						got, app.Retryable)
+				}
+			}
+			for _, index := range []int{0, 1} {
+				if results[index] != (SendResult{}) {
+					t.Errorf("results[%d] = %+v, want it left alone", index, results[index])
+				}
+			}
+		})
 	}
 }
 

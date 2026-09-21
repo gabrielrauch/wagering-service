@@ -21,6 +21,13 @@ const stringType = "String"
 // with it.
 const (
 	maxAttributeNameBytes = 256
+	// maxAttributes is how many message attributes SQS carries on one message.
+	//
+	// Ten, which is far more than trace context needs — a traceparent, a
+	// tracestate and a baggage header are three. It is checked for the same
+	// reason the name rules are: SQS refuses the whole request for it, so one
+	// over-decorated message would otherwise take nine innocent ones with it.
+	maxAttributes = 10
 	// reservedPrefixes are the namespaces SQS keeps for itself.
 	awsPrefix    = "AWS."
 	amazonPrefix = "Amazon."
@@ -33,6 +40,10 @@ const (
 // name — so one bad name in a batch of ten is nine messages that did not go out
 // and a publisher with no way to tell which of them was the problem.
 func checkAttributes(attributes map[string]string) error {
+	if len(attributes) > maxAttributes {
+		return fmt.Errorf("sqs: a message carries at most %d attributes, got %d", maxAttributes,
+			len(attributes))
+	}
 	for name, value := range attributes {
 		if err := checkAttributeName(name); err != nil {
 			return err

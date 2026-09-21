@@ -77,6 +77,17 @@ func TestHit(t *testing.T) {
 			exitCode: ExitCode,
 			stderr:   "after_pending_commit",
 		},
+		{
+			// The point step 6's publisher-recovery test arms. It fires in a
+			// case of its own rather than only appearing as the "some other
+			// point" of the case above, so that all four are exercised the
+			// same way.
+			name:     "the publisher's mark point fires",
+			armed:    AfterPublishBeforeMark,
+			hit:      AfterPublishBeforeMark,
+			exitCode: ExitCode,
+			stderr:   "after_publish_before_mark",
+		},
 	}
 
 	for _, c := range cases {
@@ -129,6 +140,35 @@ func TestHitIsANoOpInProcess(t *testing.T) {
 
 	t.Setenv(Variable, AfterPendingCommit)
 	Hit(AfterCommitBeforeAck)
+}
+
+// TestThePointsAreSpeltAsTheEnvironmentSpellsThem pins the literal strings.
+//
+// Nothing else can. A constant is both the declaration and every use of it —
+// the map key, the call site, the test table — so renaming the value renames it
+// everywhere at once and every test still passes, while the recovery script
+// that exports FAULT_POINT=after_publish_before_mark quietly stops working.
+// The right-hand sides below are deliberately literals, and this is the one
+// place in the package where that is deliberate.
+func TestThePointsAreSpeltAsTheEnvironmentSpellsThem(t *testing.T) {
+	cases := []struct {
+		constant string
+		spelling string
+	}{
+		{AfterCommitBeforeAck, "after_commit_before_ack"},
+		{AfterPublishBeforeMark, "after_publish_before_mark"},
+		{AfterClaimBeforePublish, "after_claim_before_publish"},
+		{AfterPendingCommit, "after_pending_commit"},
+	}
+	for _, c := range cases {
+		if c.constant != c.spelling {
+			t.Errorf("a fault point is spelt %q, want %q: an environment naming the old "+
+				"spelling would arm nothing", c.constant, c.spelling)
+		}
+	}
+	if Variable != "FAULT_POINT" {
+		t.Errorf("the variable is %q, want FAULT_POINT", Variable)
+	}
 }
 
 // TestEveryPointIsRegistered guards the half of the typo defence that the

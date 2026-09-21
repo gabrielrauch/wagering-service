@@ -3,7 +3,9 @@
 package sqs
 
 import (
+	"fmt"
 	"maps"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,7 +20,16 @@ import (
 // and a delete after the work is done removes it for good.
 func TestRoundTrip(t *testing.T) {
 	name := fixtureQueue(t, nil)
-	queue := openQueue(t, Config{Name: name, WaitTime: 3 * time.Second})
+	// A one-second visibility timeout, deliberately. The delete is only
+	// observable once the message would otherwise have come back: a queue asked
+	// for messages inside the visibility window answers empty whether the
+	// delete happened or not, so a round trip that drained inside it would pass
+	// with no delete at all. Three seconds of long polling is comfortably past
+	// the second, and the poll returns the moment anything appears — so this
+	// costs three seconds when the delete worked and fails at once when it did
+	// not.
+	queue := openQueue(t, Config{
+		Name: name, WaitTime: 3 * time.Second, VisibilityTimeout: time.Second})
 
 	body := `{"messageId":"018f2b9c-0000-7000-8000-00000000000a","kind":"BET"}`
 	trace := map[string]string{
@@ -63,9 +74,19 @@ func TestRoundTrip(t *testing.T) {
 	if err := queue.Delete(t.Context(), got.ReceiptHandle); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	// Released first so that the queue is not merely holding it invisible.
-	if left := drain(t, queue); len(left) != 0 {
-		t.Errorf("%d messages left after the delete, want none", len(left))
+	// One receive rather than a drain, and the difference is the whole
+	// assertion. A drain deletes what it takes and loops until the queue is
+	// empty, so against a Delete that does not delete it receives the same
+	// message forever — hanging where it should fail. A single poll past the
+	// visibility window answers the only question being asked: does the message
+	// come back.
+	left, err := queue.Receive(t.Context())
+	if err != nil {
+		t.Fatalf("receive after the delete: %v", err)
+	}
+	if len(left) != 0 {
+		t.Errorf("%d messages came back after the delete and the visibility timeout that "+
+			"followed it, want none", len(left))
 	}
 }
 
@@ -90,6 +111,46 @@ func TestAttributesSurviveWhoeverElseWroteThem(t *testing.T) {
 	if _, carried := got.Attributes["binary"]; carried {
 		t.Errorf("attributes = %v, want the binary one dropped rather than mangled",
 			got.Attributes)
+	}
+}
+
+// TestAnOpenVisibilityTimeoutLeavesTheQueuesOwnInPlace pins a correctness
+// property that rests on an SDK detail rather than on anything this package
+// controls.
+//
+// A [Config] that names no visibility timeout is modelled as a nil *int32 and
+// reaches the wire as a plain zero, and that zero means "the queue's own
+// timeout" only because the SDK omits a zero-valued VisibilityTimeout from a
+// ReceiveMessage request. If that omission ever went away, a zero would be
+// sent and read as "make it visible again immediately" — every received message
+// handed to every other consumer at once, and a receive that reserves nothing.
+//
+// The fixture queue holds messages for six seconds and the receive waits two,
+// so a second receive straight after the first must find nothing and the
+// message must come back once those six seconds have run. The first half says
+// the zero did not reach the wire; the second says the queue's own timeout is
+// what hid it. The gap between the two seconds and the six is what makes this
+// bite: a package that sent any timeout of its own — a zero, or a default it
+// invented — would hand the message back inside the poll.
+func TestAnOpenVisibilityTimeoutLeavesTheQueuesOwnInPlace(t *testing.T) {
+	name := fixtureQueue(t, map[string]string{"VisibilityTimeout": "6"})
+	queue := openQueue(t, Config{Name: name, WaitTime: 2 * time.Second})
+	send(t, name, `{"messageId":"e"}`, "wallet-1", "dedupe-1", nil)
+
+	first := receiveOne(t, queue)[0]
+	hidden, err := queue.Receive(t.Context())
+	if err != nil {
+		t.Fatalf("receive: %v", err)
+	}
+	if len(hidden) != 0 {
+		t.Fatalf("the message was visible again at once: a zero visibility "+
+			"timeout reached the wire (received %d)", len(hidden))
+	}
+
+	back := waitForRedelivery(t, queue, 20*time.Second)
+	if back.MessageID != first.MessageID {
+		t.Errorf("came back as %q, want the message the queue was hiding, %q", back.MessageID,
+			first.MessageID)
 	}
 }
 
@@ -251,10 +312,23 @@ func waitForRedelivery(t *testing.T, queue *Queue, within time.Duration) Message
 }
 
 // drain takes everything the queue will give up, deleting as it goes.
+//
+// Bounded, and the bound is not caution for its own sake. This loop's exit
+// condition is an empty receive, which a Delete that did not delete would never
+// produce: the same message would be handed back on every pass and the helper
+// whose job is to prove a queue is empty would hang until the test binary's own
+// timeout. A suite that fails takes seconds to read; one that hangs for ten
+// minutes and then reports a timeout tells whoever is reading it nothing about
+// which promise broke.
+//
+// The cap is far above what any test here needs — the largest sends 25 messages
+// across three groups — so reaching it means something is wrong rather than
+// something is busy.
 func drain(t *testing.T, queue *Queue) []Message {
 	t.Helper()
+	const rounds = 40
 	var all []Message
-	for {
+	for range rounds {
 		messages, err := queue.Receive(t.Context())
 		if err != nil {
 			t.Fatalf("receive: %v", err)
@@ -268,5 +342,108 @@ func drain(t *testing.T, queue *Queue) []Message {
 				t.Fatalf("delete: %v", err)
 			}
 		}
+	}
+	t.Fatalf("the queue was still handing messages back after %d rounds of receive and "+
+		"delete, having produced %d: something is not deleting", rounds, len(all))
+	return nil
+}
+
+// TestOneQueueServesSeveralGoroutinesAtOnce pins the promise [Queue]'s own doc
+// comment makes, because the worker task is about to build on it.
+//
+// One handle, four senders, two receivers and a readiness probe, all at once
+// and all under -race. That is not a synthetic arrangement: it is exactly how
+// this runs in production, where the HTTP server answers /health/ready on the
+// same queue the consumer is polling and the publisher is sending to.
+//
+// Every message is accounted for at the end — either a receiver took it and
+// deleted it, or it is still on the queue — so a lost send shows up as a
+// missing body rather than as a count that happened to come out right.
+func TestOneQueueServesSeveralGoroutinesAtOnce(t *testing.T) {
+	name := fixtureQueue(t, nil)
+	queue := openQueue(t, Config{Name: name, WaitTime: 2 * time.Second})
+	health, err := NewHealth(queue, 5*time.Second)
+	if err != nil {
+		t.Fatalf("build a readiness check: %v", err)
+	}
+
+	const senders, each = 4, 5
+	const total = senders * each
+
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		failures []error
+		seen     = map[string]bool{}
+	)
+	note := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		failures = append(failures, err)
+	}
+	record := func(messages []Message) {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, message := range messages {
+			seen[string(message.Body)] = true
+		}
+	}
+
+	for s := range senders {
+		wg.Go(func() {
+			messages := make([]Outbound, each)
+			for i := range messages {
+				messages[i] = Outbound{
+					Body:            fmt.Appendf(nil, `{"eventId":"s%d-%d"}`, s, i),
+					GroupID:         fmt.Sprintf("wallet-%d", s),
+					DeduplicationID: fmt.Sprintf("s%d-%d", s, i),
+				}
+			}
+			results, err := queue.SendBatch(t.Context(), messages)
+			if err != nil {
+				note(err)
+				return
+			}
+			for _, result := range results {
+				if !result.Sent() {
+					note(result.Err)
+				}
+			}
+		})
+	}
+	for range 2 {
+		wg.Go(func() {
+			for range 3 {
+				messages, err := queue.Receive(t.Context())
+				if err != nil {
+					note(err)
+					return
+				}
+				record(messages)
+				for _, message := range messages {
+					if err := queue.Delete(t.Context(), message.ReceiptHandle); err != nil {
+						note(err)
+						return
+					}
+				}
+			}
+		})
+	}
+	wg.Go(func() {
+		for range 10 {
+			if err := health.Ready(t.Context()); err != nil {
+				note(err)
+				return
+			}
+		}
+	})
+	wg.Wait()
+
+	for _, err := range failures {
+		t.Errorf("a goroutine failed: %v", err)
+	}
+	record(drain(t, queue))
+	if len(seen) != total {
+		t.Errorf("%d distinct messages accounted for, want %d", len(seen), total)
 	}
 }

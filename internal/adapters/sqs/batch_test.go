@@ -5,6 +5,7 @@ package sqs
 import (
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,13 +13,16 @@ import (
 )
 
 // TestSendBatchSplitsAtTheEntryLimit sends more than one call's worth and
-// proves every message reached the queue.
+// proves every message reached the queue, in three calls rather than one.
 //
-// Twenty-five is three calls: ten, ten and five. What is being tested is that
-// the publisher does not have to know that.
+// Twenty-five is ten, ten and five. What is being tested is that the publisher
+// does not have to know that — and the call count is asserted rather than
+// inferred, so the test says which bound did the splitting.
 func TestSendBatchSplitsAtTheEntryLimit(t *testing.T) {
 	name := fixtureQueue(t, nil)
-	queue := openQueue(t, Config{Name: name, WaitTime: 2 * time.Second})
+	var calls atomic.Int64
+	queue := openQueue(t, Config{
+		Name: name, WaitTime: 2 * time.Second, Client: countingClient(t, &calls)})
 
 	const count = 25
 	messages := make([]Outbound, count)
@@ -47,6 +51,9 @@ func TestSendBatchSplitsAtTheEntryLimit(t *testing.T) {
 		ids[result.MessageID] = true
 	}
 
+	if got := calls.Load(); got != 3 {
+		t.Errorf("%d SendMessageBatch calls for %d messages, want 3", got, count)
+	}
 	arrived := drain(t, queue)
 	if len(arrived) != count {
 		t.Fatalf("%d messages arrived, want %d", len(arrived), count)
@@ -54,11 +61,22 @@ func TestSendBatchSplitsAtTheEntryLimit(t *testing.T) {
 }
 
 // TestSendBatchSplitsAtTheSizeLimit is the other bound. Three 100 KiB messages
-// do not fit in one 256 KiB call although three entries fit in one batch, and a
-// publisher that let SQS discover that would have lost all three.
+// do not fit in one 256 KiB call although three entries fit in one batch, so
+// this must be two calls and not one.
+//
+// The assertion is the call count and nothing more, because the call count is
+// all this backend can show. LocalStack does not enforce the 256 KiB a real SQS
+// applies to a batch — a raw 300 KiB three-entry call is simply accepted — so a
+// test that claimed "SQS would have refused this" would be claiming something
+// about a service it is not running against, and a chunker that ignored the
+// weight limit would still pass it. What the value of the bound is worth is
+// settled by TestChunking, which does not need a queue at all; what needs a
+// real queue is that the split actually happens on the wire.
 func TestSendBatchSplitsAtTheSizeLimit(t *testing.T) {
 	name := fixtureQueue(t, nil)
-	queue := openQueue(t, Config{Name: name, WaitTime: 2 * time.Second})
+	var calls atomic.Int64
+	queue := openQueue(t, Config{
+		Name: name, WaitTime: 2 * time.Second, Client: countingClient(t, &calls)})
 
 	const each = 100 * 1024
 	messages := make([]Outbound, 3)
@@ -77,6 +95,10 @@ func TestSendBatchSplitsAtTheSizeLimit(t *testing.T) {
 		if !result.Sent() {
 			t.Fatalf("results[%d] = %v, want it sent", i, result.Err)
 		}
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("%d SendMessageBatch calls for 3 messages of %d bytes, want 2: the weight "+
+			"limit did not split the batch", got, each)
 	}
 	arrived := drain(t, queue)
 	if len(arrived) != 3 {
