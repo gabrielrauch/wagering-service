@@ -1,0 +1,22 @@
+# Where Grafana finds the dashboards this repository ships.
+#
+# The path is /etc/grafana/dashboards and not this directory. A provider that
+# reads the directory its own provisioning file is in tries to load that file
+# as a dashboard and logs a failure for it on every scan — the dashboards live
+# one directory over for that reason alone.
+apiVersion: 1
+
+providers:
+  - name: wagering
+    orgId: 1
+    type: file
+    # The dashboard is a file in this repository. Deleting it in the UI would
+    # put Grafana's copy and the repository's out of step until the next
+    # restart put it back; saving an edit in the UI would do the same in the
+    # other direction. Both are refused, so the file is the dashboard.
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false

@@ -15,6 +15,14 @@
 #   api-3        8083
 #   worker        --    two replicas, publishing nothing
 #
+# and the observability stack, which the five service processes reach through
+# one address and nothing else:
+#
+#   otel-collector  4317  OTLP in, from every API replica and every worker
+#   tempo           3200  the traces
+#   prometheus      9090  the metrics, scraped back off the collector
+#   grafana         3000  both of those, dashboard already loaded
+#
 # Configuration is written here rather than read from .env.example, and the two
 # disagree on purpose. .env.example is the host's view — `localhost:5432`,
 # `localhost:8080` — because that is where a developer running `go run ./cmd/api`
@@ -29,26 +37,19 @@
 name: wagering
 
 # ---------------------------------------------------------------------------
-# What the observability step adds
+# The observability path
 #
-# An OpenTelemetry Collector, Tempo, Prometheus and Grafana are not here. They
-# belong to the step that wires the OpenTelemetry SDK into the service, because
-# the exporter's configuration and the collector's receivers are one decision
-# written in two files, and splitting them across two steps is how they come to
-# disagree.
+#   api-1..3, worker ──OTLP/gRPC──▶ otel-collector ──▶ tempo      traces
+#                                         │
+#                                      :8889 ◀──scrape── prometheus   metrics
+#                                                             │
+#                                            grafana ◀────────┴── tempo
 #
-# They slot in without moving anything already here:
-#
-#   * four services of their own, each with its own healthcheck;
-#   * whatever exporter variables the SDK reads, added to the
-#     x-app-environment anchor below — both api and worker inherit it;
-#   * `otel-collector: {condition: service_healthy}` added to the depends_on of
-#     api-1, api-2, api-3 and worker, so nothing starts before the endpoint it
-#     exports to exists;
-#   * their configuration under deploy/, beside deploy/keycloak and
-#     deploy/localstack;
-#   * Grafana published on 3000, which is the address `make dashboards` already
-#     prints.
+# The service knows one address — OTEL_EXPORTER_OTLP_ENDPOINT, set in the
+# anchor below — and nothing about what is behind it. Swapping Tempo for
+# something else is an edit to deploy/otel/collector.yaml, not a redeploy of
+# five processes, and that is what the extra hop buys on a laptop where the SDK
+# could have written to Tempo directly.
 # ---------------------------------------------------------------------------
 
 # Everything both binaries need. The four variables with no default —
@@ -83,6 +84,23 @@ x-app-environment: &app-environment
   # one issuer string is true everywhere.
   OIDC_ISSUER: http://keycloak:8080/realms/wagering
   OIDC_AUDIENCE: wagering-api
+
+  # Where spans and measurements go. The scheme is what decides whether the
+  # export is encrypted, so `http://` here is plaintext gRPC and not a choice
+  # of OTLP over HTTP — the SDK speaks gRPC either way.
+  #
+  # The service's own default is empty, and empty means nothing is exported at
+  # all. This one line is the difference between a stack that is observable and
+  # one that could be. .env.example sets the same variable to localhost:4317,
+  # which is the same collector seen from the host.
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+
+  # Thirty seconds is the default and the right answer for a deployment, where
+  # every interval is paid for forever. Here the interval is how long somebody
+  # watches a dashboard after submitting a transaction before concluding it
+  # does not work. Prometheus scrapes the collector at the same five seconds —
+  # see deploy/prometheus/prometheus.yml.
+  TELEMETRY_METRIC_INTERVAL: 5s
 
 services:
   postgres:
@@ -240,6 +258,13 @@ services:
         condition: service_healthy
       localstack:
         condition: service_healthy
+      # Not because the API needs it: a process whose collector refuses
+      # connections starts, serves, and logs each failed export. It is the
+      # first request after `make up` that this is for — the one a
+      # demonstration looks at — and its spans are exactly the ones a collector
+      # that is still starting would drop.
+      otel-collector:
+        condition: service_healthy
     healthcheck:
       # /health/ready, which reports the database and the queue and answers 503
       # when either is unreachable — so this is unhealthy exactly when the
@@ -300,6 +325,157 @@ services:
       # delay the queues draining.
       localstack:
         condition: service_healthy
+      otel-collector:
+        condition: service_healthy
+
+  # --- The observability stack ----------------------------------------------
+  #
+  # Nothing above depends on any of these except through otel-collector, and
+  # the collector accepts what it is sent whether or not Tempo and Prometheus
+  # are keeping it. Losing the dashboard does not stop a transaction being
+  # processed, and none of the four is on the path of one.
+
+  # Built rather than pulled, for one line — see deploy/otel/Dockerfile. The
+  # published image is a scratch image with a single binary in it, and a
+  # container with no HTTP client in it is a container whose health endpoint
+  # nothing can ask; `condition: service_healthy` above could not be written
+  # against it.
+  otel-collector:
+    build:
+      context: ./deploy/otel
+    command: ["--config=/etc/otel/collector.yaml"]
+    volumes:
+      - ./deploy/otel/collector.yaml:/etc/otel/collector.yaml:ro
+    ports:
+      # Published so that a process started from the host — `go run ./cmd/api`
+      # with .env.example — exports to the same collector the containers do,
+      # and so that a hand-written OTLP payload can be posted to 4318.
+      - "4317:4317"
+      - "4318:4318"
+    depends_on:
+      # So that the first batch the collector forwards has somewhere to land.
+      # It would retry if it did not, but a retry that succeeds is still a log
+      # line that says something failed, on a stack whose logs are read.
+      tempo:
+        condition: service_healthy
+    healthcheck:
+      # The health_check extension, which answers 200 once every pipeline has
+      # started — so this is "the receivers are listening" and not "a process
+      # exists". busybox, installed into the image under the name `wget`; see
+      # deploy/otel/Dockerfile for why it is named that.
+      test: ["CMD", "/usr/bin/wget", "-q", "-O", "/dev/null", "http://127.0.0.1:13133"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  tempo:
+    image: grafana/tempo:2.9.0
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./deploy/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      # The blocks and the write-ahead log. A named volume rather than the
+      # container filesystem so that `docker compose restart tempo` keeps the
+      # traces, and `docker compose down -v` is still the one command that
+      # forgets everything. /var/tempo exists in the image owned by the user
+      # Tempo runs as, which is what a fresh volume inherits.
+      - tempo-data:/var/tempo
+    ports:
+      # The API the Grafana datasource talks to, published because it is also
+      # the API that answers "find me the trace with this correlationId" from a
+      # shell. See `make trace`.
+      - "3200:3200"
+    healthcheck:
+      # /ready, not /status: Tempo answers /status while it is still replaying
+      # its write-ahead log, and a collector that started against that one
+      # would spend its first seconds retrying.
+      test: ["CMD", "/busybox/wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3200/ready"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  prometheus:
+    image: prom/prometheus:v3.9.0
+    # No command. The image's default already names
+    # /etc/prometheus/prometheus.yml and /prometheus, and overriding it to say
+    # one flag means restating the rest — including the storage path, whose
+    # absence is a Prometheus that quietly writes its database into the working
+    # directory.
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    healthcheck:
+      # /-/ready rather than /-/healthy: healthy means the process is up, ready
+      # means the database is loaded and it can answer a query — which is what
+      # Grafana is about to do.
+      test: ["CMD", "/bin/wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/ready"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  grafana:
+    image: grafana/grafana:12.4.0
+    environment:
+      # Placeholders, and they could not be anything else: they are printed by
+      # `make dashboards` and written in .env.example, both of which are in the
+      # repository. Nothing in this stack is reachable from anywhere but the
+      # laptop it runs on.
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      # A viewer needs no account at all, so `make up` and then opening
+      # localhost:3000 lands on the dashboard rather than on a login form. The
+      # credentials above are what anything that writes still has to present.
+      # This is a posture for a laptop and for nothing else.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      # Grafana phones home for usage statistics and for the latest version
+      # unless told not to. A stack brought up by a `make` target has no
+      # business making either call on the developer's behalf.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      # The datasources and the dashboard provider. Grafana reads these
+      # directories once at start-up, which is what "already loaded" means.
+      #
+      # Two mounts, one per directory, rather than one over
+      # /etc/grafana/provisioning. That directory holds six of these in the
+      # image — alerting, plugins, notifiers and access-control besides these
+      # two — and a single mount hides the four this repository has nothing to
+      # say about, leaving Grafana to log a failure for each on every start.
+      - ./deploy/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./deploy/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      # The dashboards themselves, one directory over from the provider that
+      # points at them — see deploy/grafana/provisioning/dashboards.
+      - ./deploy/grafana/dashboards:/etc/grafana/dashboards:ro
+      # Grafana's own database: users, preferences, the provisioning bookkeeping
+      # that tells it this dashboard is the file's and not the UI's.
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      tempo:
+        condition: service_healthy
+    healthcheck:
+      # Generous, because Grafana is: it answers this endpoint roughly forty
+      # seconds after it starts, against a few seconds for everything else
+      # here. start_period is what keeps those forty seconds from counting as
+      # ten failures — during it a failing check leaves the container
+      # `starting`, and `docker compose up --wait` goes on waiting rather than
+      # calling a slow start a broken one.
+      test: ["CMD", "/usr/bin/curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:3000/api/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
 
 volumes:
   postgres-data:
+  tempo-data:
+  prometheus-data:
+  grafana-data:

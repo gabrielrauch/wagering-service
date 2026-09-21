@@ -1,0 +1,35 @@
+# Prometheus scrapes exactly one target: the collector's Prometheus exporter.
+#
+# The service itself exposes no /metrics endpoint and is not scraped. It pushes
+# over OTLP and the collector holds what it pushed, which is what lets three
+# API replicas and two workers be watched without Prometheus having to discover
+# five containers on a network it cannot see into.
+
+global:
+  # Five seconds, matched by TELEMETRY_METRIC_INTERVAL in docker-compose.yml.
+  # A scrape much faster than the export interval samples the same numbers
+  # repeatedly; much slower and a demonstration is over before the second
+  # sample. It is also the datasource's `timeInterval`, which is what Grafana
+  # computes $__rate_interval from.
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: otel-collector
+    static_configs:
+      - targets: ['otel-collector:8889']
+    # honor_labels is deliberately left off, and this is the one thing about
+    # this file a dashboard has to know.
+    #
+    # The collector maps each service's `service.name` onto a `job` label, so
+    # everything it exports arrives labelled job="wagering". That collides with
+    # the name of this scrape job, and Prometheus resolves the collision by
+    # keeping its own and renaming the incoming one to `exported_job`. Turning
+    # honor_labels on would reverse that — the service's label would win and
+    # `job` would read "wagering" — at the cost of no longer being able to say
+    # which collector delivered a series.
+    #
+    # It stays off because the collision is information: `job` says how a
+    # series reached Prometheus and `exported_job` says whose it is. Every
+    # query in deploy/grafana/dashboards/wagering.json selects on
+    # exported_job="wagering" for that reason, and a query that selects on
+    # job="wagering" returns nothing at all — silently, which is the trap.

@@ -22,10 +22,14 @@ REALM ?= wagering
 CLIENT ?= provider-a
 CLIENT_SECRET ?= $(CLIENT)-secret
 
-# Where the observability stack publishes Grafana. `make dashboards` prints it.
+# Where the observability stack publishes Grafana and Tempo. `make dashboards`
+# prints the first three; `make trace` asks the fourth. All four are documented
+# in .env.example beside the variables the service itself reads, and all four
+# are taken from the environment when it sets them.
 GRAFANA_URL ?= http://localhost:3000
 GRAFANA_USER ?= admin
 GRAFANA_PASSWORD ?= admin
+TEMPO_URL ?= http://localhost:3200
 
 .PHONY: help
 help: ## List the targets
@@ -87,13 +91,19 @@ fix: ## Apply the fixes gofmt, go fix and golangci-lint can make on their own
 	golangci-lint run --fix || true
 	golangci-lint fmt
 
-# --wait names the five long-running services rather than being left to cover
-# everything, because the migration job exits as soon as it has done its work
-# and `--wait` reports a container that exited as a failure. The job still runs:
-# every service named here depends on its completion.
+# --wait names services rather than being left to cover everything, because the
+# migration job exits as soon as it has done its work and `--wait` reports a
+# container that exited as a failure. The job still runs: every service named
+# here depends on its completion.
+#
+# The five named pull in the other seven. The API replicas and the worker wait
+# on the collector, which waits on Tempo; Grafana waits on Prometheus and on
+# Tempo. Naming grafana is what makes this target return with a dashboard that
+# opens, rather than one still forty seconds from answering — Grafana is by some
+# distance the slowest thing here to start.
 .PHONY: up
 up: ## Build and start the whole stack, and wait for it to be healthy
-	docker compose up --build --detach --wait api-1 api-2 api-3 worker
+	docker compose up --build --detach --wait api-1 api-2 api-3 worker grafana
 	@docker compose ps
 
 .PHONY: down
@@ -143,9 +153,35 @@ dashboards: ## Print where Grafana is and how to sign in
 	@echo "user:     $(GRAFANA_USER)"
 	@echo "password: $(GRAFANA_PASSWORD)"
 	@echo
-	@echo "The datasources and the dashboard are provisioned, so there is nothing"
-	@echo "to import. Grafana is part of the observability stack; if that address"
-	@echo "refuses the connection, it is not in docker-compose.yml yet."
+	@echo 'Both datasources and the dashboard are provisioned from deploy/grafana,'
+	@echo 'so "Wagering service" is loaded at start-up and there is nothing to'
+	@echo 'import. Reading it needs no sign-in; the credentials are for writing.'
+	@echo
+	@echo 'The trace behind one correlationId — Explore, the Tempo datasource,'
+	@echo 'the TraceQL tab:'
+	@echo
+	@echo '    { .correlationId = "<id>" }'
+	@echo
+	@echo 'or, without a browser:  make trace CORRELATION=<id>'
+
+# Prints Tempo's answer as it comes, which is one JSON object listing every
+# trace that carried this correlationId — its traceID, its root span and how
+# long it took.
+#
+# start and end are not optional. Tempo searches a default window and answers
+# an empty result, not an error, for anything outside it — so a trace that is
+# not there and a trace that is there but older look exactly alike. This asks
+# for the last hour, which is longer than this stack usually lives.
+.PHONY: trace
+trace: ## Find the trace for CORRELATION=<correlationId> in Tempo
+	@test -n "$(CORRELATION)" || \
+		{ echo 'usage: make trace CORRELATION=<correlationId>' >&2; exit 2; }
+	@curl --fail --silent --show-error --get \
+		--data-urlencode 'q={ .correlationId = "$(CORRELATION)" }' \
+		--data "start=$$(( $$(date +%s) - 3600 ))" \
+		--data "end=$$(date +%s)" \
+		"$(TEMPO_URL)/api/search"
+	@echo
 
 .PHONY: db-up
 db-up: ## Start a local PostgreSQL 16 to migrate against

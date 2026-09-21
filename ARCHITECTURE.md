@@ -422,6 +422,146 @@ the one representation this API never serves.
 
 ---
 
+## Observability
+
+`docker-compose.yml` brings up four more containers beside the service: an
+OpenTelemetry Collector, Tempo, Prometheus and Grafana. Every API replica and
+every worker exports over OTLP/gRPC to the collector and knows nothing else
+about any of them — one address, `OTEL_EXPORTER_OTLP_ENDPOINT`. The collector
+forwards traces to Tempo and holds metrics on `:8889`, which Prometheus scrapes
+every five seconds. Their configuration is in `deploy/otel`, `deploy/tempo`,
+`deploy/prometheus` and `deploy/grafana`.
+
+That variable is **empty by default**, and empty means nothing is exported at
+all: a process with no collector to talk to does not retry one. The compose
+stack sets it; `.env.example` sets it to the same collector seen from the host.
+
+| | Address | |
+|---|---|---|
+| Grafana | <http://localhost:3000> | the dashboard, already loaded |
+| Prometheus | <http://localhost:9090> | |
+| Tempo | <http://localhost:3200> | the search API below |
+| Collector | `localhost:4317` gRPC, `4318` HTTP | what the service exports to |
+
+### The dashboard
+
+Grafana starts with both datasources and the dashboard **Wagering service**
+provisioned from `deploy/grafana`. There is nothing to import and nothing to
+configure. `make dashboards` prints the address and the credentials.
+
+Those credentials are `GRAFANA_USER` and `GRAFANA_PASSWORD` in `.env.example` —
+`admin` / `admin`, which are `docker-compose.yml`'s `GF_SECURITY_ADMIN_USER` and
+`GF_SECURITY_ADMIN_PASSWORD`. They are placeholders in a repository, on a stack
+reachable from nowhere but the laptop running it. **Reading the dashboard needs
+no sign-in**: anonymous access is on, and the credentials are what anything that
+writes has to present.
+
+The panels, and the query behind each. Every selector below is
+`{exported_job="wagering"}`, left out to keep the column readable:
+
+| Panel | Query |
+|---|---|
+| Transaction outcomes | `sum by (status) (rate(wagering_transactions_total[$__rate_interval]))` |
+| Outcomes since start | `sum by (status) (wagering_transactions_total)` |
+| Rejections by failure code | `sum by (failureCode) (wagering_transactions_total{status="REJECTED"})` |
+| Processing latency percentiles | `histogram_quantile(0.50 \| 0.95 \| 0.99, sum by (le) (rate(wagering_processing_duration_seconds_bucket[$__rate_interval])))` |
+| Idempotent replays | `sum by (source, kind) (rate(wagering_idempotent_replays_total[$__rate_interval]))` |
+| Inbox duplicates | `sum by (consumer) (rate(wagering_inbox_duplicates_total[$__rate_interval]))` |
+| Lock conflicts | `sum by (transaction) (rate(wagering_lock_timeouts_total[$__rate_interval]))`, and the same over `wagering_version_conflicts_total` |
+| Outbox lag | `max(wagering_outbox_lag_seconds)` |
+| Outbox publish attempts | `sum by (outcome) (rate(wagering_outbox_publish_attempts_total[$__rate_interval]))` |
+| SQS retries | `sum by (class) (rate(wagering_sqs_retries_total[$__rate_interval]))` |
+| Dead letters | `sum(wagering_sqs_dead_letters_total) or vector(0)` |
+| Reconciliation divergences | `sum(wagering_reconciliation_divergences_total) or vector(0)` |
+
+The last two are the panels that must read zero. `or vector(0)` is there
+because a counter that has never been incremented has no series at all, and a
+panel that says "No data" where it should say "none" is a panel nobody believes
+the second time.
+
+**`exported_job`, not `job`.** The collector maps each service's `service.name`
+onto a `job` label, so everything it exports arrives labelled `job="wagering"`.
+That collides with the name of Prometheus's own scrape job, and Prometheus keeps
+its own and renames the incoming one. Every query above therefore selects
+`exported_job="wagering"`; `job="wagering"` matches nothing, silently. The same
+series also carries `service_name="wagering"`, from the resource attribute the
+collector copies onto each metric.
+
+A rate over a counter that appeared once and never moved is zero — Prometheus
+cannot tell a counter's first sample from a counter that was always at that
+value. Three requests by hand therefore leave the rate panels flat; "Outcomes
+since start" is the panel that shows them at all. Traffic spread over more than
+one scrape interval fills the rest.
+
+**The counters are one process's counters, not five.** Three API replicas and
+two workers export a resource identified by `service.name` and nothing else, so
+the collector cannot tell them apart and keeps one series where there should be
+five. Three BETs, one to each replica, move `wagering_transactions_total` by
+one. Traces are unaffected — a span carries its own identity. See
+"Limitations"; again, no query here is what needs changing.
+
+**The percentile panel reads coarse, and the cause is upstream of this
+dashboard.** `wagering.processing.duration` is recorded in seconds and keeps the
+OpenTelemetry SDK's default bucket boundaries, which begin at 5 and were chosen
+for a duration in milliseconds. Every operation this service has performed falls
+in the first bucket, so `histogram_quantile` interpolates inside (0s, 5s] and
+answers 2.5 seconds for work whose exact mean — `_sum / _count`, which is not
+bucketed — is six milliseconds. See "Limitations"; the query is not what needs
+changing.
+
+### Finding a trace by `correlationId`
+
+Every span carries `correlationId`: the value `X-Correlation-Id` echoes, the
+error body returns and every log line names. One trace spans the HTTP request,
+the use case, the SQL transaction and the wallet events the outbox published
+from it afterwards — the publish span is a child of the trace the event was
+stored under, and is linked to the batch that carried it.
+
+**In Grafana** — *Explore*, the **Tempo** datasource, the **TraceQL** tab:
+
+```
+{ .correlationId = "8d126071-1a25-4831-af62-7e61e80c59cb" }
+```
+
+The same query works on `.transactionId`, `.walletId`, `.providerId`,
+`.messageId` and `.eventId`.
+
+**From a shell**:
+
+```
+make trace CORRELATION=8d126071-1a25-4831-af62-7e61e80c59cb
+```
+
+which is Tempo's search API, and the whole of it:
+
+```
+curl --get --data-urlencode 'q={ .correlationId = "…" }' \
+     --data "start=$(( $(date +%s) - 3600 ))" \
+     --data "end=$(date +%s)" \
+     http://localhost:3200/api/search
+```
+
+`start` and `end` are not optional. Outside its default window Tempo answers an
+empty result rather than an error, so a trace that is not there and a trace that
+is there but older look exactly alike. `GET /api/traces/<traceID>` then returns
+the trace itself, in OTLP JSON — where the trace and span identifiers are
+**base64**, not the hex the search result just printed.
+
+One BET, found that way, is nineteen spans:
+
+```
+SPAN_KIND_SERVER    POST /wagering/transactions   correlationId=… kind=BET transactionId=…
+SPAN_KIND_INTERNAL  Wagering.Submit
+SPAN_KIND_CLIENT    postgres movement
+SPAN_KIND_CLIENT    postgres.query                ×13
+SPAN_KIND_PRODUCER  publish wallet event          eventId=…  → links to `publish outbox batch`
+SPAN_KIND_PRODUCER  publish wallet event          eventId=…
+```
+
+The two producer spans are two seconds after the server span closed, in the
+worker, in another container. They are in this trace because that is where the
+event came from.
+
 ## Interpretations
 
 The original challenge specification is not in this repository and could not be
@@ -565,3 +705,28 @@ does not exist. The following were derived from the task text plus the
 - **The SQS readiness check does not exist yet.** `/health/ready` takes a set of
   named checks and the composition root supplies them; until the queue adapter
   exists, the set names only PostgreSQL.
+- **`wagering.processing.duration` has millisecond-shaped buckets and
+  second-shaped values.** The instrument is created with `metric.WithUnit("s")`
+  and recorded with `Took.Seconds()`, but names no boundaries — so it takes the
+  SDK's defaults, `0, 5, 10, 25 … 10000`, which are the defaults for a duration
+  measured in milliseconds. Every observation lands in the first bucket. The sum
+  and the count stay exact, and every percentile the dashboard can compute is an
+  interpolation inside a single five-second bucket: p50 reads 2.5s where the
+  mean is 0.006s. The fix is one option on the instrument in
+  `internal/telemetry/metrics.go` —
+  `metric.WithExplicitBucketBoundaries(0.005, 0.01, 0.025, 0.05, 0.075, 0.1,
+  0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10)`, the boundary set the OpenTelemetry
+  semantic conventions give for a duration in seconds. The dashboard needs no
+  change when it lands.
+- **Only one process's measurements reach the dashboard.** Every process builds
+  its OpenTelemetry resource from `service.name` alone — `resource.Default()`
+  plus that one attribute, with no `service.instance.id`. The collector's
+  Prometheus exporter keys a series by its labels, and five processes reporting
+  the same metric under the same labels are one series to it: three BETs, one to
+  each API replica, move `wagering_transactions_total` by one, and the other two
+  are lost with no error anywhere. The fix is one attribute on the resource in
+  `internal/fxmod/telemetry.go` — `semconv.ServiceInstanceID` from the hostname,
+  which the container runtime already sets to something distinct per replica and
+  which the exporter maps to `instance`. Every query on the dashboard already
+  aggregates with `sum by (...)`, so none of them changes when it lands. Traces
+  never had this problem: a span identifies itself.
