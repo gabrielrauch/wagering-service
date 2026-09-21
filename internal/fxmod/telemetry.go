@@ -105,11 +105,14 @@ import (
 // the process throws away the traces an operator most wants, because whether a
 // trace is interesting is known at its END. The collector is where that
 // decision belongs — tail sampling keeps the errors and the slow ones and drops
-// the rest — and the collector is not this repository's. What this package owes
-// that decision is the arithmetic above, so that whoever configures it knows
-// what they are bounding. The three intervals are the other knob and they are
-// environment variables, so a deployment that wants fewer spans and no
-// collector rule can slow the loops down instead.
+// the rest — and this repository's collector is deploy/otel/collector.yaml,
+// which carries no tail_sampling and states why beside the processors it does
+// have: a laptop keeps every trace, because the one somebody is demonstrating
+// is never the one a rule would have kept. What this package owes that decision
+// is the arithmetic above, so that whoever configures it knows what they are
+// bounding. The three intervals are the other knob and they are environment
+// variables, so a deployment that wants fewer spans and no collector rule can
+// slow the loops down instead.
 func Telemetry() fx.Option {
 	return fx.Module("telemetry",
 		fx.Provide(
