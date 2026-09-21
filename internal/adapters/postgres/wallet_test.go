@@ -52,9 +52,9 @@ func TestTwoMovementsOnOneWalletSerialise(t *testing.T) {
 	}()
 
 	// Long enough that a lock which did not serialise would have let the second
-	// command through, and short enough to stay inside the lock timeout — a
-	// waiter cut off at 750ms would prove nothing about serialisation.
-	time.Sleep(200 * time.Millisecond)
+	// command through, and well inside the lock timeout — a waiter cut off
+	// mid-test would prove nothing about serialisation.
+	time.Sleep(contentionPause)
 	select {
 	case got := <-entered:
 		t.Fatalf("the second movement took the wallet at %s while the first still held it", got)

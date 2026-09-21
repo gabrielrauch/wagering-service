@@ -19,14 +19,26 @@ import (
 
 // The timeouts every test's manager runs with.
 //
-// The lock timeout is short because several tests prove that a second command
-// on one wallet waits and is then cut off, and a generous one would make each
-// of those tests pay for the wait. It is still an order of magnitude above the
-// round trip to a container on the same host, so a test that expects to acquire
-// a lock is not racing it.
+// The lock timeout is the margin the concurrency tests live inside. Several of
+// them hold a lock, sleep a fixed 250ms to show that a waiter really is
+// waiting, and then release — so the timeout has to be comfortably longer than
+// that sleep or a loaded machine turns a passing test into a lock timeout. Two
+// seconds is an 8x margin, where 750ms was 3x and was the first thing expected
+// to flake under -race on a shared runner.
+//
+// Only one test pays for the size of it: the one that deliberately waits the
+// whole timeout out to prove the wait is bounded. That is a second and a
+// quarter of extra runtime, once, for a suite that is otherwise the flakiest
+// part of the change.
 const (
-	testLockTimeout      = 750 * time.Millisecond
+	testLockTimeout      = 2 * time.Second
 	testStatementTimeout = 10 * time.Second
+	// contentionPause is how long a test holds something another goroutine
+	// wants before checking that the other goroutine has not got it. Long
+	// enough that an unserialized waiter would certainly have finished, and
+	// far enough inside testLockTimeout that a slow machine does not turn the
+	// wait into a failure.
+	contentionPause = 250 * time.Millisecond
 )
 
 // base is the instant the fixtures count from. Truncated to the microsecond
@@ -373,8 +385,9 @@ func (w *world) referenceFor(
 	return view
 }
 
-// reschedule moves a parked operation's next attempt through the adapter.
-func (w *world) reschedule(t *testing.T, id wagering.TransactionID, to time.Time) {
+// rescheduleOperation moves a parked operation's next attempt through the
+// adapter.
+func (w *world) rescheduleOperation(t *testing.T, id wagering.TransactionID, to time.Time) {
 	t.Helper()
 	err := w.tm.WithinMovement(t.Context(), func(ctx context.Context, r *app.Repos) error {
 		return r.Transactions.Reschedule(ctx, id, to)

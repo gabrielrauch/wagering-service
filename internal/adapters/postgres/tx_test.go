@@ -93,9 +93,18 @@ func TestTheTransactionManagerSetsWhatItPromises(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
 
+	// The timeouts are read from pg_settings rather than current_setting,
+	// because current_setting renders them the way a human would write them —
+	// "750ms", but "2s" — and an assertion against that spelling is an
+	// assertion about PostgreSQL's formatting that breaks when the configured
+	// value crosses a unit. pg_settings.setting is the raw count in the
+	// setting's base unit, which is milliseconds, which is exactly what
+	// [milliseconds] renders. Comparing the two also checks that function
+	// against what the server actually stored.
 	const settings = `SELECT current_setting('transaction_isolation'), ` +
 		`current_setting('transaction_read_only'), ` +
-		`current_setting('lock_timeout'), current_setting('statement_timeout')`
+		`(SELECT setting FROM pg_settings WHERE name = 'lock_timeout'), ` +
+		`(SELECT setting FROM pg_settings WHERE name = 'statement_timeout')`
 
 	read := func(t *testing.T, options pgx.TxOptions) (isolation, readOnly, lock, statement string) {
 		t.Helper()
@@ -116,11 +125,11 @@ func TestTheTransactionManagerSetsWhatItPromises(t *testing.T) {
 		if readOnly != "off" {
 			t.Errorf("read only %q, wanted off", readOnly)
 		}
-		if lock != "750ms" {
-			t.Errorf("lock_timeout %q, wanted 750ms", lock)
+		if want := milliseconds(testLockTimeout); lock != want {
+			t.Errorf("lock_timeout %q ms, wanted %q", lock, want)
 		}
-		if statement != "10s" {
-			t.Errorf("statement_timeout %q, wanted 10s", statement)
+		if want := milliseconds(testStatementTimeout); statement != want {
+			t.Errorf("statement_timeout %q ms, wanted %q", statement, want)
 		}
 	})
 
@@ -132,11 +141,11 @@ func TestTheTransactionManagerSetsWhatItPromises(t *testing.T) {
 		if readOnly != "on" {
 			t.Errorf("read only %q, wanted on", readOnly)
 		}
-		if lock != "750ms" {
-			t.Errorf("lock_timeout %q, wanted 750ms", lock)
+		if want := milliseconds(testLockTimeout); lock != want {
+			t.Errorf("lock_timeout %q ms, wanted %q", lock, want)
 		}
-		if statement != "10s" {
-			t.Errorf("statement_timeout %q, wanted 10s", statement)
+		if want := milliseconds(testStatementTimeout); statement != want {
+			t.Errorf("statement_timeout %q ms, wanted %q", statement, want)
 		}
 	})
 
@@ -146,7 +155,7 @@ func TestTheTransactionManagerSetsWhatItPromises(t *testing.T) {
 		// happened to be handed that connection next.
 		var lock string
 		if err := w.app.QueryRow(t.Context(),
-			`SELECT current_setting('lock_timeout')`).Scan(&lock); err != nil {
+			`SELECT setting FROM pg_settings WHERE name = 'lock_timeout'`).Scan(&lock); err != nil {
 			t.Fatalf("read the session's lock_timeout: %v", err)
 		}
 		if lock != "0" {

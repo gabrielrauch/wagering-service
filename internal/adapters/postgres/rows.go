@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -11,13 +12,26 @@ import (
 	"github.com/gabrielrauch/wagering-service/internal/domain/wagering"
 )
 
-// The conversions between a row and the values the domain works in.
+// Everything that converts between a stored row and a domain value, in both
+// directions.
 //
-// They are gathered here rather than written at each call site because the
-// mistakes they prevent are the silent kind: a UUID sent as sixteen numbers, a
-// NULL scanned as an empty string that then fails a NOT NULL check three
-// statements later, an amount that took a detour through a decimal string. Each
-// one is stated once, so there is one place to read to know it is right.
+// That is the rule this file is drawn on, and it is worth stating because the
+// obvious alternative — "reads here, writes beside the statement that makes
+// them" — is what the package drifted into: a ledger entry was read in this
+// file and written in ledger.go, a wager transaction was read here and rendered
+// in transactions.go, and the two halves of one mapping sat in different files
+// with nothing to hold them level. A column added to a row struct now has one
+// place to be added on the way out as well as on the way in.
+//
+// What lives here is therefore the row structs, their scan targets, the
+// Rehydrate calls that turn them into domain values, and the argument lists
+// that turn domain values back into rows. What does not is the statement text,
+// which is in sql.go and beside the store that issues it.
+//
+// The scalar conversions below are gathered for a related reason: the mistakes
+// they prevent are the silent kind — a UUID sent as sixteen numbers, a NULL
+// scanned as an empty string that then fails a NOT NULL check three statements
+// later, an amount that took a detour through a decimal string.
 
 // uuidOf renders one of the identifiers this system mints for a uuid column.
 //
@@ -108,6 +122,12 @@ func moneyFrom(minor int64, code string) (money.Money, error) {
 	return money.FromMinorUnits(minor, currency)
 }
 
+// walletColumns names every column a wallet read projects, in the order
+// [walletRow.dest] expects them.
+var walletColumns = []string{
+	"id", "player_id", "currency", "balance_minor", "version", "created_at", "updated_at",
+}
+
 // walletRow is one row of wagering.wallet.
 type walletRow struct {
 	id        pgtype.UUID
@@ -148,6 +168,38 @@ func (r *walletRow) wallet() (*wagering.Wallet, error) {
 		UpdatedAt: r.updatedAt,
 	})
 }
+
+// walletArgs renders a wallet for an insert, in the order [walletColumns]
+// names.
+func walletArgs(w *wagering.Wallet) []any {
+	return []any{
+		uuidOf(w.ID()),
+		string(w.PlayerID()),
+		w.Currency().String(),
+		minorOf(w.Balance()),
+		int64(w.Version()),
+		w.CreatedAt(),
+		w.UpdatedAt(),
+	}
+}
+
+// transactionColumns names every column a wager transaction read projects, in
+// the order [transactionRow.dest] expects them.
+var transactionColumns = []string{
+	"id", "wallet_id", "player_id", "currency", "kind", "status", "amount_minor",
+	"provider", "external_transaction_id", "idempotency_key", "payload_hash",
+	"round_id", "game_id", "reference_external_transaction_id",
+	"resolved_reference_id", "correlation_id", "result_balance_minor",
+	"failure_code", "reference_attempts", "reference_deadline",
+	"created_at", "updated_at",
+}
+
+// insertTransactionColumns adds the worker's schedule, which is written but
+// never read back into the domain: RehydrateWagerTransaction reads the
+// deadline, which is the wait budget, and ignores the next attempt, which is
+// only when to look again.
+var insertTransactionColumns = append(
+	slices.Clone(transactionColumns), "reference_next_attempt_at")
 
 // transactionRow is one row of wagering.wager_transaction, plus the correlation
 // it arrived under.
@@ -241,6 +293,13 @@ func (r *transactionRow) stored() (*app.StoredTransaction, error) {
 	return &app.StoredTransaction{Transaction: tx, Correlation: r.correlation}, nil
 }
 
+// ledgerColumns names every column a ledger read projects, in the order
+// [ledgerRow.dest] expects them.
+var ledgerColumns = []string{
+	"id", "wallet_id", "transaction_id", "currency", "direction", "amount_minor",
+	"balance_before_minor", "balance_after_minor", "wallet_version", "created_at",
+}
+
 // ledgerRow is one row of wagering.wallet_ledger_entry.
 type ledgerRow struct {
 	id            pgtype.UUID
@@ -292,4 +351,113 @@ func (r *ledgerRow) entry() (wagering.WalletLedgerEntry, error) {
 		WalletVersion: uint64(r.walletVersion),
 		CreatedAt:     r.createdAt,
 	})
+}
+
+// transactionArgs renders a snapshot for an insert, in the order
+// [insertTransactionColumns] names.
+//
+// A transaction with no provider side writes NULL into all six of the columns
+// the provider owns, which is the count
+// wager_transaction_origin_carries_its_fields checks: none for an opening, all
+// six otherwise, and nothing in between.
+func transactionArgs(
+	snap wagering.TransactionSnapshot,
+	correlation string,
+	nextAttemptAt time.Time,
+) []any {
+	var external wagering.ExternalSnapshot
+	if snap.External != nil {
+		external = *snap.External
+	}
+	return []any{
+		uuidOf(snap.ID),
+		uuidOf(snap.WalletID),
+		string(snap.PlayerID),
+		snap.Money.Currency().String(),
+		snap.Kind.String(),
+		snap.Status.String(),
+		minorOf(snap.Money),
+		textOf(external.Provider),
+		textOf(external.ExternalTransactionID),
+		textOf(external.IdempotencyKey),
+		textOf(external.PayloadHash),
+		textOf(external.RoundID),
+		textOf(external.GameID),
+		textOf(external.ReferenceExternalTransactionID),
+		nullableUUIDOf(external.ResolvedReferenceID),
+		correlation,
+		nullableMinorOf(snap.Result),
+		textOf(snap.FailureCode),
+		snap.ReferenceAttempts,
+		timeOf(snap.ReferenceDeadline),
+		snap.CreatedAt,
+		snap.UpdatedAt,
+		timeOf(nextAttemptAt),
+	}
+}
+
+// snapshotOf reads the stored shape off a transaction.
+//
+// It is the inverse of [transactionRow.transaction] and exists because the
+// domain hides its fields: a write has to ask the accessors, and asking them in
+// one place keeps a column from being written from the wrong one.
+func snapshotOf(tx *wagering.WagerTransaction) wagering.TransactionSnapshot {
+	snap := wagering.TransactionSnapshot{
+		ID:                tx.ID(),
+		WalletID:          tx.WalletID(),
+		PlayerID:          tx.PlayerID(),
+		Kind:              tx.Kind(),
+		Money:             tx.Money(),
+		Status:            tx.Status(),
+		CreatedAt:         tx.CreatedAt(),
+		UpdatedAt:         tx.UpdatedAt(),
+		ReferenceAttempts: tx.ReferenceAttempts(),
+	}
+	if result, ok := tx.Result(); ok {
+		snap.Result = &result
+	}
+	// Both of these report the zero value when they report false, so assigning
+	// unconditionally says exactly what a guard would have.
+	snap.FailureCode, _ = tx.FailureCode()
+	snap.ReferenceDeadline, _ = tx.ReferenceDeadline()
+
+	if !tx.IsExternal() {
+		return snap
+	}
+	provider, _ := tx.Provider()
+	externalID, _ := tx.ExternalTransactionID()
+	key, _ := tx.IdempotencyKey()
+	hash, _ := tx.PayloadHash()
+	round, _ := tx.RoundID()
+	game, _ := tx.GameID()
+	reference, _ := tx.ReferenceExternalTransactionID()
+	resolved, _ := tx.ResolvedReferenceID()
+	snap.External = &wagering.ExternalSnapshot{
+		Provider:                       provider,
+		ExternalTransactionID:          externalID,
+		IdempotencyKey:                 key,
+		PayloadHash:                    hash,
+		RoundID:                        round,
+		GameID:                         game,
+		ReferenceExternalTransactionID: reference,
+		ResolvedReferenceID:            resolved,
+	}
+	return snap
+}
+
+// ledgerArgs renders an entry for an insert, in the order [ledgerColumns]
+// names.
+func ledgerArgs(e wagering.WalletLedgerEntry) []any {
+	return []any{
+		uuidOf(e.ID()),
+		uuidOf(e.WalletID()),
+		uuidOf(e.TransactionID()),
+		e.Amount().Currency().String(),
+		e.Direction().String(),
+		minorOf(e.Amount()),
+		minorOf(e.BalanceBefore()),
+		minorOf(e.BalanceAfter()),
+		int64(e.WalletVersion()),
+		e.CreatedAt(),
+	}
 }

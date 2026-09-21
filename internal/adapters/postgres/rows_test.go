@@ -85,8 +85,11 @@ func TestAStoredRowTheDomainRefusesIsReportedRatherThanLoaded(t *testing.T) {
 	// A version stored below zero would become an enormous version rather than
 	// an error, because the column is signed and the domain's is not. Both
 	// checks below are guards on that one conversion, and reaching either takes
-	// disarming the CHECK that makes it unreachable — which is exactly what
-	// says the guard is defence in depth rather than the only line.
+	// disarming TWO things: the CHECK that refuses the value, and — through
+	// w.corrupt — the triggers that refuse the write, since wallet_guard will
+	// not let a version move without the balance and the ledger is append-only.
+	// Needing to take both down is exactly what says these guards are defence
+	// in depth rather than the only line.
 	//
 	// Neither database is put back together afterwards. Each is this test's own
 	// and is discarded with it, and a half-repaired schema would be a worse

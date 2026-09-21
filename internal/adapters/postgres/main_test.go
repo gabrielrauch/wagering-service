@@ -94,7 +94,30 @@ func run(m *testing.M) int {
 	defer pool.Close()
 
 	sharedDSN, admin = dsn, pool
-	return m.Run()
+	code := m.Run()
+	// After every test has finished, so nothing is still copying from it.
+	dropTemplate()
+	return code
+}
+
+// builtTemplate names the schema template once it has been built, so that
+// [run] can remove it.
+//
+// The template is the one database no test owns: it is created on the first
+// test that asks for a migrated database and then copied by every later one, so
+// there is no *testing.T whose cleanup it belongs to. Left behind it is the
+// residue a suite run leaves on a persistent cluster even when every test
+// passed and dropped its own.
+var builtTemplate string
+
+func dropTemplate() {
+	if builtTemplate == "" {
+		return
+	}
+	if _, err := admin.Exec(context.Background(),
+		"DROP DATABASE IF EXISTS "+builtTemplate+" WITH (FORCE)"); err != nil {
+		fmt.Fprintf(os.Stderr, "could not drop the schema template %s: %v\n", builtTemplate, err)
+	}
 }
 
 // startCluster brings up a PostgreSQL 16 container, or returns the cluster
@@ -207,6 +230,7 @@ var schemaTemplate = sync.OnceValues(func() (string, error) {
 	if err := migrator.Up(context.Background()); err != nil {
 		return "", fmt.Errorf("migrate the template: %w", err)
 	}
+	builtTemplate = name
 	return name, nil
 })
 
@@ -222,7 +246,35 @@ func freshDatabase(t *testing.T, template string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Registered before the pools that will connect to it, so that it runs
+	// after them: cleanups run last in, first out.
+	t.Cleanup(func() { drop(t, name) })
 	return target
+}
+
+// drop removes a database once the test that took it has passed.
+//
+// Kept on failure, deliberately: the comment this replaces defended keeping
+// every database on the grounds that "a database left standing is the one a
+// failing test can be investigated against", which argues for keeping the
+// databases of FAILING tests and says nothing for the rest. A passing test's
+// database is ~8MB nobody will ever look at, and a suite run repeatedly against
+// one cluster accumulated them until the cluster ran out of disk.
+//
+// WITH (FORCE) because a pool that has not finished closing would otherwise
+// hold the drop off; the cleanup that closes it is registered later and so runs
+// first, but a connection the server has not yet reaped is not this test's to
+// wait for. A drop that fails is logged and not fatal — the database simply
+// stays, which is what used to happen to all of them.
+func drop(t *testing.T, name string) {
+	t.Helper()
+	if t.Failed() {
+		return
+	}
+	if _, err := admin.Exec(context.Background(),
+		"DROP DATABASE IF EXISTS "+name+" WITH (FORCE)"); err != nil {
+		t.Logf("could not drop %s, leaving it behind: %v", name, err)
+	}
 }
 
 // create makes a database and returns its name. The name is generated here

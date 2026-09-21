@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -14,34 +13,21 @@ import (
 	"github.com/gabrielrauch/wagering-service/internal/domain/wagering"
 )
 
-// transactionColumns is the projection every wager transaction read takes, in
-// the order [transactionRow.dest] expects it.
-const transactionColumns = `id, wallet_id, player_id, currency, kind, status, amount_minor, ` +
-	`provider, external_transaction_id, idempotency_key, payload_hash, round_id, game_id, ` +
-	`reference_external_transaction_id, resolved_reference_id, correlation_id, ` +
-	`result_balance_minor, failure_code, reference_attempts, reference_deadline, ` +
-	`created_at, updated_at`
-
-// insertTransactionColumns adds the worker's schedule, which is written but
-// never read back into the domain: RehydrateWagerTransaction reads the
-// deadline, which is the wait budget, and ignores the next attempt, which is
-// only when to look again.
-const insertTransactionColumns = transactionColumns + `, reference_next_attempt_at`
-
-const (
-	selectTransactionByID = `SELECT ` + transactionColumns +
+// The statements this store issues. Built from the column slices in rows.go, so
+// a column added there reaches the projection and the placeholder list without
+// either being counted by hand.
+var (
+	selectTransactionByID = `SELECT ` + columns(transactionColumns) +
 		` FROM wagering.wager_transaction WHERE id = $1`
 	// Provider-scoped in SQL rather than filtered afterwards: the provider is
 	// half of the key, so a row belonging to somebody else is never read, never
 	// mind never returned.
-	selectTransactionByExternal = `SELECT ` + transactionColumns +
+	selectTransactionByExternal = `SELECT ` + columns(transactionColumns) +
 		` FROM wagering.wager_transaction WHERE provider = $1 AND external_transaction_id = $2`
-	selectTransactionByKey = `SELECT ` + transactionColumns +
+	selectTransactionByKey = `SELECT ` + columns(transactionColumns) +
 		` FROM wagering.wager_transaction WHERE provider = $1 AND idempotency_key = $2`
 
-	insertTransaction = `INSERT INTO wagering.wager_transaction (` + insertTransactionColumns +
-		`) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, ` +
-		`$13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)`
+	insertTransaction = insertInto("wagering.wager_transaction", insertTransactionColumns)
 
 	// ON CONFLICT DO NOTHING is how a duplicate is detected, and it is doing
 	// three things at once.
@@ -69,6 +55,44 @@ const (
 	// statement to tell apart.
 	insertTransactionIfNew = insertTransaction + ` ON CONFLICT DO NOTHING`
 
+	// FOR NO KEY UPDATE for the same reason the wallet takes it: a reversal
+	// resolving this row, and a ledger entry naming it, both take FOR KEY SHARE
+	// through their foreign keys, and neither should queue behind a claim. It
+	// still conflicts with another worker's claim, which is the only exclusion
+	// this needs.
+	//
+	// Under READ COMMITTED the predicate is re-checked once the lock is
+	// granted, so a row another worker settled while this one waited comes back
+	// as no rows — which is the answer the port asks for.
+	claimForUpdate = `SELECT ` + columns(transactionColumns) +
+		` FROM wagering.wager_transaction ` +
+		`WHERE id = $1 AND status = 'PENDING_REFERENCE' AND reference_next_attempt_at <= $2 ` +
+		`FOR NO KEY UPDATE`
+
+	// selectReference reads the transaction an operation points at and whatever
+	// currently holds it, in one round trip.
+	//
+	// The hold comes from active_reversal rather than from a scan of everything
+	// that references the row, because active_reversal IS the answer to "what
+	// holds this?" — one indexed row per held reference, maintained by the
+	// trigger and by nothing else (ADR-0007). A released hold is deleted rather
+	// than marked, so a row that is there is a hold that still stands and
+	// ReversalView.Reversed is always false.
+	//
+	// The two shapes are unioned rather than joined so that every row has the
+	// same columns. A LEFT JOIN would leave the holder's non-nullable columns
+	// NULL when there is no hold, which is a shape the row scanner would have
+	// to learn to tell apart from a real one.
+	selectReference = `WITH reference AS (SELECT ` + columns(transactionColumns) +
+		` FROM wagering.wager_transaction WHERE provider = $1 AND external_transaction_id = $2) ` +
+		`SELECT true, r.* FROM reference r ` +
+		`UNION ALL SELECT false, ` + qualified("h", transactionColumns) +
+		` FROM wagering.active_reversal a ` +
+		`JOIN wagering.wager_transaction h ON h.id = a.reversal_id ` +
+		`JOIN reference ON reference.id = a.reference_id`
+)
+
+const (
 	// Scoped to one wallet, which is the rule rather than an optimisation:
 	// waking a waiter on another wallet writes outside the transaction's
 	// declared write set, and the lock order exists to make that impossible.
@@ -94,19 +118,6 @@ const (
 		`WHERE status = 'PENDING_REFERENCE' AND reference_next_attempt_at <= $1 ` +
 		`ORDER BY reference_next_attempt_at, id LIMIT 1`
 
-	// FOR NO KEY UPDATE for the same reason the wallet takes it: a reversal
-	// resolving this row, and a ledger entry naming it, both take FOR KEY SHARE
-	// through their foreign keys, and neither should queue behind a claim. It
-	// still conflicts with another worker's claim, which is the only exclusion
-	// this needs.
-	//
-	// Under READ COMMITTED the predicate is re-checked once the lock is
-	// granted, so a row another worker settled while this one waited comes back
-	// as no rows — which is the answer the port asks for.
-	claimForUpdate = `SELECT ` + transactionColumns + ` FROM wagering.wager_transaction ` +
-		`WHERE id = $1 AND status = 'PENDING_REFERENCE' AND reference_next_attempt_at <= $2 ` +
-		`FOR NO KEY UPDATE`
-
 	rescheduleTransaction = `UPDATE wagering.wager_transaction ` +
 		`SET reference_next_attempt_at = $2 WHERE id = $1 AND status = 'PENDING_REFERENCE'`
 
@@ -116,38 +127,6 @@ const (
 	failTransaction = `UPDATE wagering.wager_transaction ` +
 		`SET status = $2, updated_at = $3, reference_next_attempt_at = NULL WHERE id = $1`
 )
-
-// selectReference reads the transaction an operation points at and whatever
-// currently holds it, in one round trip.
-//
-// The hold comes from active_reversal rather than from a scan of everything
-// that references the row, because active_reversal IS the answer to "what holds
-// this?" — one indexed row per held reference, maintained by the trigger and by
-// nothing else (ADR-0007). A released hold is deleted rather than marked, so a
-// row that is there is a hold that still stands and ReversalView.Reversed is
-// always false.
-//
-// The two shapes are unioned rather than joined so that every row has the same
-// columns. A LEFT JOIN would leave the holder's non-nullable columns NULL when
-// there is no hold, which is a shape the row scanner would have to learn to
-// tell apart from a real one.
-var selectReference = `WITH reference AS (SELECT ` + transactionColumns +
-	` FROM wagering.wager_transaction WHERE provider = $1 AND external_transaction_id = $2) ` +
-	`SELECT true, r.* FROM reference r ` +
-	`UNION ALL SELECT false, ` + qualified("h", transactionColumns) +
-	` FROM wagering.active_reversal a ` +
-	`JOIN wagering.wager_transaction h ON h.id = a.reversal_id ` +
-	`JOIN reference ON reference.id = a.reference_id`
-
-// qualified puts a table alias in front of every name in a projection, so the
-// projection is written once and read in two places.
-func qualified(alias, columns string) string {
-	names := strings.Split(columns, ", ")
-	for i, name := range names {
-		names[i] = alias + "." + name
-	}
-	return strings.Join(names, ", ")
-}
 
 // transactions reads and writes wager transactions.
 type transactions struct{ tx pgx.Tx }
@@ -348,96 +327,4 @@ func (t transactions) one(
 		return nil, corrupt(what, err)
 	}
 	return stored, nil
-}
-
-// transactionArgs renders a snapshot for [insertTransaction], in the order
-// [insertTransactionColumns] names.
-//
-// A transaction with no provider side writes NULL into all six of the columns
-// the provider owns, which is the count
-// wager_transaction_origin_carries_its_fields checks: none for an opening, all
-// six otherwise, and nothing in between.
-func transactionArgs(
-	snap wagering.TransactionSnapshot,
-	correlation string,
-	nextAttemptAt time.Time,
-) []any {
-	var external wagering.ExternalSnapshot
-	if snap.External != nil {
-		external = *snap.External
-	}
-	return []any{
-		uuidOf(snap.ID),
-		uuidOf(snap.WalletID),
-		string(snap.PlayerID),
-		snap.Money.Currency().String(),
-		snap.Kind.String(),
-		snap.Status.String(),
-		minorOf(snap.Money),
-		textOf(external.Provider),
-		textOf(external.ExternalTransactionID),
-		textOf(external.IdempotencyKey),
-		textOf(external.PayloadHash),
-		textOf(external.RoundID),
-		textOf(external.GameID),
-		textOf(external.ReferenceExternalTransactionID),
-		nullableUUIDOf(external.ResolvedReferenceID),
-		correlation,
-		nullableMinorOf(snap.Result),
-		textOf(snap.FailureCode),
-		snap.ReferenceAttempts,
-		timeOf(snap.ReferenceDeadline),
-		snap.CreatedAt,
-		snap.UpdatedAt,
-		timeOf(nextAttemptAt),
-	}
-}
-
-// snapshotOf reads the stored shape off a transaction.
-//
-// It is the inverse of [transactionRow.transaction] and exists because the
-// domain hides its fields: a write has to ask the accessors, and asking them in
-// one place keeps a column from being written from the wrong one.
-func snapshotOf(tx *wagering.WagerTransaction) wagering.TransactionSnapshot {
-	snap := wagering.TransactionSnapshot{
-		ID:                tx.ID(),
-		WalletID:          tx.WalletID(),
-		PlayerID:          tx.PlayerID(),
-		Kind:              tx.Kind(),
-		Money:             tx.Money(),
-		Status:            tx.Status(),
-		CreatedAt:         tx.CreatedAt(),
-		UpdatedAt:         tx.UpdatedAt(),
-		ReferenceAttempts: tx.ReferenceAttempts(),
-	}
-	if result, ok := tx.Result(); ok {
-		snap.Result = &result
-	}
-	// Both of these report the zero value when they report false, so assigning
-	// unconditionally says exactly what a guard would have.
-	snap.FailureCode, _ = tx.FailureCode()
-	snap.ReferenceDeadline, _ = tx.ReferenceDeadline()
-
-	if !tx.IsExternal() {
-		return snap
-	}
-	provider, _ := tx.Provider()
-	externalID, _ := tx.ExternalTransactionID()
-	key, _ := tx.IdempotencyKey()
-	hash, _ := tx.PayloadHash()
-	round, _ := tx.RoundID()
-	game, _ := tx.GameID()
-	reference, _ := tx.ReferenceExternalTransactionID()
-	resolved, _ := tx.ResolvedReferenceID()
-	snap.External = &wagering.ExternalSnapshot{
-		Provider:                       provider,
-		ExternalTransactionID:          externalID,
-		IdempotencyKey:                 key,
-		PayloadHash:                    hash,
-		RoundID:                        round,
-		GameID:                         game,
-		ReferenceExternalTransactionID: reference,
-		ResolvedReferenceID:            resolved,
-	}
-	return snap
 }

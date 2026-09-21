@@ -51,6 +51,8 @@ type TxManager struct {
 // budget. One value for both would force the lock wait to be as generous as the
 // slowest legitimate query.
 type TxConfig struct {
+	// Pool is where a transaction's connection comes from, and it is held for
+	// exactly as long as the transaction lasts.
 	Pool *pgxpool.Pool
 	// LockTimeout bounds how long a statement waits for a row lock.
 	LockTimeout time.Duration
@@ -163,6 +165,23 @@ const applyTimeouts = `SELECT set_config('lock_timeout', $1, true), ` +
 // what the command came to. A failed rollback also destroys the connection
 // rather than returning it to the pool, which is pgx's behaviour and the right
 // one.
+//
+// # The fourth exit, which is the ambiguous one
+//
+// A commit that fails having lost the connection does not say whether the
+// server committed. The COMMIT may have been applied and the acknowledgement
+// lost, so this returns an error for work that possibly landed — and classifies
+// it Retryable, which invites the caller to send it again.
+//
+// That is safe here, and only because of what the schema does with the second
+// attempt. A submission carries an idempotency key and a provider's external
+// id, both unique, so a retry of work that did commit loses on them and is
+// reported as ErrDuplicateSubmission — which the use case resolves by reading
+// what is stored rather than by applying anything. The retry cannot double a
+// balance; it can only discover which of the two outcomes actually happened.
+// A movement with no such key would make this classification wrong, and there
+// is none: every write this manager commits is reached through a door that
+// claims one first.
 func (m *TxManager) within(
 	ctx context.Context,
 	options pgx.TxOptions,
@@ -205,6 +224,22 @@ func (m *TxManager) within(
 // milliseconds renders a duration the way PostgreSQL's timeout settings read
 // one. They are counts of milliseconds, and a bare integer is the spelling that
 // needs no unit parsing at the other end.
+//
+// It rounds UP, and that is the whole of this function.
+//
+// Zero does not mean "immediately" to PostgreSQL, it means DISABLED. Truncating
+// would therefore turn any timeout under a millisecond into no timeout at all —
+// silently, through a configuration NewTxManager accepted, producing exactly
+// the condition its own documentation says it refuses a missing timeout to
+// prevent: a wallet lock held for as long as the network allows. Rounding up
+// makes that unreachable, because every positive duration renders as at least
+// one millisecond.
+//
+// Rounding rather than refusing anything below a millisecond, because refusing
+// only moves the boundary: 1500µs would still be silently truncated to 1ms on
+// the other side of it. Rounding up is the only rule under which no
+// configuration is quietly weakened.
 func milliseconds(d time.Duration) string {
-	return strconv.FormatInt(d.Milliseconds(), 10)
+	const unit = time.Millisecond
+	return strconv.FormatInt(int64((d+unit-1)/unit), 10)
 }

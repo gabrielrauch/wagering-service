@@ -7,6 +7,7 @@ import (
 	"errors"
 	"testing"
 	"time"
+	"uuid"
 
 	"github.com/gabrielrauch/wagering-service/internal/app"
 	"github.com/gabrielrauch/wagering-service/internal/domain/wagering"
@@ -81,7 +82,7 @@ func TestConcurrentIdenticalSubmissionsProduceOneRow(t *testing.T) {
 	// Long enough that an attempt which did not block would have finished, and
 	// well inside the lock timeout, which bounds a wait on another
 	// transaction's uncommitted key as much as it bounds a wait on a row lock.
-	time.Sleep(250 * time.Millisecond)
+	time.Sleep(contentionPause)
 	releasedAt := time.Now()
 	close(release)
 
@@ -264,8 +265,8 @@ func TestTheNextDueOperationIsTheOneWaitingLongest(t *testing.T) {
 	later := w.park(t, "player-due", "ext-later", "ext-target-a", at(1))
 	earlier := w.park(t, "player-due", "ext-earlier", "ext-target-b", at(2))
 
-	w.reschedule(t, later, at(40))
-	w.reschedule(t, earlier, at(20))
+	w.rescheduleOperation(t, later, at(40))
+	w.rescheduleOperation(t, earlier, at(20))
 
 	if got := w.nextDue(t, at(10)); got != nil {
 		t.Fatalf("claimed %s before anything was due", got.TransactionID)
@@ -276,6 +277,62 @@ func TestTheNextDueOperationIsTheOneWaitingLongest(t *testing.T) {
 	}
 	if got.TransactionID != earlier {
 		t.Fatalf("claimed %s, wanted the earlier %s", got.TransactionID, earlier)
+	}
+}
+
+// TestTiedSchedulesAreBrokenByTransactionID is the trailing column of
+// wager_transaction_due_idx, tested on the case that makes it load-bearing.
+//
+// MakeDue stamps every operation it wakes with ONE instant, so a commit that
+// wakes two leaves them due at exactly the same time. Ordering on the schedule
+// alone would then leave the choice to whatever order the rows came back in —
+// which is stable enough in a test to look deliberate and is not a promise the
+// database makes. The two candidates here are deliberately given no other way
+// to be told apart.
+func TestTiedSchedulesAreBrokenByTransactionID(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	wallet := w.openWallet(t, "player-tied", "100.00", "BRL")
+	first := w.park(t, "player-tied", "ext-tied-1", "ext-target", at(1))
+	second := w.park(t, "player-tied", "ext-tied-2", "ext-target", at(2))
+
+	var woke int
+	err := w.tm.WithinMovement(t.Context(), func(ctx context.Context, r *app.Repos) error {
+		if _, err := r.Wallets.LockByID(ctx, wallet.ID()); err != nil {
+			return err
+		}
+		var err error
+		woke, err = r.Transactions.MakeDue(ctx, app.SettledOperation{
+			WalletID: wallet.ID(),
+			Provider: "acme",
+			External: "ext-target",
+		}, at(5))
+		return err
+	})
+	if err != nil {
+		t.Fatalf("wake the waiters: %v", err)
+	}
+	if woke != 2 {
+		t.Fatalf("woke %d operations, wanted both", woke)
+	}
+	if a, b := w.scheduleOf(t, first), w.scheduleOf(t, second); !a.Equal(b) {
+		t.Fatalf("the two were woken at %s and %s, wanted one instant", a, b)
+	}
+
+	lower := first
+	if uuid.UUID(second).Compare(uuid.UUID(first)) < 0 {
+		lower = second
+	}
+	// Twice, because a tie broken by nothing would still answer consistently
+	// often enough to pass once.
+	for turn := range 2 {
+		got := w.nextDue(t, at(6))
+		if got == nil {
+			t.Fatalf("turn %d claimed nothing with two operations due", turn)
+		}
+		if got.TransactionID != lower {
+			t.Fatalf("turn %d claimed %s, wanted the lower id %s", turn, got.TransactionID, lower)
+		}
 	}
 }
 
@@ -292,7 +349,7 @@ func TestOneParkedOperationIsClaimedByOneWorker(t *testing.T) {
 	w := newWorld(t)
 	wallet := w.openWallet(t, "player-claim", "100.00", "BRL")
 	parked := w.park(t, "player-claim", "ext-parked", "ext-target", at(1))
-	w.reschedule(t, parked, at(2))
+	w.rescheduleOperation(t, parked, at(2))
 
 	t.Run("a second worker finds nothing once the first has moved it", func(t *testing.T) {
 		claimed := make(chan struct{})
@@ -352,7 +409,7 @@ func TestOneParkedOperationIsClaimedByOneWorker(t *testing.T) {
 		// first. Without this the two might never contend at all, and the
 		// assertion above would hold for the uninteresting reason that the
 		// second worker ran after the first had finished.
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(contentionPause)
 		select {
 		case got := <-finished:
 			t.Fatalf("the second worker finished at %s while the first still held the wallet", got)
@@ -375,7 +432,7 @@ func TestOneParkedOperationIsClaimedByOneWorker(t *testing.T) {
 
 	t.Run("a claim whose transaction ended is claimable again", func(t *testing.T) {
 		// Back to due, and then claimed by a transaction that rolls back.
-		w.reschedule(t, parked, at(2))
+		w.rescheduleOperation(t, parked, at(2))
 		abandoned := errors.New("the worker gave up")
 		err := w.tm.WithinMovement(t.Context(), func(ctx context.Context, r *app.Repos) error {
 			if _, err := r.Wallets.LockByID(ctx, wallet.ID()); err != nil {
@@ -414,7 +471,7 @@ func TestReschedulingMovesOnlyTheSchedule(t *testing.T) {
 	parked := w.park(t, "player-resched", "ext-resched", "ext-target", at(1))
 
 	before := w.rowOf(t, parked)
-	w.reschedule(t, parked, at(90))
+	w.rescheduleOperation(t, parked, at(90))
 	after := w.rowOf(t, parked)
 
 	if !w.scheduleOf(t, parked).Equal(at(90)) {

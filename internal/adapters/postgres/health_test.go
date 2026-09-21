@@ -78,19 +78,26 @@ func TestReadinessGivesUpWithinItsTimeout(t *testing.T) {
 		t.Fatalf("new readiness check: %v", err)
 	}
 
+	// One second, not three: the probe below gives up after 200ms, so the only
+	// thing a longer sleep buys is a longer test.
 	busy := make(chan struct{})
-	held := make(chan struct{})
+	acquired := make(chan error, 1)
 	go func() {
 		defer close(busy)
 		conn, err := pool.Acquire(context.Background())
+		acquired <- err
 		if err != nil {
 			return
 		}
 		defer conn.Release()
-		close(held)
-		_, _ = conn.Exec(context.Background(), `SELECT pg_sleep(3)`)
+		_, _ = conn.Exec(context.Background(), `SELECT pg_sleep(1)`)
 	}()
-	<-held
+	// Reported rather than signalled by a channel that is never closed on the
+	// failing path: without this the test hangs to the package timeout and says
+	// nothing about why.
+	if err := <-acquired; err != nil {
+		t.Fatalf("take the pool's only connection: %v", err)
+	}
 
 	started := time.Now()
 	err = health.Ready(t.Context())

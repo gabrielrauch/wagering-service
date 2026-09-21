@@ -12,11 +12,9 @@ import (
 	"github.com/gabrielrauch/wagering-service/internal/domain/wagering"
 )
 
-const (
-	insertWallet = `INSERT INTO wagering.wallet ` +
-		`(id, player_id, currency, balance_minor, version, created_at, updated_at) ` +
-		`VALUES ($1, $2, $3, $4, $5, $6, $7)`
+var insertWallet = insertInto("wagering.wallet", walletColumns)
 
+const (
 	// Settling is the only thing an update is for, so this statement names
 	// exactly the columns settling produces and nothing else. Everything the
 	// operation IS — the wallet, the player, the currency, the kind, the
@@ -75,15 +73,7 @@ func (w *writer) open(
 	correlation string,
 ) error {
 	const what = "open a wallet"
-	_, err := w.tx.Exec(ctx, insertWallet,
-		uuidOf(wallet.ID()),
-		string(wallet.PlayerID()),
-		wallet.Currency().String(),
-		minorOf(wallet.Balance()),
-		int64(wallet.Version()),
-		wallet.CreatedAt(),
-		wallet.UpdatedAt(),
-	)
+	_, err := w.tx.Exec(ctx, insertWallet, walletArgs(wallet)...)
 	if err != nil {
 		return fail(what, err)
 	}

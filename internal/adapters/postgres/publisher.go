@@ -58,9 +58,24 @@ const (
 	// Putting the event back with a later schedule. The claim goes with it:
 	// holding a claim on work this publisher has given up on would keep the row
 	// out of the pool until the claim expired, for no reason.
-	rescheduleEvent = `UPDATE wagering.outbox SET next_attempt_at = $2, ` +
+	//
+	// Scoped to the publisher that holds the claim, like releaseClaims below and
+	// unlike markPublished above, and the asymmetry is the point. A claim
+	// expires by wall clock, so a publisher can be slow enough to lose one to
+	// another and not know it. If it could then reschedule anyway it would clear
+	// the new holder's claim AND set next_attempt_at to an instant of its own
+	// choosing — and because the outbox is head-of-line per aggregate, that
+	// stalls the whole wallet's stream for as long as the stale publisher
+	// happened to pick. Marking published has no equivalent: its worst case is
+	// a second send, which at-least-once already permits.
+	//
+	// A row nobody holds is still reschedulable, which is what claimed_by IS
+	// NULL admits: an event released at shutdown and not yet reclaimed has no
+	// holder to take it from.
+	rescheduleEvent = `UPDATE wagering.outbox SET next_attempt_at = $3, ` +
 		`claimed_by = NULL, claimed_at = NULL, claim_expires_at = NULL ` +
-		`WHERE event_id = $1 AND published_at IS NULL`
+		`WHERE event_id = $2 AND published_at IS NULL ` +
+		`AND (claimed_by = $1 OR claimed_by IS NULL)`
 
 	// Handing everything back at shutdown, so a replica that stops cleanly does
 	// not leave its work waiting for a claim to expire.
@@ -171,24 +186,60 @@ func (c *OutboxClaims) Claim(ctx context.Context, req ClaimRequest) ([]ClaimedEv
 	return claimed, nil
 }
 
-// MarkPublished records that one event has been sent and releases its claim.
+// MarkPublished records that one event has been sent and releases its claim,
+// reporting whether this call was the one that did it.
 //
-// An event that is already published is not an error. A claim expires by wall
-// clock, so a publisher that was slow can find its work has been done by
-// another — and that is the recovery path working, not a failure to report.
-func (c *OutboxClaims) MarkPublished(ctx context.Context, id app.EventID, at time.Time) error {
-	_, err := c.pool.Exec(ctx, markPublished, uuidOf(id), at)
-	return fail("mark an event published", err)
+// An event that is already published is not an error, and the false is not a
+// failure either. A claim expires by wall clock, so a publisher that was slow
+// can find its work has been done by another — that is the recovery path
+// working, and the only thing worth doing with the report is counting it.
+//
+// Both of the writes below report the row count rather than discarding it, and
+// both do it by value where [transactions.Reschedule] does it by returning an
+// error. That difference is deliberate and turns on who holds what. There, the
+// caller is inside a transaction holding the row's lock and has just asserted
+// the operation is parked, so changing nothing means the caller's model of the
+// row is wrong — a defect, and the error channel is where a defect belongs.
+// Here, nothing is held across the call and a claim may legitimately have
+// expired between taking it and finishing with it, so changing nothing is an
+// ordinary outcome that a publisher may want to observe and must not alert on.
+func (c *OutboxClaims) MarkPublished(
+	ctx context.Context,
+	id app.EventID,
+	at time.Time,
+) (bool, error) {
+	tag, err := c.pool.Exec(ctx, markPublished, uuidOf(id), at)
+	if err != nil {
+		return false, fail("mark an event published", err)
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
-// Reschedule puts an event back with a later next attempt, releasing the claim.
+// Reschedule puts an event this publisher holds back with a later next attempt,
+// releasing the claim, and reports whether it was still there to move.
 //
 // The instant is the caller's, because the backoff policy is the publisher's:
 // how long to wait after a send that failed has no business meaning and nothing
 // in the database has an opinion about it.
-func (c *OutboxClaims) Reschedule(ctx context.Context, id app.EventID, at time.Time) error {
-	_, err := c.pool.Exec(ctx, rescheduleEvent, uuidOf(id), at)
-	return fail("reschedule an event", err)
+//
+// A false means the event was published or claimed by somebody else while this
+// publisher held it — see rescheduleEvent for why taking it back anyway would
+// be worse than not rescheduling at all.
+func (c *OutboxClaims) Reschedule(
+	ctx context.Context,
+	by string,
+	id app.EventID,
+	at time.Time,
+) (bool, error) {
+	if by == "" {
+		return false, app.AsUnretryable(
+			errors.New("postgres: rescheduling an event names the publisher holding it"))
+	}
+	tag, err := c.pool.Exec(ctx, rescheduleEvent, by, uuidOf(id), at)
+	if err != nil {
+		return false, fail("reschedule an event", err)
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 // ReleaseClaims hands back everything this publisher holds, and reports how

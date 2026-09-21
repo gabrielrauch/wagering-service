@@ -9,15 +9,9 @@ import (
 	"github.com/gabrielrauch/wagering-service/internal/domain/wagering"
 )
 
-// walletColumns is the projection every wallet read takes, in the order
-// [walletRow.dest] expects it. Written once so that a column added to the row
-// struct and forgotten in a query is a scan error at the first read rather than
-// a field that is silently always zero.
-const walletColumns = `id, player_id, currency, balance_minor, version, created_at, updated_at`
-
-const (
-	selectWalletByID  = `SELECT ` + walletColumns + ` FROM wagering.wallet WHERE id = $1`
-	selectWalletByKey = `SELECT ` + walletColumns +
+var (
+	selectWalletByID  = `SELECT ` + columns(walletColumns) + ` FROM wagering.wallet WHERE id = $1`
+	selectWalletByKey = `SELECT ` + columns(walletColumns) +
 		` FROM wagering.wallet WHERE player_id = $1 AND currency = $2`
 
 	// FOR NO KEY UPDATE, not FOR UPDATE.

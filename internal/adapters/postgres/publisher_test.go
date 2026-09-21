@@ -93,10 +93,27 @@ func TestAClaimIsBoundedAndHeadOfLine(t *testing.T) {
 		t.Fatalf("claimed %v, wanted one event from each wallet", aggregates)
 	}
 
-	// The limit is honoured even when more is claimable.
+	// Both heads published, so both wallets' second events are now free of the
+	// head-of-line rule and two rows are claimable at once. Only now does a
+	// limit of one mean anything: until this point the batch was bounded by
+	// what was claimable rather than by what was asked for, and a test that
+	// asserted on the limit here would have passed with any limit at all.
 	w.markPublished(t, claims, batch[0].EventID, at(11))
-	if got := w.claim(t, claims, "publisher-a", 1, at(12)); len(got) != 1 {
-		t.Fatalf("claimed %d events under a limit of 1", len(got))
+	w.markPublished(t, claims, batch[1].EventID, at(11))
+
+	first := w.claim(t, claims, "publisher-a", 1, at(12))
+	if len(first) != 1 {
+		t.Fatalf("claimed %d events under a limit of 1, with two claimable", len(first))
+	}
+	second := w.claim(t, claims, "publisher-a", 1, at(13))
+	if len(second) != 1 {
+		t.Fatalf("claimed %d events on the second turn, wanted the other one", len(second))
+	}
+	if first[0].EventID == second[0].EventID {
+		t.Fatal("the second turn claimed the event the first had already taken")
+	}
+	if got := w.claim(t, claims, "publisher-a", 1, at(14)); len(got) != 0 {
+		t.Fatalf("claimed %d events with nothing left claimable", len(got))
 	}
 }
 
@@ -195,51 +212,130 @@ func TestPublishingAnEventReleasesTheNextOne(t *testing.T) {
 		t.Fatalf("%d events are still unpublished", got)
 	}
 
-	// Publishing something already published is not a failure. A claim expires
-	// by wall clock, so a slow publisher can find its work has been done by
-	// another, and that is the recovery path working.
-	w.markPublished(t, claims, first[0].EventID, at(15))
+	// Publishing something already published is not a failure, and now says so:
+	// false rather than an error. A claim expires by wall clock, so a slow
+	// publisher can find its work has been done by another, and that is the
+	// recovery path working rather than something to alert on.
+	published, err := claims.MarkPublished(t.Context(), first[0].EventID, at(15))
+	if err != nil {
+		t.Fatalf("publish an already-published event: %v", err)
+	}
+	if published {
+		t.Fatal("publishing an already-published event reported that it did it")
+	}
 }
 
-// TestReschedulingAndReleasingHandWorkBack covers the two ways a publisher
-// gives up: on one event it could not send, and on everything it holds when it
-// is shutting down.
-func TestReschedulingAndReleasingHandWorkBack(t *testing.T) {
+// TestReschedulingDelaysAnEventAndDropsItsClaim is one of the two ways a
+// publisher gives up: on a single event it could not send.
+func TestReschedulingDelaysAnEventAndDropsItsClaim(t *testing.T) {
 	t.Parallel()
 	w := newWorld(t)
-	w.openWallet(t, "player-handback", "100.00", "BRL")
+	w.openWallet(t, "player-reschedule", "100.00", "BRL")
 	claims := w.claims(t)
 
-	t.Run("rescheduling delays the event and drops the claim", func(t *testing.T) {
-		batch := w.claim(t, claims, "publisher-a", 10, at(10))
-		if len(batch) != 1 {
-			t.Fatalf("claimed %d events, wanted 1", len(batch))
-		}
-		if err := claims.Reschedule(t.Context(), batch[0].EventID, at(60)); err != nil {
-			t.Fatalf("reschedule: %v", err)
-		}
-		// The claim is gone, so nothing waits out a hold on work this publisher
-		// has already given up on — but the event is not due yet either.
-		if got := w.claim(t, claims, "publisher-b", 10, at(20)); len(got) != 0 {
-			t.Fatalf("claimed %d events before the new schedule", len(got))
-		}
-		if got := w.claim(t, claims, "publisher-b", 10, at(61)); len(got) != 1 {
-			t.Fatalf("claimed %d events once the new schedule came round, wanted 1", len(got))
-		}
-	})
+	batch := w.claim(t, claims, "publisher-a", 10, at(10))
+	if len(batch) != 1 {
+		t.Fatalf("claimed %d events, wanted 1", len(batch))
+	}
+	if moved := w.putEventBack(t, claims, "publisher-a", batch[0].EventID, at(60)); !moved {
+		t.Fatal("the holder could not reschedule its own event")
+	}
 
-	t.Run("releasing hands back everything this publisher holds", func(t *testing.T) {
-		released, err := claims.ReleaseClaims(t.Context(), "publisher-b")
-		if err != nil {
-			t.Fatalf("release: %v", err)
-		}
-		if released != 1 {
-			t.Fatalf("released %d claims, wanted 1", released)
-		}
-		if got := w.claim(t, claims, "publisher-c", 10, at(62)); len(got) != 1 {
-			t.Fatalf("claimed %d events after a clean shutdown, wanted 1", len(got))
-		}
-	})
+	// The claim is gone, so nothing waits out a hold on work this publisher has
+	// already given up on — but the event is not due yet either.
+	if got := w.claim(t, claims, "publisher-b", 10, at(20)); len(got) != 0 {
+		t.Fatalf("claimed %d events before the new schedule", len(got))
+	}
+	if got := w.claim(t, claims, "publisher-b", 10, at(61)); len(got) != 1 {
+		t.Fatalf("claimed %d events once the new schedule came round, wanted 1", len(got))
+	}
+}
+
+// TestOnlyTheHolderReschedulesAnEvent is what scoping the write to the claim
+// buys.
+//
+// A claim expires by wall clock, so a publisher can be slow enough to lose one
+// and not know it. Unscoped, its eventual failure to send would clear the new
+// holder's claim and push next_attempt_at wherever the stale publisher decided
+// — and the outbox is head-of-line per aggregate, so that stalls the whole
+// wallet's stream for as long as it picked.
+func TestOnlyTheHolderReschedulesAnEvent(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.openWallet(t, "player-stale-publisher", "100.00", "BRL")
+	claims := w.claims(t)
+
+	held := w.claim(t, claims, "publisher-holder", 10, at(10))
+	if len(held) != 1 {
+		t.Fatalf("claimed %d events, wanted 1", len(held))
+	}
+
+	if moved := w.putEventBack(t, claims, "publisher-stale", held[0].EventID, at(9000)); moved {
+		t.Fatal("a publisher that holds no claim rescheduled somebody else's event")
+	}
+	// Untouched: still due when it was, and still claimed by the holder.
+	var (
+		holder string
+		due    time.Time
+	)
+	if err := w.owner.QueryRow(t.Context(),
+		`SELECT claimed_by, next_attempt_at FROM wagering.outbox WHERE event_id = $1`,
+		uuidOf(held[0].EventID)).Scan(&holder, &due); err != nil {
+		t.Fatalf("read the event back: %v", err)
+	}
+	if holder != "publisher-holder" {
+		t.Fatalf("the claim is held by %q, wanted publisher-holder", holder)
+	}
+	if !due.Equal(at(0)) {
+		t.Fatalf("the event is due at %s, wanted the %s it was written with", due, at(0))
+	}
+
+	// And an event nobody holds is still reschedulable, which is what an event
+	// released at shutdown and not yet reclaimed looks like.
+	if _, err := claims.ReleaseClaims(t.Context(), "publisher-holder"); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if moved := w.putEventBack(t, claims, "publisher-any", held[0].EventID, at(70)); !moved {
+		t.Fatal("an unclaimed event could not be rescheduled")
+	}
+}
+
+// TestReleasingHandsBackEverythingAPublisherHolds is the other way a publisher
+// gives up: on everything at once, because it is shutting down.
+//
+// Without it a replica that stops cleanly leaves its claimed rows waiting out a
+// hold that exists for the case where it did not.
+func TestReleasingHandsBackEverythingAPublisherHolds(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.openWallet(t, "player-shutdown-one", "100.00", "BRL")
+	w.openWallet(t, "player-shutdown-two", "100.00", "BRL")
+	claims := w.claims(t)
+
+	held := w.claim(t, claims, "publisher-stopping", 10, at(10))
+	if len(held) != 2 {
+		t.Fatalf("claimed %d events, wanted the head of each of the two wallets", len(held))
+	}
+
+	released, err := claims.ReleaseClaims(t.Context(), "publisher-stopping")
+	if err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if released != 2 {
+		t.Fatalf("released %d claims, wanted 2", released)
+	}
+	// Immediately, rather than when the hold would have expired.
+	if got := w.claim(t, claims, "publisher-next", 10, at(11)); len(got) != 2 {
+		t.Fatalf("claimed %d events after a clean shutdown, wanted 2", len(got))
+	}
+	// And a publisher holding nothing releases nothing.
+	released, err = claims.ReleaseClaims(t.Context(), "publisher-stopping")
+	if err != nil {
+		t.Fatalf("release again: %v", err)
+	}
+	if released != 0 {
+		t.Fatalf("released %d claims for a publisher that holds none", released)
+	}
 }
 
 // claims builds the publisher's side of the outbox on the application's pool.
@@ -267,11 +363,34 @@ func (w *world) claim(
 	return batch
 }
 
+// markPublished publishes an event and asserts that this call was the one that
+// did it, which every caller here has arranged to be true.
 func (w *world) markPublished(t *testing.T, c *OutboxClaims, id app.EventID, now time.Time) {
 	t.Helper()
-	if err := c.MarkPublished(t.Context(), id, now); err != nil {
+	published, err := c.MarkPublished(t.Context(), id, now)
+	if err != nil {
 		t.Fatalf("mark %s published: %v", id, err)
 	}
+	if !published {
+		t.Fatalf("event %s was already published by somebody else", id)
+	}
+}
+
+// putEventBack reschedules an event and reports whether it was still there to
+// move.
+func (w *world) putEventBack(
+	t *testing.T,
+	c *OutboxClaims,
+	by string,
+	id app.EventID,
+	to time.Time,
+) bool {
+	t.Helper()
+	moved, err := c.Reschedule(t.Context(), by, id, to)
+	if err != nil {
+		t.Fatalf("reschedule %s: %v", id, err)
+	}
+	return moved
 }
 
 // outboxRow is the projection the ordering assertions read.

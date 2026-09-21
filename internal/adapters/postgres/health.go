@@ -20,6 +20,13 @@ import (
 const readinessProbe = `SELECT 1`
 
 // Health answers whether this process can reach the database.
+//
+// This is a READINESS probe and must not be wired to a liveness check. It takes
+// a connection from the pool, so a process whose pool is saturated reports
+// unready — which is the right answer for readiness, because shedding load from
+// a replica that has none to give is the point. Wired to liveness the same
+// answer restarts the replica, which returns its connections to nobody and
+// moves the saturation to whichever replica is left.
 type Health struct {
 	pool    *pgxpool.Pool
 	timeout time.Duration
