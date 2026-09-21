@@ -209,6 +209,7 @@ provider side, which the domain models as a nullable struct on a single type.
 | `wager_transaction_wallet_fkey` `(wallet_id, player_id, currency)` → `wallet` | the transaction's currency and player are the wallet's. `CURRENCY_MISMATCH` made unrepresentable. |
 | `wager_transaction_kind_is_known`, `..._status_is_known` | the closed sets, checked against `wagering.Kinds()` and `Statuses()` by test |
 | `wager_transaction_origin_carries_its_fields` | `num_nonnulls(provider, external_transaction_id, idempotency_key, payload_hash, round_id, game_id) = 0` for an `OPENING` and `6` otherwise. One line; exactly `validateOrigin`. |
+| `correlation_id` `NOT NULL` | the trace the operation arrived under. Required on **every** row, openings included, and deliberately outside the constraint above: that one counts the six fields the *provider* owns, and this one is ours. Causation is not stored — on the queue path it is the message id, which already has an inbox row, and a resumed operation has no causing event with an identity. |
 | `wager_transaction_opening_is_born_processed` | an opening is applied as part of creating the wallet; no other status was ever reachable |
 | `wager_transaction_amount_follows_kind` | `LOSS` moves nothing, everything else moves something — `Kind.checkAmount` |
 | `wager_transaction_reference_follows_kind` | a reversal must name what it undoes, a win may, nothing else may — `Kind.checkReference` |
@@ -217,7 +218,7 @@ provider side, which the domain models as a nullable struct on a single type.
 | `wager_transaction_processed_reversal_is_resolved` | a settled reversal names what it undid. Both maintainer triggers are gated on `resolved_reference_id`, so without this a `PROCESSED` `REFUND` carrying only the provider's external name takes no hold and the bet can be returned again |
 | `wager_transaction_resolves_the_one_it_names` `(provider, reference_external_transaction_id, resolved_reference_id)` → `(provider, external_transaction_id, id)` | the resolved reference *is* the transaction the row names, not merely some transaction |
 | `wager_transaction_wallet_identity_key` `UNIQUE (id, wallet_id)` | the FK target tying a ledger entry to its transaction's wallet |
-| trigger `wager_transaction_guard` (BEFORE UPDATE) | the operation's own terms and the whole provider side are immutable; a resolution is decided once; a terminal status is terminal and nothing returns to `PENDING`; `updated_at` moves forward |
+| trigger `wager_transaction_guard` (BEFORE UPDATE) | the operation's own terms — including the `correlation_id` it arrived under — and the whole provider side are immutable; a resolution is decided once; a terminal status is terminal and nothing returns to `PENDING`; `updated_at` moves forward |
 | `wager_transaction_processed_reports_a_balance` | the reported balance is present **exactly** when processed |
 | `wager_transaction_result_is_never_negative` | storage is not a way around `MarkProcessed`'s guards |
 | `wager_transaction_rejected_names_a_code` | the failure code is present **exactly** when rejected |
@@ -230,8 +231,9 @@ provider side, which the domain models as a nullable struct on a single type.
 
 **Concurrent duplicates** are serialised by those two unique constraints and nothing else.
 The second `INSERT` blocks on the uncommitted duplicate key; once the first commits it
-receives `23505` and reads the winner. One row wins, the others observe it after commit. No
-advisory lock, and no reliance on SQS FIFO deduplication.
+receives `23505`, which aborts its transaction — so the winner is read in a new one, never
+where the violation was caught. One row wins, the others observe it after commit. No advisory
+lock, and no reliance on SQS FIFO deduplication.
 
 `wager_transaction_guard` is `wallet_guard` for the other financial table. Without it the two
 unique constraints only ever constrain the current tuple and nothing pins the tuple: a settled
@@ -364,6 +366,11 @@ same mechanic as a duplicate wager transaction. Two consumers may legitimately s
 message, so the consumer is half of the identity. `completed_at` is nullable and must not
 precede `received_at`.
 
+The pair is a single address, and the application layer names it as one: `app.InboxKey`, which
+`InboxReader.Find` takes instead of two adjacent strings. Two strings side by side are
+transposable at a call site without the compiler noticing, and a transposed lookup here finds
+nothing — which reads as "not handled yet" and lets a redelivery be processed twice.
+
 Nothing here opens a transaction of its own, so the row and the domain changes it causes
 commit together.
 
@@ -451,8 +458,9 @@ with both axes, so adding a code without a migration fails the build.
 | `wager_transaction_one_opening_per_wallet` | a wallet has at most one opening credit |
 | `wager_transaction_reference_idx` | "what points at this operation?" — building a `ReferenceView` |
 | `wager_transaction_resolved_reference_idx` | the resolved side of the same; backs the self-referencing FK |
-| `wager_transaction_due_idx` | workers claiming due `PENDING_REFERENCE` work |
+| `wager_transaction_due_idx` | workers claiming due `PENDING_REFERENCE` work, in claim order; the trailing `id` makes that order **total**, which matters because `MakeDue` wakes every waiter in one commit with one instant |
 | `wager_transaction_wallet_history_idx` | a wallet's operations, newest first |
+| `wager_transaction_correlation_idx` | everything that happened under one trace |
 | `wallet_ledger_entry_version_key` | cursor pagination per wallet; `sum(signed_minor)` as an index-only scan |
 | `wallet_ledger_entry_transaction_key` | "which entry did this transaction produce?", from its leading column |
 | `inbox_unfinished_idx` | work that arrived and never finished |
