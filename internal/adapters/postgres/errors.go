@@ -67,7 +67,13 @@ var transientRules = map[string]bool{
 }
 
 // transientCodes are the SQLSTATEs that mean the database declined this attempt
-// rather than this work.
+// rather than this work, on a connection that was ESTABLISHED.
+//
+// A refusal at connect time needs no entry here and must not have one: it is
+// answered structurally in [transient], because the same code can mean one
+// thing to a connection attempt and the opposite to a statement. Several of the
+// entries below can only arrive at connect time and are kept as belt and
+// braces rather than because that path depends on them.
 //
 // query_canceled is in the list and is the one worth explaining, because it
 // arrives from two different places and this package deliberately does not try
@@ -121,7 +127,12 @@ func fail(what string, err error) error {
 	if err == nil {
 		return nil
 	}
-	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
+	// Only a refusal that names a rule is looked up, and the guard is
+	// structural rather than decorative: a connect-time refusal carries a
+	// PgError with no constraint name, and without this the maps would be
+	// asked about "" on the one path where the answer must come from
+	// [transient] instead.
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok && pgErr.ConstraintName != "" {
 		if sentinel, mapped := portErrors[pgErr.ConstraintName]; mapped {
 			// Two %w: the sentinel for the use case to branch on, and the
 			// driver error so the rule that refused the write survives into
@@ -150,14 +161,44 @@ func transient(err error) bool {
 		// record anything.
 		return true
 	}
+
+	// A failure to CONNECT is transient, whatever the server refused with.
+	//
+	// The order matters and is the whole of this function. A ConnectError
+	// WRAPS the refusal it was handed, so a SQLSTATE test placed above this one
+	// finds the inner PgError, answers from its code, and returns — and the
+	// connect error is never reached in exactly the case it was written for.
+	// That is not hypothetical: it sent every in-flight wager to a dead-letter
+	// queue the first time a database was closed for maintenance.
+	//
+	// Unconditional, because the question Class asks is whether the attempt
+	// recorded anything, and a connection that was never established carried no
+	// statement that could have. That half does not depend on the code at all.
+	//
+	// And a code cannot answer it anyway, which is why this is structural
+	// rather than a longer list. PostgreSQL refuses a closed database with
+	// 55000 — the same 55000 that means object_not_in_prerequisite_state when
+	// a statement raises it, which is permanent. The SQLSTATE is identical and
+	// the right answer is opposite; only the fact that the connection was never
+	// established tells the two apart, and that is what this wrapper is.
+	//
+	// The cost is named rather than hidden: an invalid password (28P01) is
+	// transient here too, and will be retried by a service that can never
+	// succeed. That is still the better answer. What Unretryable means to the
+	// caller on the queue path is "leave this for the redrive policy", which
+	// puts a provider's wager in the dead-letter queue — and a wrong password
+	// in this service's own configuration is not a defect in that wager. The
+	// redrive policy bounds the retrying either way; the difference is whether
+	// the operation is shed silently or after an operator has watched the same
+	// connection failure repeat.
+	if _, refused := errors.AsType[*pgconn.ConnectError](err); refused {
+		return true
+	}
+
 	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
 		return transientCodes[pgErr.Code] || strings.HasPrefix(pgErr.Code, connectionExceptionClass)
 	}
-	// Not a SQLSTATE at all: the connection never carried the statement to a
-	// server that could refuse it. pgx reports these as a connect error or as
-	// the wrapped network error, and both mean nothing was applied.
-	var connErr *pgconn.ConnectError
-	return errors.As(err, &connErr)
+	return false
 }
 
 // corrupt reports a stored row the domain refused to load.

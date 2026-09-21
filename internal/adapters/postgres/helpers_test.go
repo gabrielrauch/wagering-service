@@ -7,6 +7,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"net/url"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -307,6 +310,36 @@ func refusedBy(t *testing.T, err error, rule string) {
 	}
 	if pgErr.ConstraintName != rule {
 		t.Fatalf("refused by %q, wanted %q: %v", pgErr.ConstraintName, rule, err)
+	}
+}
+
+// database is the name of this test's own database.
+func (w *world) database(t *testing.T) string {
+	t.Helper()
+	parsed, err := url.Parse(w.dsn)
+	if err != nil {
+		t.Fatalf("parse this test's dsn: %v", err)
+	}
+	return strings.TrimPrefix(parsed.Path, "/")
+}
+
+// setAllowConnections opens or closes this test's database to NEW connections,
+// which is how a maintenance window is engineered.
+//
+// It runs on the shared admin pool rather than on w.owner, because that one is
+// connected to the very database being closed. Existing connections are
+// unaffected either way — which is the detail that made the defect this pins
+// hard to see: a command on an already-open connection still works, and only
+// the reconnect is refused.
+//
+// The context is Background rather than the test's, because this is called from
+// a cleanup and a test's context is cancelled before cleanups run.
+func (w *world) setAllowConnections(t *testing.T, allow bool) {
+	t.Helper()
+	statement := "ALTER DATABASE " + w.database(t) + " WITH ALLOW_CONNECTIONS " +
+		strconv.FormatBool(allow)
+	if _, err := admin.Exec(context.Background(), statement); err != nil {
+		t.Fatalf("alter the database: %v\n\t%s", err, statement)
 	}
 }
 
