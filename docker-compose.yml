@@ -1,0 +1,305 @@
+# The whole service and everything it talks to, on one laptop.
+#
+#   docker compose up --build       bring it all up
+#   docker compose down -v          take it all down, volume included
+#
+# `make up` and `make down` are the same two commands with the waiting done for
+# you. What comes up:
+#
+#   postgres     5432   the database, migrated by the job below before anything
+#                       that needs a schema starts
+#   keycloak     8080   the identity provider, realm imported from deploy/
+#   localstack   4566   SQS, queues provisioned from deploy/
+#   api-1        8081   three API replicas on three host ports
+#   api-2        8082
+#   api-3        8083
+#   worker        --    two replicas, publishing nothing
+#
+# Configuration is written here rather than read from .env.example, and the two
+# disagree on purpose. .env.example is the host's view — `localhost:5432`,
+# `localhost:8080` — because that is where a developer running `go run ./cmd/api`
+# finds these services. In here every address is a service name on the compose
+# network instead. Every variable that is not named below is left at the default
+# .env.example documents, so there is one place to read what a variable means
+# and one place to read what this stack sets it to.
+#
+# No secret in this file is real. The database password, the Keycloak admin
+# password and the AWS credentials are placeholders that only these containers
+# will ever accept.
+name: wagering
+
+# ---------------------------------------------------------------------------
+# What the observability step adds
+#
+# An OpenTelemetry Collector, Tempo, Prometheus and Grafana are not here. They
+# belong to the step that wires the OpenTelemetry SDK into the service, because
+# the exporter's configuration and the collector's receivers are one decision
+# written in two files, and splitting them across two steps is how they come to
+# disagree.
+#
+# They slot in without moving anything already here:
+#
+#   * four services of their own, each with its own healthcheck;
+#   * whatever exporter variables the SDK reads, added to the
+#     x-app-environment anchor below — both api and worker inherit it;
+#   * `otel-collector: {condition: service_healthy}` added to the depends_on of
+#     api-1, api-2, api-3 and worker, so nothing starts before the endpoint it
+#     exports to exists;
+#   * their configuration under deploy/, beside deploy/keycloak and
+#     deploy/localstack;
+#   * Grafana published on 3000, which is the address `make dashboards` already
+#     prints.
+# ---------------------------------------------------------------------------
+
+# Everything both binaries need. The four variables with no default —
+# DATABASE_URL, AWS_REGION, OIDC_ISSUER, OIDC_AUDIENCE — are all here, so a
+# process that starts at all was configured deliberately.
+x-app-environment: &app-environment
+  SERVICE_NAME: wagering
+
+  # The service connects as a member of wagering_app, which has no DDL and no
+  # UPDATE or DELETE on the ledger. The role is requested at connection time;
+  # it does not exist until the migration job has run, which is the second
+  # reason — after the tables — that nothing here starts before that job
+  # finishes.
+  DATABASE_URL: postgres://postgres:postgres@postgres:5432/wagering?sslmode=disable&options=-c%20role%3Dwagering_app
+
+  AWS_REGION: us-east-1
+  AWS_ENDPOINT_URL: http://localstack:4566
+  # LocalStack accepts any pair. These are read by the AWS SDK's credential
+  # chain, never by this service, and a deployment sets neither: it uses an
+  # instance role instead.
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  # Without it the credential chain falls through to the EC2 metadata service,
+  # which on a laptop is black-holed rather than refused — five seconds of
+  # retries before every client works.
+  AWS_EC2_METADATA_DISABLED: "true"
+
+  # Compared with a token's "iss" byte for byte. It is the container address and
+  # not the published one because KC_HOSTNAME below pins Keycloak to that
+  # spelling whichever interface a request arrived on — so a token fetched from
+  # the host through localhost:8080 still says `http://keycloak:8080`, and the
+  # one issuer string is true everywhere.
+  OIDC_ISSUER: http://keycloak:8080/realms/wagering
+  OIDC_AUDIENCE: wagering-api
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: wagering
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # -h 127.0.0.1 is what makes this mean "ready for connections" rather than
+      # "a postmaster exists". The entrypoint runs initdb and the scripts in
+      # docker-entrypoint-initdb.d against a temporary server started with
+      # listen_addresses='' — reachable over the unix socket and over nothing
+      # else — so a check that went through the socket would pass while the port
+      # was still shut, and everything waiting on it would race the database's
+      # own initialisation.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "wagering"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      # Pins the issuer, and every URL in the discovery document, to this
+      # spelling. Left to itself Keycloak takes the hostname from the request,
+      # so a token fetched through the published port would say
+      # `http://localhost:8080/realms/wagering` and one fetched from inside the
+      # network would say `http://keycloak:8080/realms/wagering` — two issuers
+      # for one realm, of which the API can only ever accept the one
+      # OIDC_ISSUER names.
+      KC_HOSTNAME: http://keycloak:8080
+      # The console is the exception: it is opened in a browser on the host,
+      # which cannot resolve `keycloak`. Admin traffic is not token traffic, so
+      # giving it its own address costs the issuer nothing.
+      KC_HOSTNAME_ADMIN: http://localhost:8080
+    ports:
+      - "8080:8080"
+    volumes:
+      # --import-realm reads this directory once at start-up. Read-only: an
+      # import that wrote back to the export would make the realm a thing the
+      # container mutates rather than a thing the repository states.
+      - ./deploy/keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+    healthcheck:
+      # The realm's discovery document, and not Keycloak's own health endpoint.
+      # Keycloak reports itself up before it has finished importing, so a check
+      # that asked it would let the API start and fail its first JWKS fetch
+      # against a realm that does not exist yet. This asks the one question that
+      # matters: does /realms/wagering answer. The import takes twelve to
+      # fourteen seconds, which start_period covers.
+      #
+      # It is spoken over bash's /dev/tcp because the image has no HTTP client
+      # at all — no curl, no wget — and adding one to an identity provider to
+      # check on it is a poor trade.
+      test:
+        - CMD
+        - bash
+        - -c
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/8080 &&
+          printf 'GET /realms/wagering/.well-known/openid-configuration HTTP/1.1\r\nHost: keycloak:8080\r\nConnection: close\r\n\r\n' >&3 &&
+          head -n 1 <&3 | grep -q ' 200 '
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  localstack:
+    image: localstack/localstack:4
+    environment:
+      # SQS and nothing else. LocalStack starts what it is asked for, and the
+      # rest of it is start-up time this stack never uses.
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: us-east-1
+    ports:
+      - "4566:4566"
+    volumes:
+      # ready.d runs after the edge service accepts requests — which is to say,
+      # after LocalStack has already logged "Ready.".
+      - ./deploy/localstack/01-queues.sh:/etc/localstack/init/ready.d/01-queues.sh:ro
+    healthcheck:
+      # The queues, not the container. LocalStack's own health endpoint is green
+      # from the moment the edge service is up, which is before ready.d has run
+      # — so a check that asked it would report ready while the queues were
+      # still absent, and every process that resolves a queue URL at start-up
+      # would fail against a LocalStack that called itself healthy. Asking for
+      # the three queue URLs cannot be green until 01-queues.sh has finished
+      # creating them.
+      test:
+        - CMD-SHELL
+        - >-
+          awslocal sqs get-queue-url --queue-name wager-transactions.fifo > /dev/null &&
+          awslocal sqs get-queue-url --queue-name wager-transactions-dlq.fifo > /dev/null &&
+          awslocal sqs get-queue-url --queue-name wallet-events.fifo > /dev/null
+      interval: 3s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+
+  # The migration job. It applies the schema and exits; everything that needs a
+  # schema waits for that exit rather than for a container to be up, which is
+  # what service_completed_successfully means and what service_started would
+  # not.
+  migrate:
+    build:
+      context: .
+      target: migrate
+    command: ["up"]
+    environment:
+      # No `role=wagering_app` here: this connection creates the roles, so it
+      # cannot ask to be one of them. It runs as the owner, which is the split
+      # docs/schema.md describes.
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/wagering?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Three replicas of the API, written out three times.
+  #
+  # `deploy.replicas: 3` would be shorter and would not work: every replica of
+  # one service publishes the same host port, so two of the three would fail to
+  # bind and the service would never come up. A host port range — "8081-8083:8080"
+  # — does bind, but which replica lands on which port is whatever order they
+  # started in, and a demonstration that submits to one replica and reads back
+  # from another needs to be able to say which is which.
+  #
+  # So: one anchor and three services that differ in exactly one line. The
+  # duplication is three `ports:` entries, and it buys stable names.
+  api-1: &api
+    build:
+      context: .
+      target: api
+    environment:
+      <<: *app-environment
+      # Inside the container nothing else wants 8080, so the API takes it and
+      # the host port is what tells the three replicas apart. .env.example moves
+      # it to 8081 for the opposite reason: on a laptop Keycloak has 8080.
+      HTTP_ADDR: ":8080"
+    ports:
+      - "8081:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    healthcheck:
+      # /health/ready, which reports the database and the queue and answers 503
+      # when either is unreachable — so this is unhealthy exactly when the
+      # replica cannot serve, rather than when it has stopped running.
+      #
+      # busybox, installed into the image under the name `wget`. Distroless has
+      # no HTTP client and Compose can only run a check inside the container it
+      # is checking; see the Dockerfile for why it is named the way it is.
+      test: ["CMD", "/usr/bin/wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health/ready"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # Everything but the published port comes from api-1. A key written here
+  # replaces the merged one, which is why `ports` is the only one written.
+  api-2:
+    <<: *api
+    ports:
+      - "8082:8080"
+
+  api-3:
+    <<: *api
+    ports:
+      - "8083:8080"
+
+  # Two replicas of the worker. This one can use deploy.replicas, because a
+  # worker publishes no port and so has nothing to collide over.
+  worker:
+    build:
+      context: .
+      target: worker
+    deploy:
+      replicas: 2
+    environment:
+      <<: *app-environment
+      # Identical across both replicas, deliberately. The inbox holds one row
+      # per consumer per message and that row is what turns a redelivery into a
+      # replay; a per-replica name would give each replica its own rows and let
+      # one message be applied once by each of them.
+      CONSUMER_NAME: wager-consumer
+      # PUBLISHER_NAME is deliberately absent — the opposite rule, for the
+      # opposite reason. It lands in outbox.claimed_by and scopes a reschedule
+      # to the publisher holding the row, so two publishers sharing a name put
+      # back each other's claims. Unset, the configuration falls back to
+      # HOSTNAME, which the container runtime sets to the container's id: a
+      # different value in each replica without this file having to invent one.
+      # A worker that is running is a worker that found a name, because a
+      # process with neither variable set refuses to start.
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      # No keycloak. Nothing a worker does is authenticated — a message on the
+      # inbound queue was authorised by whatever put it there — so the worker's
+      # graph has no identity provider in it and waiting for one would only
+      # delay the queues draining.
+      localstack:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
