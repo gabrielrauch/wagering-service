@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgerrcode"
+
 	"github.com/gabrielrauch/wagering-service/internal/domain/wagering"
 )
 
@@ -13,17 +15,17 @@ const insertTransaction = `
 	INSERT INTO wagering.wager_transaction (
 		id, wallet_id, player_id, currency, kind, status, amount_minor,
 		provider, external_transaction_id, idempotency_key, payload_hash, round_id, game_id,
-		reference_external_transaction_id, resolved_reference_id,
+		reference_external_transaction_id, resolved_reference_id, correlation_id,
 		result_balance_minor, failure_code,
 		reference_attempts, reference_deadline, reference_next_attempt_at,
 		created_at, updated_at
 	) VALUES (
 		$1, $2, $3, $4, $5, $6, $7,
 		$8, $9, $10, $11, $12, $13,
-		$14, $15,
-		$16, $17,
-		$18, $19, $20,
-		$21, $22
+		$14, $15, $16,
+		$17, $18,
+		$19, $20, $21,
+		$22, $23
 	)`
 
 // txn is a row under construction. Every field is an any so that nil means SQL
@@ -37,6 +39,7 @@ type txn struct {
 	provider, externalID, idempotencyKey, payloadHash  any
 	roundID, gameID                                    any
 	referenceExternalID, resolvedReferenceID           any
+	correlation                                        any
 	result, failureCode                                any
 	attempts, deadline, nextAttempt                    any
 	createdAt, updatedAt                               any
@@ -46,7 +49,7 @@ func (x txn) args() []any {
 	return []any{
 		x.id, x.walletID, x.playerID, x.currency, x.kind, x.status, x.amount,
 		x.provider, x.externalID, x.idempotencyKey, x.payloadHash, x.roundID, x.gameID,
-		x.referenceExternalID, x.resolvedReferenceID,
+		x.referenceExternalID, x.resolvedReferenceID, x.correlation,
 		x.result, x.failureCode,
 		x.attempts, x.deadline, x.nextAttempt,
 		x.createdAt, x.updatedAt,
@@ -78,18 +81,49 @@ func externalTx(w wallet, kind string) txn {
 		kind: kind, status: "PENDING", amount: int64(2500),
 		provider: "acme", externalID: external, idempotencyKey: "key-" + id,
 		payloadHash: hashOf(external), roundID: "round-1", gameID: "game-1",
-		attempts: 0, createdAt: base, updatedAt: base,
+		correlation: "corr-" + id,
+		attempts:    0, createdAt: base, updatedAt: base,
 	}
 }
 
 // openingTx is the internal transaction that records a wallet's starting
 // balance. It is born processed and carries no provider side at all.
 func openingTx(w wallet, amount int64) txn {
+	id := wagering.NewTransactionID().String()
 	return txn{
-		id: wagering.NewTransactionID().String(), walletID: w.id, playerID: w.playerID,
+		id: id, walletID: w.id, playerID: w.playerID,
 		currency: w.currency, kind: "OPENING", status: "PROCESSED", amount: amount,
-		result: amount, attempts: 0, createdAt: base, updatedAt: base,
+		// An opening carries no provider side, but it does carry a correlation:
+		// the service opened this wallet on behalf of some request too.
+		correlation: "corr-" + id,
+		result:      amount, attempts: 0, createdAt: base, updatedAt: base,
 	}
+}
+
+// TestEveryTransactionCarriesACorrelation pins the part of correlation_id that
+// is not obvious from the column definition: it is required on an OPENING too.
+//
+// The provider fields are all-or-nothing by origin, so the reflex is to assume
+// anything a provider did not send is nullable for an internal transaction. The
+// correlation is ours rather than theirs -- the service opened that wallet on
+// behalf of some request as well -- which is why it sits outside
+// wager_transaction_origin_carries_its_fields and applies to every row.
+func TestEveryTransactionCarriesACorrelation(t *testing.T) {
+	t.Parallel()
+	db := migrated(t)
+	w := newWallet(t, db, 10000)
+
+	t.Run("a provider submission", func(t *testing.T) {
+		bet := externalTx(w, "BET")
+		bet.correlation = nil
+		bet.refuses(t, db, pgerrcode.NotNullViolation)
+	})
+
+	t.Run("an opening", func(t *testing.T) {
+		opening := openingTx(w, 5000)
+		opening.correlation = nil
+		opening.refuses(t, db, pgerrcode.NotNullViolation)
+	})
 }
 
 func hashOf(s string) string {
@@ -515,6 +549,7 @@ func TestASettledTransactionCannotBeRewritten(t *testing.T) {
 		{"the amount", operation, "amount_minor", int64(999999)},
 		{"the wallet", operation, "wallet_id", elsewhere.id},
 		{"the creation time", operation, "created_at", base.Add(time.Hour)},
+		{"the correlation it arrived under", operation, "correlation_id", "corr-rewritten"},
 		{"the clock running backwards", clock, "updated_at", base.Add(-time.Hour)},
 	} {
 		t.Run(c.name, func(t *testing.T) {

@@ -32,6 +32,21 @@ CREATE TABLE wagering.wager_transaction (
     reference_external_transaction_id wagering.opaque_id,
     resolved_reference_id             uuid,
 
+    -- The trace this operation arrived under, so that everything done on behalf
+    -- of one request can be found together afterwards.
+    --
+    -- NOT NULL for every row, openings included: a wallet opened by the service
+    -- has a correlation just as much as a provider submission does. It stands
+    -- outside wager_transaction_origin_carries_its_fields for the same reason --
+    -- that constraint counts the six fields the PROVIDER owns, and this one is
+    -- ours.
+    --
+    -- Causation is deliberately not stored beside it. On the queue path it is the
+    -- message id, which already has its own inbox row, and a resumed operation
+    -- has no causing event with an identity at all -- so a column for it would be
+    -- null exactly when it mattered and duplicated when it did not.
+    correlation_id wagering.opaque_id NOT NULL,
+
     -- What settling produced: the balance reported back to the provider, or the
     -- code that refused the operation. Each is present exactly when its status
     -- was reached.
@@ -210,6 +225,11 @@ CREATE INDEX wager_transaction_due_idx
 CREATE INDEX wager_transaction_wallet_history_idx
     ON wagering.wager_transaction (wallet_id, created_at DESC, id);
 
+-- "Everything that happened under this trace" -- the operator question the
+-- correlation exists to answer.
+CREATE INDEX wager_transaction_correlation_idx
+    ON wagering.wager_transaction (correlation_id);
+
 -- What a wager transaction may and may not do when it changes.
 --
 -- The wallet has wallet_guard and the ledger has ledger_append_only; this is the
@@ -227,12 +247,12 @@ CREATE FUNCTION wagering.wager_transaction_guard() RETURNS trigger
 AS $$
 BEGIN
     IF (NEW.id, NEW.wallet_id, NEW.player_id, NEW.currency, NEW.kind,
-        NEW.amount_minor, NEW.created_at)
+        NEW.amount_minor, NEW.created_at, NEW.correlation_id)
        IS DISTINCT FROM
        (OLD.id, OLD.wallet_id, OLD.player_id, OLD.currency, OLD.kind,
-        OLD.amount_minor, OLD.created_at) THEN
+        OLD.amount_minor, OLD.created_at, OLD.correlation_id) THEN
         RAISE EXCEPTION
-            'a wager transaction records one operation: the wallet, player, currency, kind, amount and creation time of % are fixed',
+            'a wager transaction records one operation: the wallet, player, currency, kind, amount, creation time and correlation of % are fixed',
             OLD.id
             USING CONSTRAINT = 'wager_transaction_operation_is_immutable';
     END IF;
