@@ -220,6 +220,61 @@ func TestTheLatencyHistogramIsInSecondsAndSharesTheCounterAttributes(t *testing.
 	}
 }
 
+// TestTheLatencyBucketsAreShapedForSeconds pins the boundaries themselves.
+//
+// It is the only thing that can. The SDK's default boundaries are 0, 5, 10,
+// 25 … 10000, shaped for milliseconds, and against a value in seconds every
+// observation this service will ever make lands in the first bucket — so the
+// recording succeeds, the sum and the count are right, the unit says "s", and
+// only the QUANTILES are nonsense. Nothing fails, nothing logs, and the panel
+// reports a steady 2.5 seconds for six milliseconds of work for ever.
+//
+// So the assertion is on the list: that it is the declared unit's shape, that
+// the whole of it lies where this service's work lies, and that an observation
+// of a few milliseconds is distinguishable from one of a few hundred.
+func TestTheLatencyBucketsAreShapedForSeconds(t *testing.T) {
+	t.Parallel()
+	r := record(t)
+
+	// Two observations three orders of magnitude apart. A bucket list shaped
+	// for the wrong unit puts both in the same bucket, which is the whole
+	// failure.
+	for _, took := range []time.Duration{6 * time.Millisecond, 900 * time.Millisecond} {
+		r.RecordOperation(t.Context(), Operation{
+			Source: SourceHTTP, Kind: "BET", Status: "PROCESSED", Took: took,
+		})
+	}
+
+	histogram, ok := r.instrument(t, MetricProcessing).Data.(metricdata.Histogram[float64])
+	if !ok {
+		t.Fatalf("%s is not a float64 histogram", MetricProcessing)
+	}
+	point := histogram.DataPoints[0]
+
+	if !slices.Equal(point.Bounds, processingBuckets) {
+		t.Fatalf("%s draws its boundaries at %v, wanted %v",
+			MetricProcessing, point.Bounds, processingBuckets)
+	}
+	// The SDK's defaults, which are what this instrument gets if the explicit
+	// boundaries are ever dropped. Named here so that the revert is what fails.
+	if point.Bounds[0] >= 1 {
+		t.Errorf("%s starts at %v, which is a millisecond-shaped boundary on an "+
+			"instrument declared in seconds", MetricProcessing, point.Bounds[0])
+	}
+
+	// And the two observations are told apart, which is what a quantile needs.
+	var occupied int
+	for _, count := range point.BucketCounts {
+		if count > 0 {
+			occupied++
+		}
+	}
+	if occupied != 2 {
+		t.Errorf("six milliseconds and nine hundred fell into %d buckets, wanted two: %v",
+			occupied, point.BucketCounts)
+	}
+}
+
 // TestAnOperationWithNoMeasurementDistortsNoHistogram pins the one case that
 // would quietly ruin the latency panel.
 //

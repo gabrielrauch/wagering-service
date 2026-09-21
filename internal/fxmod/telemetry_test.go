@@ -6,12 +6,14 @@ import (
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	semconv "go.opentelemetry.io/otel/semconv/v1.38.0"
 	"go.uber.org/fx"
 	"go.uber.org/fx/fxevent"
 
@@ -318,5 +320,54 @@ func TestOnlyTheProbesAreKeptOutOfTheTraces(t *testing.T) {
 				t.Errorf("notAProbe(%q) = %v, wanted %v", path, got, traced)
 			}
 		})
+	}
+}
+
+// TestTheResourceNamesTheServiceAndTheProcess pins the two attributes without
+// which a metric is wrong rather than merely thin.
+//
+// service.name is what a dashboard selects on — the collector's Prometheus
+// exporter turns it into `job`, which Prometheus renames to `exported_job`
+// where it collides with its own scrape job.
+//
+// service.instance.id is the one whose absence is silent data loss. The
+// exporter identifies a series by its labels, so five processes of one service
+// emitting the same instrument with the same labels are one series that each
+// overwrites in turn rather than five that sum. Measured on the running stack
+// before it existed: three bets, one to each of three API replicas, moved the
+// counter by ONE, with nothing logged anywhere.
+//
+// Both are asserted because both are invisible when wrong: the service keeps
+// working, the exports keep succeeding, and only the numbers are false.
+func TestTheResourceNamesTheServiceAndTheProcess(t *testing.T) {
+	t.Parallel()
+	cfg := loadedFrom(t, telemetryEnvironment(map[string]string{"SERVICE_NAME": "wagering"}))
+
+	res, err := newResource(cfg.Telemetry, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("build the resource: %v", err)
+	}
+
+	attributes := map[string]string{}
+	for _, attr := range res.Attributes() {
+		attributes[string(attr.Key)] = attr.Value.String()
+	}
+
+	if got := attributes[string(semconv.ServiceNameKey)]; got != "wagering" {
+		t.Errorf("service.name is %q, wanted the configured name", got)
+	}
+	instance, named := attributes[string(semconv.ServiceInstanceIDKey)]
+	if !named {
+		t.Fatalf("the resource names no %s, so every process of this service reports "+
+			"under one identity: %v", semconv.ServiceInstanceIDKey, attributes)
+	}
+	if instance == "" {
+		t.Errorf("%s is empty, which is every process claiming one identity rather "+
+			"than none claiming any", semconv.ServiceInstanceIDKey)
+	}
+	host, err := os.Hostname()
+	if err == nil && instance != host {
+		t.Errorf("%s is %q, wanted this host's name %q",
+			semconv.ServiceInstanceIDKey, instance, host)
 	}
 }

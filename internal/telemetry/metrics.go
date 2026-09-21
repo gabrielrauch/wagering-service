@@ -34,6 +34,8 @@ const (
 	// MetricProcessing is how long one operation took, measured at the door it
 	// came in by — so it includes the transaction, the domain and the wait for
 	// a wallet lock, and excludes the queue it was sitting on.
+	//
+	// Its boundaries are named explicitly; see [processingBuckets].
 	MetricProcessing = "wagering.processing.duration"
 
 	// MetricQueueRetries counts messages handed back for another delivery.
@@ -98,6 +100,30 @@ const (
 	unitSeconds     = "s"
 )
 
+// processingBuckets is where [MetricProcessing] draws its histogram boundaries,
+// in SECONDS, and naming them is not a refinement — it is the whole instrument.
+//
+// The SDK's default boundaries are 0, 5, 10, 25 … 10000, which are shaped for
+// MILLISECONDS. Recorded against a value in seconds, every operation this
+// service has ever performed falls in the first bucket, and the quantile a
+// dashboard draws is then an interpolation inside a bucket holding everything.
+// Measured on a live stack before this line existed: p50 2.5s, p95 4.75s, p99
+// 4.95s, for work whose _sum/_count was 6.1 MILLISECONDS — and those three
+// numbers would have stayed exactly those numbers whatever the service did,
+// because they are properties of the bucket list rather than of any
+// measurement. A panel that always says the same thing is worse than no panel.
+//
+// The list is the SDK's own, divided by a thousand: the same shape, in the unit
+// the instrument declares. It spans five milliseconds to ten seconds, which
+// brackets what this service does — a wager is a handful of milliseconds, and
+// ten seconds is past every timeout on the path.
+//
+// Nothing here can notice this being reverted, which is why there is a test on
+// the boundaries themselves.
+var processingBuckets = []float64{
+	0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10,
+}
+
 // instruments is every measurement this service takes.
 //
 // One struct built once per process rather than an instrument created at each
@@ -154,6 +180,7 @@ func newInstruments(meter metric.Meter) (*instruments, error) {
 	if i.processing, err = meter.Float64Histogram(MetricProcessing,
 		metric.WithUnit(unitSeconds),
 		metric.WithDescription("How long one operation took at the door it arrived by."),
+		metric.WithExplicitBucketBoundaries(processingBuckets...),
 	); err != nil {
 		return nil, fail(MetricProcessing, err)
 	}

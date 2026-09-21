@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/metric"
@@ -234,16 +235,76 @@ func newEventLogger(logger *slog.Logger) fxevent.Logger {
 // Prometheus renames that to `exported_job` where it collides with its own
 // scrape job, which is what a dashboard has to select on.
 //
+// # service.instance.id, and why a metric is wrong without it
+//
+// It says WHICH process emitted this, and its absence is not a missing detail
+// — it is silent data loss. The collector's Prometheus exporter identifies a
+// series by its labels, so five processes of one service emitting
+// wagering.transactions with identical labels are not five series that sum:
+// they are one series that each of them overwrites in turn. Measured on the
+// running stack before this existed: three bets, one to each of three API
+// replicas, moved the counter by ONE. Two vanished, with nothing logged
+// anywhere — not by the collector, not by Prometheus, not by this service.
+// Every counter in the catalogue was under-reporting by about the replica
+// count, and the dashboard looked entirely plausible while doing it.
+//
+// Traces were never affected, which is why the end-to-end trace verification
+// did not find this: a trace is identified by its trace id and does not care
+// which process wrote a span.
+//
+// # The tension with dropping `publisher` from a counter, which is only apparent
+//
+// internal/telemetry deliberately removed a per-process name from
+// wagering.outbox.publish_attempts because a pod name with a random suffix
+// multiplies the series of a business counter for ever. This adds what is
+// usually the same string. Both are right, because they are different places:
+// on an INSTRUMENT, per-process identity multiplies every question that
+// instrument answers by the number of processes that ever ran; on the RESOURCE,
+// it IS the identity of the emitter, it is where Prometheus expects it — as the
+// `instance` label — and without it the emitters are indistinguishable and
+// therefore lossy. A dashboard sums over instances and asks its business
+// question once; an operator drills into one instance when they need to.
+//
+// # Where the value comes from
+//
+// The operating system, not the configuration. It is the same string
+// PUBLISHER_NAME falls back to and for the same reason — every container
+// runtime sets the hostname to something distinct per replica, a pod name under
+// Kubernetes and a container id under compose — but it is asked of the host
+// rather than of the environment, because it is a fact about this process
+// rather than a thing an operator tunes, and because a second variable to set
+// is a second variable to forget.
+//
+// A host that will not say its own name loses the attribute rather than getting
+// an empty one: an empty service.instance.id is not "unknown", it is every
+// process claiming the same identity, which is the exact failure this exists to
+// prevent. It is warned about, because the consequence is quiet.
+//
 // Merged with the SDK's default resource, which contributes the telemetry SDK's
 // own name and version, and merged from a SCHEMALESS resource so that the merge
 // cannot fail on a schema URL conflict. The alternative — naming a schema URL
 // here — makes upgrading the SDK a change to this line, and the failure mode is
 // a process that will not start over a version string.
-func newResource(cfg config.Telemetry) (*resource.Resource, error) {
-	return resource.Merge(
-		resource.Default(),
-		resource.NewSchemaless(semconv.ServiceName(cfg.ServiceName)),
-	)
+func newResource(cfg config.Telemetry, logger *slog.Logger) (*resource.Resource, error) {
+	attributes := []attribute.KeyValue{semconv.ServiceName(cfg.ServiceName)}
+
+	host, err := os.Hostname()
+	switch {
+	case err != nil:
+		logger.Warn("this host will not say its own name, so every process of this "+
+			"service reports under one identity and their measurements overwrite "+
+			"rather than sum",
+			slog.String("attribute", string(semconv.ServiceInstanceIDKey)),
+			slog.String("error", err.Error()))
+	case host == "":
+		logger.Warn("this host has no name, so every process of this service reports "+
+			"under one identity and their measurements overwrite rather than sum",
+			slog.String("attribute", string(semconv.ServiceInstanceIDKey)))
+	default:
+		attributes = append(attributes, semconv.ServiceInstanceID(host))
+	}
+
+	return resource.Merge(resource.Default(), resource.NewSchemaless(attributes...))
 }
 
 // newPropagator is how a trace crosses a boundary: an HTTP header, an outbox
