@@ -82,7 +82,7 @@ func TestEveryEnvelopeIsAddressedAndTraceable(t *testing.T) {
 	if _, err := f.wagers.Submit(t.Context(), app.SubmitOperation{
 		Principal:   providerPrincipal(t, acme),
 		Correlation: "corr-abc",
-		Fields:      fields(acme, submission{Kind: "BET", External: "ext-1", Key: "key-1", Amount: "25.00"}),
+		Fields:      f.addressed(fields(acme, submission{Kind: "BET", External: "ext-1", Key: "key-1", Amount: "25.00"})),
 	}); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestMoneyIsPublishedAsADecimalString(t *testing.T) {
 	if _, err := f.wagers.Submit(t.Context(), app.SubmitOperation{
 		Principal:   providerPrincipal(t, acme),
 		Correlation: "corr-1",
-		Fields:      fields(acme, submission{Kind: "BET", External: "ext-1", Key: "key-1", Amount: "25.00"}),
+		Fields:      f.addressed(fields(acme, submission{Kind: "BET", External: "ext-1", Key: "key-1", Amount: "25.00"})),
 	}); err != nil {
 		t.Fatalf("submit: %v", err)
 	}

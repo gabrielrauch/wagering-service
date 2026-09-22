@@ -1,6 +1,8 @@
 package app_test
 
 import (
+	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -133,6 +135,124 @@ func TestBackoffIsClampedToTheDeadline(t *testing.T) {
 	deadline := f.clock.Now().Add(time.Hour)
 	if !at.Equal(deadline) {
 		t.Errorf("next attempt at %s, want the deadline %s", at, deadline)
+	}
+}
+
+// wageringWith builds the write path on one backoff policy and nothing else
+// unusual, so that a refusal can only be about the policy.
+//
+// It returns the error rather than failing on it, which is the whole reason it
+// is not newFixtureWith: the cases below are about constructions that must NOT
+// succeed.
+func wageringWith(t *testing.T, backoff app.BackoffPolicy) (*app.Wagering, error) {
+	t.Helper()
+	return app.NewWagering(app.WageringDeps{
+		Tx:        newFakeDB(),
+		Processor: newProcessor(t, defaultMaxAttempts, defaultReferenceTTL),
+		Clock:     newFakeClock(),
+		IDs:       &fakeIDs{},
+		Backoff:   backoff,
+		Defects:   &fakeObserver{},
+	})
+}
+
+// A schedule that cannot mean what it says is refused at construction, because
+// a policy that only misbehaves from the second attempt onwards would otherwise
+// be discovered by a parked operation rather than by whoever deployed it.
+//
+// The factor that is not a number is why this table exists. NaN passes every
+// other check here — it is not below one, and it is not above the cap — and
+// what it produces is a wait of zero from the second attempt on, which is this
+// system looking at one operation as fast as it can ask until the wait budget
+// runs out. An infinite factor is the opposite case and is deliberately
+// ACCEPTED: it caps, which is what a factor growing without bound should come
+// to, and the test below pins that it does.
+func TestABackoffPolicyIsRefusedWhenItCannotSchedule(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		policy app.BackoffPolicy
+		// why is what the refusal has to say. Empty means the policy stands.
+		why string
+	}{
+		{
+			name:   "a factor that is not a number",
+			policy: app.BackoffPolicy{Initial: time.Minute, Factor: math.NaN(), Max: time.Hour},
+			why:    "is not a number",
+		},
+		{
+			name:   "no initial delay",
+			policy: app.BackoffPolicy{Factor: 2, Max: time.Hour},
+			why:    "positive initial delay",
+		},
+		{
+			name:   "a negative initial delay",
+			policy: app.BackoffPolicy{Initial: -time.Minute, Factor: 2, Max: time.Hour},
+			why:    "positive initial delay",
+		},
+		{
+			name:   "a factor that shortens each wait",
+			policy: app.BackoffPolicy{Initial: time.Minute, Factor: 0.5, Max: time.Hour},
+			why:    "below 1 shortens",
+		},
+		{
+			name:   "a maximum below the initial delay",
+			policy: app.BackoffPolicy{Initial: time.Hour, Factor: 2, Max: time.Minute},
+			why:    "is below its initial delay",
+		},
+		{
+			name:   "an infinite factor, which caps",
+			policy: app.BackoffPolicy{Initial: time.Minute, Factor: math.Inf(1), Max: time.Hour},
+		},
+		{
+			name:   "an ordinary policy",
+			policy: app.BackoffPolicy{Initial: time.Minute, Factor: 2, Max: time.Hour},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			service, err := wageringWith(t, tc.policy)
+			if tc.why == "" {
+				if err != nil {
+					t.Fatalf("a policy that schedules perfectly well was refused: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("built a service on a policy that should have been refused for %q",
+					tc.why)
+			}
+			if service != nil {
+				t.Error("a refused construction returns no service")
+			}
+			if !strings.Contains(err.Error(), tc.why) {
+				t.Errorf("refusal = %q, want it to say %q", err, tc.why)
+			}
+			assertClass(t, err, app.Unretryable)
+		})
+	}
+}
+
+// Why an infinite factor needs no case of its own in the validation above: the
+// schedule takes the smaller of the scaled delay and the maximum, so the second
+// attempt is already the cap and every one after it stays there.
+func TestAnInfiniteBackoffFactorCaps(t *testing.T) {
+	f := newFixtureWith(t, 10, 24*time.Hour,
+		app.BackoffPolicy{Initial: time.Minute, Factor: math.Inf(1), Max: 10 * time.Minute})
+	f.db.seedWallet(t, "player-1", "100.00", "BRL")
+	parked := f.park(t, "ext-refund", "key-1")
+
+	// Pow(x, 0) is 1 for any x, so the first wait is the initial delay; from
+	// the second on, the factor is infinite and the cap is the answer.
+	for i, want := range []time.Duration{time.Minute, 10 * time.Minute, 10 * time.Minute} {
+		if i > 0 {
+			f.waitForNextAttempt(t, parked.TransactionID)
+			if out := f.resume(t); !out.Claimed {
+				t.Fatalf("attempt %d: nothing claimed", i+1)
+			}
+		}
+		got := f.nextAttemptAt(t, parked.TransactionID).Sub(f.clock.Now())
+		if got < want || got > want+want/10 {
+			t.Errorf("attempt %d waits %s, want %s (+at most a tenth)", i+1, got, want)
+		}
 	}
 }
 

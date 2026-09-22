@@ -1,0 +1,279 @@
+package fxmod
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"go.uber.org/fx"
+
+	"github.com/gabrielrauch/wagering-service/internal/adapters/postgres"
+	"github.com/gabrielrauch/wagering-service/internal/app"
+	"github.com/gabrielrauch/wagering-service/internal/config"
+	"github.com/gabrielrauch/wagering-service/internal/telemetry"
+	"github.com/gabrielrauch/wagering-service/internal/workers"
+)
+
+// Consumer is the loop that takes wager operations off the inbound queue.
+func Consumer() fx.Option {
+	return fx.Module("consumer",
+		fx.Provide(newConsumer),
+		fx.Invoke(runConsumer),
+	)
+}
+
+// Outbox is the loop that moves committed events onto the outbound queue.
+//
+// It is named for the table rather than for the loop, because that is what it
+// is about: nothing is published before its transaction commits, so the queue
+// only ever sees rows the database already agreed to.
+func Outbox() fx.Option {
+	return fx.Module("outbox",
+		fx.Provide(newPublisher),
+		fx.Invoke(runPublisher, observeOutboxLag),
+	)
+}
+
+// Reference is the loop that carries parked operations forward.
+func Reference() fx.Option {
+	return fx.Module("reference",
+		fx.Provide(newReferenceWorker),
+		fx.Invoke(runReferenceWorker),
+	)
+}
+
+// newConsumer wires the consumer.
+//
+// The redrive policy is configuration rather than something read back off the
+// queue, and it has to match what deploy/localstack/01-queues.sh provisions: it
+// is how the consumer knows that a delivery is the last one before the
+// dead-letter queue, which is the line an operator most wants in the log. Zero
+// would mean it says nothing about it.
+//
+// The drain timeout should stay under the queue's visibility timeout, and that
+// relationship is a convention this package does not enforce — internal/workers
+// declines to be told the visibility timeout on the grounds that a second place
+// to configure one is a place for the two to disagree, and overruling that here
+// would create exactly the second place. What a drain past the visibility
+// timeout buys is a release that quietly fails because the message came back on
+// its own; .env.example says so next to both values.
+func newConsumer(
+	cfg config.Consumer,
+	queues config.SQS,
+	queue inboundQueue,
+	wagering *app.Wagering,
+	reporting *telemetry.Telemetry,
+	logger *slog.Logger,
+) (*workers.Consumer, error) {
+	settings := consumerSettings(cfg, queues)
+	settings.Queue, settings.Wagering, settings.Logger = queue, wagering, logger
+	settings.Telemetry = reporting
+	return workers.NewConsumer(settings)
+}
+
+// consumerSettings is the configuration half of the consumer's wiring, apart
+// from its dependencies.
+//
+// Apart, so that what the environment becomes can be asserted without a queue,
+// a database and a container. Every field here is one a wrong value makes the
+// system quietly rather than loudly wrong — a name that varied per replica, a
+// redrive count of zero, a backoff that was dropped — and none of them shows up
+// in a running process until the day it matters.
+func consumerSettings(cfg config.Consumer, queues config.SQS) workers.ConsumerConfig {
+	return workers.ConsumerConfig{
+		Name:            cfg.Name,
+		Concurrency:     cfg.Concurrency,
+		Backoff:         backoffOf(cfg.Backoff),
+		DrainTimeout:    cfg.DrainTimeout,
+		MaxReceiveCount: queues.MaxReceiveCount,
+	}
+}
+
+// runConsumer starts the loop and stops it within its drain deadline.
+func runConsumer(lc fx.Lifecycle, consumer *workers.Consumer) {
+	lc.Append(fx.Hook{
+		OnStart: outlivesStartUp(consumer.Start),
+		OnStop:  stopWorker("consumer", consumer.Stop),
+	})
+}
+
+// newPublisher wires the publisher.
+//
+// Name is the one value in this configuration that must differ between two
+// processes running the same deployment. It lands in outbox.claimed_by, and a
+// reschedule is scoped to the publisher holding the row, so two publishers
+// sharing a name put each other's claims back — and because the outbox is
+// head-of-line per wallet, a claim put back by the wrong process is a wallet's
+// event stream stalled behind it. config.Publisher.Name is PUBLISHER_NAME or
+// HOSTNAME and has no fixed default, which is what keeps that from happening
+// silently on the day a second replica is deployed.
+func newPublisher(
+	cfg config.Publisher,
+	claims *postgres.OutboxClaims,
+	queue outboundQueue,
+	clock app.Clock,
+	reporting *telemetry.Telemetry,
+	logger *slog.Logger,
+) (*workers.Publisher, error) {
+	settings := publisherSettings(cfg)
+	settings.Outbox, settings.Queue = claims, queue
+	settings.Clock, settings.Logger = clock, logger
+	settings.Telemetry = reporting
+	return workers.NewPublisher(settings)
+}
+
+// observeOutboxLag reports how old the oldest unpublished event is, from the
+// process that is responsible for draining it.
+//
+// Here and not in [Telemetry], although the lag is a property of the table
+// rather than of this loop. Every replica registering it would report the same
+// global number under a different instance label, and a dashboard would have to
+// know to take the maximum of four identical series; the publisher is the one
+// process whose job the number describes, so it is the one that answers for it.
+// A deployment with the publisher switched off reports no lag, which is honest:
+// nothing in it is draining the outbox.
+//
+// The callback runs on the meter's own collection interval —
+// TELEMETRY_METRIC_INTERVAL — and is unregistered on the way down, before the
+// pool closes, so that the last collection of a shutting-down process does not
+// ask a closed pool and report the failure as an export error.
+func observeOutboxLag(
+	lc fx.Lifecycle,
+	claims *postgres.OutboxClaims,
+	clock app.Clock,
+	reporting *telemetry.Telemetry,
+) error {
+	stop, err := reporting.ObserveOutboxLag(func(ctx context.Context) (time.Duration, error) {
+		oldest, waiting, err := claims.OldestUnpublished(ctx)
+		if err != nil {
+			return 0, err
+		}
+		if !waiting {
+			return 0, nil
+		}
+		// Clamped at nought rather than reported negative. occurred_at comes
+		// from this service's own clock and the comparison is made against
+		// another replica's, so a few milliseconds of skew is ordinary — and a
+		// gauge that goes negative is one somebody writes an alert around.
+		return max(clock.Now().Sub(oldest), 0), nil
+	})
+	if err != nil {
+		return err
+	}
+	lc.Append(fx.Hook{OnStop: func(context.Context) error { return stop() }})
+	return nil
+}
+
+// publisherSettings is the configuration half of the publisher's wiring.
+func publisherSettings(cfg config.Publisher) workers.PublisherConfig {
+	return workers.PublisherConfig{
+		Name:         cfg.Name,
+		Batch:        cfg.Batch,
+		Hold:         cfg.Hold,
+		Interval:     cfg.Interval,
+		Backoff:      backoffOf(cfg.Backoff),
+		DrainTimeout: cfg.DrainTimeout,
+	}
+}
+
+// runPublisher starts the loop and stops it within its drain deadline.
+//
+// Stop hands back every claim this publisher holds, through the pool — which is
+// why the pool's close hook is appended where it is. See [newPool].
+func runPublisher(lc fx.Lifecycle, publisher *workers.Publisher) {
+	lc.Append(fx.Hook{
+		OnStart: outlivesStartUp(publisher.Start),
+		OnStop:  stopWorker("publisher", publisher.Stop),
+	})
+}
+
+// newReferenceWorker wires the reference worker.
+//
+// Name is the subject the service principal acts under and is kept for the
+// audit trail alone, so it is stable rather than per-process: a row's trail
+// should name the job and not whichever replica happened to run the turn.
+func newReferenceWorker(
+	cfg config.Reference, wagering *app.Wagering,
+	reporting *telemetry.Telemetry, logger *slog.Logger,
+) (*workers.ReferenceWorker, error) {
+	settings := referenceSettings(cfg)
+	settings.Wagering, settings.Logger = wagering, logger
+	settings.Telemetry = reporting
+	return workers.NewReferenceWorker(settings)
+}
+
+// referenceSettings is the configuration half of the reference worker's wiring.
+func referenceSettings(cfg config.Reference) workers.ReferenceConfig {
+	return workers.ReferenceConfig{
+		Name:         cfg.Name,
+		Interval:     cfg.Interval,
+		Backoff:      backoffOf(cfg.Backoff),
+		DrainTimeout: cfg.DrainTimeout,
+	}
+}
+
+// runReferenceWorker starts the loop and stops it within its drain deadline.
+func runReferenceWorker(lc fx.Lifecycle, worker *workers.ReferenceWorker) {
+	lc.Append(fx.Hook{
+		OnStart: outlivesStartUp(worker.Start),
+		OnStop:  stopWorker("reference worker", worker.Stop),
+	})
+}
+
+// outlivesStartUp is the other half of [stopContext], and it exists for the
+// same reason at the other end of the process's life.
+//
+// Fx hands an OnStart hook the context [Run] built from START_TIMEOUT, and all
+// three loops root their run context in the one they are given — Consumer.Start
+// says so outright: "a composition root that cancels it stops this consumer the
+// way a crash would". A loop started on that context therefore stops receiving
+// the instant the start-up budget expires, a few seconds after the process came
+// up, and nothing reports it: the process stays alive, keeps its pool, and each
+// Stop then reports a clean shutdown of a loop that had been dead for hours.
+// That is the same silent no-op cmd/worker's "no loops is refused" guard exists
+// to prevent, reached by another road.
+//
+// WithoutCancel keeps the values — a correlation or a trace established at
+// start-up belongs on the lines a loop writes — and drops the cancellation,
+// which the loop does not need: Stop owns the shutdown, cancels the loop's own
+// context and waits for the drain.
+//
+// This is not applied to the HTTP server, and that is not an oversight.
+// httpapi.Server.Start uses its context for net.Listen alone and detaches what
+// it keeps, so the start-up budget bounds the bind — which is exactly what
+// should be bounded.
+func outlivesStartUp(start func(context.Context) error) func(context.Context) error {
+	return func(ctx context.Context) error { return start(context.WithoutCancel(ctx)) }
+}
+
+// backoffOf is the one conversion internal/config's independence costs.
+//
+// That package depends on nothing in this tree so that it is testable without
+// any of it, which means it states a schedule in its own shape and this is
+// where the shape becomes a worker's. Three fields, written once.
+func backoffOf(b config.Backoff) workers.Backoff {
+	return workers.Backoff{Initial: b.Initial, Factor: b.Factor, Max: b.Max}
+}
+
+// stopWorker names the loop in whatever its Stop reported.
+//
+// Every worker's Stop reports what it did not finish — receivers still holding
+// messages, a turn that overran — and that report is the difference between a
+// drain that completed and one that ran out of time. Carrying it out of the
+// hook rather than logging it and returning nil is what makes those two
+// different exit codes: Fx joins the errors from every OnStop hook, and a
+// process that abandoned work mid-flight should not look like a clean
+// deployment.
+//
+// The loop is named because the error itself does not always name it. A
+// publisher and a consumer both report "the drain deadline of 20s passed", and
+// an operator reading one line needs to know which loop left work behind.
+func stopWorker(what string, stop func(context.Context) error) func(context.Context) error {
+	return func(ctx context.Context) error {
+		if err := stop(ctx); err != nil {
+			return fmt.Errorf("fxmod: the %s did not stop cleanly: %w", what, err)
+		}
+		return nil
+	}
+}

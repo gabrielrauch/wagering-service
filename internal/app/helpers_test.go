@@ -118,8 +118,27 @@ func (f *fixture) trySubmit(t *testing.T, of app.OperationFields) (app.Operation
 	return f.wagers.Submit(t.Context(), app.SubmitOperation{
 		Principal:   providerPrincipal(t, provider),
 		Correlation: "corr-" + of.ExternalTransactionID,
-		Fields:      of,
+		Fields:      f.addressed(of),
 	})
+}
+
+// addressed fills in the wallet a submission names when the test left it out.
+//
+// A provider knows the wallet it addresses — it was told the id when the
+// wallet was opened — and every submission carries it. The fixture stands in
+// for that memory: it looks the wallet up by the player and currency the
+// submission names, exactly as the provider would have recorded it, so that a
+// test names the wallet only when the wallet is what the test is about. A
+// submission for a player who holds no such wallet is left as it was, which the
+// service refuses as a missing field.
+func (f *fixture) addressed(of app.OperationFields) app.OperationFields {
+	if of.WalletID != "" {
+		return of
+	}
+	if id, ok := f.db.walletFor(of.PlayerID, of.Currency); ok {
+		of.WalletID = id.String()
+	}
+	return of
 }
 
 func providerPrincipal(t *testing.T, p wagering.Provider) app.Principal {

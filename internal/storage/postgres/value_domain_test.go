@@ -21,18 +21,25 @@ func TestCurrencyCodeDomain(t *testing.T) {
 		name     string
 		value    string
 		accepted bool
+		// goOnly marks a value the schema allows but the domain refuses. The
+		// schema checks form alone, three uppercase letters; money.ParseCurrency
+		// then requires a currency whose ISO 4217 minor unit is two digits, the
+		// only ones a fixed scale of two can hold. The list lives in the domain
+		// and nowhere else, so the schema cannot tell JPY from BRL and is the
+		// coarser net by design (ADR-0001, amendment).
+		goOnly bool
 	}{
-		{"a currency", "BRL", true},
-		{"any three uppercase letters, with no allowlist", "XQZ", true},
-		{"a zero-exponent currency, stored at scale two", "JPY", true},
-		{"lowercase", "brl", false},
-		{"mixed case", "Brl", false},
-		{"two letters", "BR", false},
-		{"four letters", "BRLX", false},
-		{"digits", "BR1", false},
-		{"empty", "", false},
-		{"trailing space", "BRL ", false},
-		{"leading space", " BRL", false},
+		{name: "a currency", value: "BRL", accepted: true},
+		{name: "three uppercase letters naming no currency", value: "XQZ", accepted: true, goOnly: true},
+		{name: "a zero-exponent currency, which scale two cannot hold", value: "JPY", accepted: true, goOnly: true},
+		{name: "lowercase", value: "brl", accepted: false},
+		{name: "mixed case", value: "Brl", accepted: false},
+		{name: "two letters", value: "BR", accepted: false},
+		{name: "four letters", value: "BRLX", accepted: false},
+		{name: "digits", value: "BR1", accepted: false},
+		{name: "empty", value: "", accepted: false},
+		{name: "trailing space", value: "BRL ", accepted: false},
+		{name: "leading space", value: " BRL", accepted: false},
 	}
 
 	for _, c := range cases {
@@ -45,13 +52,15 @@ func TestCurrencyCodeDomain(t *testing.T) {
 				refuses(t, db, checkViolation, cast, c.value)
 			}
 
-			// The same string put to the domain's own parser. The schema and
-			// money.ParseCurrency describe one rule, so a case where they
-			// disagree is a case where storage has become a way around
-			// construction.
+			// The same string put to the domain's own parser. The schema's rule
+			// is the domain's form check, so the two may differ in one direction
+			// only: a value the domain accepts and the schema refuses would make
+			// storage a way around construction, and is a defect. A value the
+			// schema accepts and the domain refuses is a documented goOnly case.
 			_, err := money.ParseCurrency(c.value)
-			if accepted := err == nil; accepted != c.accepted {
-				t.Errorf("money.ParseCurrency accepted=%t, the schema accepted=%t", accepted, c.accepted)
+			wantGo := c.accepted && !c.goOnly
+			if accepted := err == nil; accepted != wantGo {
+				t.Errorf("money.ParseCurrency accepted=%t, wanted %t (schema accepted=%t)", accepted, wantGo, c.accepted)
 			}
 		})
 	}

@@ -13,6 +13,12 @@ At most one **active** reversal per transaction. A bet already refunded cannot a
 rolled back — that would return the same debit twice. But `BET → REFUND → ROLLBACK of that
 refund` nets to the bet standing debited, and releases the bet to be reversed again.
 
+  > **Amended 2026-09-22.** Released to be reversed again *by a rollback*. The brief
+  > also asks that a reference never receive two successful reversals of the same kind,
+  > and the rule above, taken alone, allowed exactly that: after the rollback of the refund
+  > the bet could be refunded a second time. A second rule now sits beside this one, and
+  > it does not release. See the amendment at the end.
+
 A `ROLLBACK` can never itself be reversed, so one applied straight to a bet holds it
 permanently, while a `REFUND` can always be undone. The asymmetry is deliberate: a rollback
 is a provider asserting the operation never happened; a refund is a business decision that
@@ -70,3 +76,46 @@ not hold the bet it pays out on.
 - `BET → REFUND → ROLLBACK → REFUND → …` is unbounded, each pair netting zero. Every step
   is individually valid, audited, and leaves the balance correct, so no cap is imposed; a
   cap would be a number with no business meaning.
+
+  > **Amended 2026-09-22.** This sequence is now rejected at its fourth step. The second
+  > `REFUND` is a second successful refund of one bet, which the per-kind rule refuses
+  > under `REFERENCE_ALREADY_REVERSED`. The chain is no longer unbounded: a bet can be
+  > refunded once and rolled back once, and the longest legal sequence on one bet is
+  > `BET → REFUND → ROLLBACK of the refund → ROLLBACK of the bet`.
+
+## Amendment (2026-09-22): a second rule, counted per kind
+
+The specification asks two things of a reference, and this record implemented one of
+them. "At most one active reversal" is what the sections above settle on, and it is what
+makes `BET → REFUND → ROLLBACK of the refund → ROLLBACK of the bet` legal: undoing the
+refund releases the bet. The specification also asks, in as many words, that a reference
+never receive **two successful reversals of the same kind** — and the active rule alone did
+not give that. After the rollback of the refund the bet was held by nothing, so a second
+`REFUND` found the slot free, was processed, and returned the stake a second time. Two
+`PROCESSED` refunds of one bet, each individually valid, each audited, and the last bullet
+above called the sequence unbounded and declined to cap it.
+
+The rule now added is stated on the pair `(reference, kind)` and never releases: a
+`PROCESSED` reversal of a kind counts whether or not it was later reversed itself.
+`ReferenceView.HasSuccessfulReversalOfKind` is the domain's statement of it, asked in
+`evaluateReference` before the active-reversal check, and it answers the same code —
+`REFERENCE_ALREADY_REVERSED` — so a provider reads one answer for "this reference has
+already been reversed" however history got there. The schema states it as a partial unique
+index, `wager_transaction_one_successful_reversal_per_kind`; ADR-0007, as amended, records
+why that index is right where the one it rejected was wrong.
+
+What this changes for a reader of the sections above:
+
+- Undoing a refund releases the bet to a `ROLLBACK`, and to nothing else. The sequence this
+  record was written to permit still goes through; the one it did not consider does not.
+- The reference view has to carry every processed reversal, not only the one holding the
+  reference. A refund that was rolled back no longer holds the bet and still counts as a
+  successful refund of it, and a view built from "what holds this?" alone has forgotten it.
+  That is a requirement on every store that builds the view, stated on the port.
+- "Released again" is still not state maintained by hand. The active slot is derived as
+  before; the per-kind count is derived from the same append-only history, by a predicate
+  that ignores release. Nothing here writes to a `PROCESSED` transaction, and the mutable
+  slot rejected above stays rejected.
+- The recursion is still bounded at two levels, and now so is the sequence: a bet may be
+  refunded once and rolled back once, a refund may be rolled back once, and a rollback may
+  not be reversed at all.

@@ -1,0 +1,373 @@
+package fxmod
+
+import (
+	"context"
+	"log/slog"
+	"maps"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	semconv "go.opentelemetry.io/otel/semconv/v1.38.0"
+	"go.uber.org/fx"
+	"go.uber.org/fx/fxevent"
+
+	"github.com/gabrielrauch/wagering-service/internal/config"
+	"github.com/gabrielrauch/wagering-service/internal/telemetry"
+)
+
+// stopOrder records the OnStop hooks Fx ran, by the constructor that appended
+// each one.
+//
+// An fxevent.Logger rather than a log line, because this is Fx's own account of
+// its own lifecycle: CallerName is the function that appended the hook, so
+// asserting on it is asserting on which component's hook ran when, which IS the
+// shutdown ordering. A log line would be a restatement of the code that wrote
+// it.
+type stopOrder struct {
+	mu      sync.Mutex
+	stopped []string
+}
+
+func (s *stopOrder) logger() fxevent.Logger { return s }
+
+func (s *stopOrder) LogEvent(event fxevent.Event) {
+	stopped, ok := event.(*fxevent.OnStopExecuted)
+	if !ok {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stopped = append(s.stopped, short(stopped.CallerName))
+}
+
+func (s *stopOrder) ran() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.stopped)
+}
+
+// at reports where a constructor's hook ran, and fails when none did.
+func (s *stopOrder) at(t *testing.T, constructor string) int {
+	t.Helper()
+	if i := slices.Index(s.ran(), constructor); i >= 0 {
+		return i
+	}
+	t.Fatalf("no OnStop hook appended by %s ran; the shutdown was %v", constructor, s.ran())
+	return -1
+}
+
+// short is the constructor's own name out of the fully qualified one Fx reports.
+func short(caller string) string {
+	if dot := strings.LastIndex(caller, "."); dot >= 0 {
+		return caller[dot+1:]
+	}
+	return caller
+}
+
+// telemetryEnvironment is a configuration with an exporting SDK and nothing
+// else this package needs.
+//
+// The endpoint names a port nothing is listening on, deliberately: otlptracegrpc
+// dials lazily, so building the exporter makes no connection and the process
+// starts. That is the same property the "collector is unreachable" case rests
+// on, and it is why this test needs no collector.
+func telemetryEnvironment(overrides map[string]string) map[string]string {
+	env := map[string]string{
+		"DATABASE_URL":                "postgres://wagering:secret@127.0.0.1:5432/wagering",
+		"AWS_REGION":                  "us-east-1",
+		"OIDC_ISSUER":                 "http://127.0.0.1:8080/realms/wagering",
+		"OIDC_AUDIENCE":               "wagering-api",
+		"PUBLISHER_NAME":              "publisher-test",
+		"OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4317",
+		"TELEMETRY_SHUTDOWN_TIMEOUT":  "1s",
+	}
+	maps.Copy(env, overrides)
+	return env
+}
+
+func loadedFrom(t *testing.T, env map[string]string) config.Config {
+	t.Helper()
+	cfg, err := config.Load(config.Static(env))
+	if err != nil {
+		t.Fatalf("load the configuration: %v", err)
+	}
+	return cfg
+}
+
+// afterwards is a module shaped like every other module in this package: a
+// constructor that takes the logger and appends an OnStop hook.
+//
+// It stands in for [newPool], the three run* invokes and [serve] — everything
+// whose work must be finished before telemetry is flushed. What it proves is
+// the ordering property rather than any of those components: a hook appended by
+// a module declared AFTER the telemetry module runs BEFORE the SDK's, so the
+// SDK is still exporting while that component drains.
+func afterwards() fx.Option {
+	return fx.Module("afterwards",
+		fx.Provide(newDrainingComponent),
+		fx.Invoke(func(*drainingComponent) {}),
+	)
+}
+
+// drainingComponent stands in for a pool, a server or a loop.
+type drainingComponent struct{ drained bool }
+
+// newDrainingComponent is named rather than anonymous so that Fx reports it by
+// name in the event this test reads; an anonymous constructor is reported as
+// "func1", which says nothing to whoever reads the failure.
+func newDrainingComponent(lc fx.Lifecycle, _ *slog.Logger) *drainingComponent {
+	component := &drainingComponent{}
+	lc.Append(fx.Hook{OnStop: func(context.Context) error {
+		component.drained = true
+		return nil
+	}})
+	return component
+}
+
+// TestTelemetryIsFlushedAfterEverythingThatCouldStillEmit pins the seam this
+// whole module is arranged around.
+//
+// Fx runs OnStop hooks in the reverse of the order they were appended, so
+// "flushed last" is "appended first". The logger's hook is appended first
+// unconditionally because fx.WithLogger forces its constructor during fx.New;
+// the SDK's providers have no such forcing, so [installTelemetry] makes them
+// exist before any other module's invoke can ask for anything.
+//
+// Without that invoke the first component to be built would append its hook
+// ahead of the SDK's, and the SDK would be shut down while that component was
+// still draining — the last spans of every shutdown, lost, silently, in a way
+// no other test here would notice.
+func TestTelemetryIsFlushedAfterEverythingThatCouldStillEmit(t *testing.T) {
+	t.Parallel()
+	ran := &stopOrder{}
+	cfg := loadedFrom(t, telemetryEnvironment(nil))
+
+	app := fx.New(
+		fx.WithLogger(ran.logger),
+		Telemetry(),
+		Config(cfg),
+		afterwards(),
+	)
+	if err := app.Err(); err != nil {
+		t.Fatalf("build the graph: %v", err)
+	}
+	startAndStop(t, app)
+
+	drained := ran.at(t, "newDrainingComponent")
+	traces := ran.at(t, "newTracerProvider")
+	metrics := ran.at(t, "newMeterProvider")
+	flushed := ran.at(t, "newLogger")
+
+	if drained > traces || drained > metrics {
+		t.Errorf("the SDK was shut down before a component had finished draining: %v", ran.ran())
+	}
+	if traces > flushed || metrics > flushed {
+		t.Errorf("the last line was written before the SDK was flushed: %v", ran.ran())
+	}
+}
+
+// TestNothingIsExportedWhenThereIsNowhereToExportTo pins how telemetry is
+// switched off, and that switching it off leaves nothing behind.
+//
+// Two ways, because they are two different sentences for an operator: switched
+// off deliberately, and never told where. Both build no exporter, no SDK
+// provider and no shutdown hook — so a process with telemetry off makes no
+// network call and has one fewer thing that can fail on its way down.
+func TestNothingIsExportedWhenThereIsNowhereToExportTo(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		overrides map[string]string
+	}{
+		{
+			name:      "switched off",
+			overrides: map[string]string{"OTEL_SDK_DISABLED": "true"},
+		},
+		{
+			name:      "no collector configured",
+			overrides: map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": ""},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			ran := &stopOrder{}
+			cfg := loadedFrom(t, telemetryEnvironment(c.overrides))
+			if cfg.Telemetry.Exporting() {
+				t.Fatalf("%v still reports somewhere to export to", c.overrides)
+			}
+
+			app := fx.New(fx.WithLogger(ran.logger), Telemetry(), Config(cfg))
+			if err := app.Err(); err != nil {
+				t.Fatalf("build the graph: %v", err)
+			}
+			startAndStop(t, app)
+
+			for _, constructor := range []string{"newTracerProvider", "newMeterProvider"} {
+				if slices.Contains(ran.ran(), constructor) {
+					t.Errorf("%s appended a shutdown hook with nothing to shut down: %v",
+						constructor, ran.ran())
+				}
+			}
+			if !slices.Contains(ran.ran(), "newLogger") {
+				t.Errorf("the last line was never written: %v", ran.ran())
+			}
+		})
+	}
+}
+
+// TestAProcessStartsAndStopsWithACollectorThatIsNotAnswering pins the
+// requirement that telemetry may never be the reason a deployment fails.
+//
+// The endpoint names a port nothing is listening on. otlptracegrpc dials
+// lazily, so nothing here waits for a connection; the exports fail in the
+// background and are reported through [otelErrors] as warnings. What must hold
+// is that the graph builds, starts, stops within the telemetry budget, and
+// reports no error from any hook.
+func TestAProcessStartsAndStopsWithACollectorThatIsNotAnswering(t *testing.T) {
+	t.Parallel()
+	ran := &stopOrder{}
+	cfg := loadedFrom(t, telemetryEnvironment(map[string]string{
+		// A port in the ephemeral range nothing in this suite binds.
+		"OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:1",
+	}))
+
+	app := fx.New(fx.WithLogger(ran.logger), Telemetry(), Config(cfg))
+	if err := app.Err(); err != nil {
+		t.Fatalf("a collector that is not answering stopped the graph building: %v", err)
+	}
+
+	started := time.Now()
+	startAndStop(t, app)
+	// The budget is a second and there are two providers to flush, so four is a
+	// generous ceiling that still fails if a Shutdown were waiting on the
+	// connection rather than on its own deadline.
+	if took := time.Since(started); took > 4*time.Second {
+		t.Errorf("starting and stopping took %s against a collector that is not answering", took)
+	}
+	if !slices.Contains(ran.ran(), "newLogger") {
+		t.Errorf("the last line was never written: %v", ran.ran())
+	}
+}
+
+// startAndStop runs the whole lifecycle and fails on anything either half
+// reported.
+func startAndStop(t *testing.T, app *fx.App) {
+	t.Helper()
+	startCtx, cancelStart := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancelStart()
+	if err := app.Start(startCtx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	stopCtx, cancelStop := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelStop()
+	if err := app.Stop(stopCtx); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+}
+
+// TestTheDisabledTelemetryIsWhatAComponentGivenNoneUses is the composition
+// root's half of the contract internal/telemetry states.
+func TestTheDisabledTelemetryIsWhatAComponentGivenNoneUses(t *testing.T) {
+	t.Parallel()
+	if telemetry.Or(nil) != telemetry.Disabled() {
+		t.Error("a component given no telemetry does not get the disabled one")
+	}
+}
+
+// TestOnlyTheProbesAreKeptOutOfTheTraces pins the filter [newServer] hands
+// otelhttp.
+//
+// It is asserted in both directions, because a filter is exactly the shape that
+// passes a one-sided test: inverted, it traces every probe and nothing else,
+// and every assertion about a route's span would still hold on a suite that
+// only ever checked routes.
+//
+// An orchestrator polls the two health endpoints every few seconds per replica,
+// for ever, and each poll would be a trace containing one span saying a probe
+// answered — more spans than this service's real traffic on a quiet deployment,
+// looked up by nobody. A probe that FAILS is visible in the readiness body, in
+// the line the check writes, and in the orchestrator's own events.
+func TestOnlyTheProbesAreKeptOutOfTheTraces(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]bool{
+		"/health/live":                   false,
+		"/health/ready":                  false,
+		"/wagering/transactions":         true,
+		"/wallets":                       true,
+		"/wallets/0199c0de/ledger":       true,
+		"/health":                        true,
+		"/healthy":                       true,
+		"/wallets/health/live":           true,
+		"/":                              true,
+		"/providers/acme/wagering/x/y/z": true,
+	}
+
+	for path, traced := range cases {
+		t.Run(path, func(t *testing.T) {
+			t.Parallel()
+			r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, path, nil)
+			if got := notAProbe(r); got != traced {
+				t.Errorf("notAProbe(%q) = %v, wanted %v", path, got, traced)
+			}
+		})
+	}
+}
+
+// TestTheResourceNamesTheServiceAndTheProcess pins the two attributes without
+// which a metric is wrong rather than merely thin.
+//
+// service.name is what a dashboard selects on — the collector's Prometheus
+// exporter turns it into `job`, which Prometheus renames to `exported_job`
+// where it collides with its own scrape job.
+//
+// service.instance.id is the one whose absence is silent data loss. The
+// exporter identifies a series by its labels, so five processes of one service
+// emitting the same instrument with the same labels are one series that each
+// overwrites in turn rather than five that sum. Measured on the running stack
+// before it existed: three bets, one to each of three API replicas, moved the
+// counter by ONE, with nothing logged anywhere.
+//
+// Both are asserted because both are invisible when wrong: the service keeps
+// working, the exports keep succeeding, and only the numbers are false.
+func TestTheResourceNamesTheServiceAndTheProcess(t *testing.T) {
+	t.Parallel()
+	cfg := loadedFrom(t, telemetryEnvironment(map[string]string{"SERVICE_NAME": "wagering"}))
+
+	res, err := newResource(cfg.Telemetry, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("build the resource: %v", err)
+	}
+
+	attributes := map[string]string{}
+	for _, attr := range res.Attributes() {
+		attributes[string(attr.Key)] = attr.Value.String()
+	}
+
+	if got := attributes[string(semconv.ServiceNameKey)]; got != "wagering" {
+		t.Errorf("service.name is %q, wanted the configured name", got)
+	}
+	instance, named := attributes[string(semconv.ServiceInstanceIDKey)]
+	if !named {
+		t.Fatalf("the resource names no %s, so every process of this service reports "+
+			"under one identity: %v", semconv.ServiceInstanceIDKey, attributes)
+	}
+	if instance == "" {
+		t.Errorf("%s is empty, which is every process claiming one identity rather "+
+			"than none claiming any", semconv.ServiceInstanceIDKey)
+	}
+	host, err := os.Hostname()
+	if err == nil && instance != host {
+		t.Errorf("%s is %q, wanted this host's name %q",
+			semconv.ServiceInstanceIDKey, instance, host)
+	}
+}

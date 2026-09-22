@@ -26,9 +26,34 @@ type BackoffPolicy struct {
 	Max time.Duration
 }
 
+// validate refuses a policy that cannot mean what it says.
+//
+// The factor that is not a number is the case worth writing down, because
+// nothing else here catches it and its effect is the opposite of a backoff. NaN
+// is not less than one, math.Pow carries it through, the min against Max
+// propagates it, and converting it to a Duration yields zero — so the first
+// attempt is scheduled normally, because Pow(x, 0) is 1 for any x, and every
+// attempt after it is scheduled for now, for ever. A parked operation would
+// then be looked at as fast as the worker could ask until its wait budget ran
+// out, which is the one failure a schedule has to be incapable of.
+//
+// It is reachable without anybody typing it. strconv.ParseFloat("NaN", 64)
+// succeeds with no error, so a factor read from a deployment's environment
+// arrives here. The configuration loader refuses it too, naming the offending
+// variable, which is the report an operator can act on; this is the invariant
+// stated where the value is used, so a caller that never went through the
+// loader cannot get past it.
+//
+// An infinite factor needs no case of its own. [BackoffPolicy.next] takes the
+// smaller of the scaled delay and Max, so +Inf becomes Max, which is what a
+// factor growing without bound should come to.
 func (p BackoffPolicy) validate() error {
 	if p.Initial <= 0 {
 		return defect("a backoff policy needs a positive initial delay, got %s", p.Initial)
+	}
+	if math.IsNaN(p.Factor) {
+		return defect("a backoff factor that is not a number leaves every wait after the "+
+			"first at zero, got %v", p.Factor)
 	}
 	if p.Factor < 1 {
 		return defect("a backoff factor below 1 shortens each wait, got %v", p.Factor)

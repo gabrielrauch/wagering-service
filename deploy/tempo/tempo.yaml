@@ -1,0 +1,33 @@
+# Tempo, single binary, everything on local disk.
+#
+# A laptop has no object store and does not need one: this configuration keeps
+# the whole ingest-and-query path in one process and writes blocks to a
+# container filesystem. Nothing here is a deployment's shape — a deployment
+# splits the components and points the backend at S3 — and the parts that would
+# differ are the two paths below and nothing else.
+
+server:
+  # The API, and everything the Grafana datasource asks: /api/search,
+  # /api/traces/<id>, /ready.
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        # Only gRPC, because only the collector writes here. Opening the HTTP
+        # receiver as well would publish a second way in that nothing in this
+        # stack uses and that nothing in this stack watches.
+        grpc: {endpoint: 0.0.0.0:4317}
+
+storage:
+  trace:
+    backend: local
+    wal: {path: /var/tempo/wal}
+    local: {path: /var/tempo/blocks}
+
+# Tempo reports anonymous usage statistics to Grafana Labs unless told not to.
+# A stack that is brought up and torn down on a laptop, by a `make` target, has
+# no business making that call on the developer's behalf.
+usage_report:
+  reporting_enabled: false

@@ -1,0 +1,195 @@
+package httpapi
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"time"
+
+	"github.com/gabrielrauch/wagering-service/internal/app"
+	"github.com/gabrielrauch/wagering-service/internal/domain/wagering"
+	"github.com/gabrielrauch/wagering-service/internal/telemetry"
+)
+
+// WageringService is the part of the application's write path this adapter
+// calls.
+//
+// It is declared here rather than taken as *app.Wagering so that a handler test
+// can supply a fake, and it names exactly the three methods the routes below
+// reach: Resume is the worker's door and has no route, so admitting it would
+// advertise a door this transport does not open.
+type WageringService interface {
+	Submit(ctx context.Context, cmd app.SubmitOperation) (app.OperationResult, error)
+	TransactionByID(
+		ctx context.Context, principal app.Principal, id wagering.TransactionID,
+	) (app.OperationResult, error)
+	TransactionByExternalID(
+		ctx context.Context, principal app.Principal,
+		provider wagering.Provider, id wagering.ExternalTransactionID,
+	) (app.OperationResult, error)
+}
+
+// WalletService is the part of the application's wallet path this adapter
+// calls.
+type WalletService interface {
+	Open(ctx context.Context, cmd app.OpenWalletCommand) (app.WalletView, *app.OperationResult, error)
+	ByID(ctx context.Context, principal app.Principal, id wagering.WalletID) (app.WalletView, error)
+	Ledger(ctx context.Context, principal app.Principal, q app.LedgerQuery) (app.LedgerPage, error)
+	Reconcile(
+		ctx context.Context, principal app.Principal, id wagering.WalletID,
+	) (app.Reconciliation, error)
+}
+
+// Authenticator turns a bearer credential into the principal a request acts
+// under.
+//
+// *oidc.Authenticator satisfies it. Depending on the interface rather than on
+// that type keeps key material out of every handler test: a fake here needs no
+// issuer, no JWKS and no signing key to answer either way.
+type Authenticator interface {
+	Authenticate(ctx context.Context, bearer string) (app.Principal, error)
+}
+
+// ReadinessCheck reports whether one dependency this process needs is
+// answering. A nil error is ready.
+//
+// *postgres.Health satisfies it, and so does the composition root's
+// queueReadiness in internal/fxmod, which asks the outbound queue for its
+// attributes. Readiness takes a set of named checks and lets the composition
+// root say what is in it, so this package never has to know how a dependency
+// is probed — only that it answers.
+type ReadinessCheck interface {
+	Ready(ctx context.Context) error
+}
+
+// Config is everything the API is built from.
+//
+// A struct rather than a long positional list, so a dependency is named at the
+// call site rather than counted.
+type Config struct {
+	// Wagering and Wallets are the two application services.
+	Wagering WageringService
+	Wallets  WalletService
+	// Authenticator turns a credential into a principal. Every route but the
+	// two health checks goes through it.
+	Authenticator Authenticator
+	// Readiness names the dependencies /health/ready reports on. It may be
+	// empty, which reports ready and says so with an empty set rather than
+	// inventing confidence it has no check for.
+	Readiness map[string]ReadinessCheck
+	// ReadinessTimeout bounds the whole readiness probe, not each check in it.
+	// Without a bound the endpoint inherits whatever deadline its caller set,
+	// and an orchestrator that sets none waits on a dependency that is not
+	// answering for as long as the connection stays open — reporting neither
+	// ready nor unready, which is the one answer nothing can act on.
+	ReadinessTimeout time.Duration
+	// MaxBodyBytes bounds a request body.
+	//
+	// It lives here rather than on [Server] although it is a transport limit,
+	// because refusing a body is answering a request and only this side knows
+	// the shape an answer has to take.
+	MaxBodyBytes int64
+	// Logger is where a refusal is counted. It is required: every distinction
+	// this package keeps out of a response — a foreign operation, which of the
+	// credential refusals happened — exists to be visible on the inside, and an
+	// absent logger does not degrade that, it deletes it.
+	Logger *slog.Logger
+	// Telemetry is where a request is traced and an operation counted.
+	// Optional: nil is [telemetry.Disabled], which records nothing and changes
+	// nothing else.
+	//
+	// Optional where the logger is required, and the asymmetry is deliberate.
+	// The logger carries distinctions a caller is deliberately not told, so an
+	// API built without one would be answering 404 to a foreign read with
+	// nowhere for the difference to survive; telemetry carries none — every
+	// attribute it sets is either in the response or in a log line already.
+	Telemetry *telemetry.Telemetry
+}
+
+// API routes and answers every request this service serves. It implements
+// [net/http.Handler].
+type API struct {
+	wagering         WageringService
+	wallets          WalletService
+	authenticator    Authenticator
+	readiness        map[string]ReadinessCheck
+	readinessTimeout time.Duration
+	maxBody          int64
+	logger           *slog.Logger
+	telemetry        *telemetry.Telemetry
+	mux              *http.ServeMux
+}
+
+// New wires the API.
+//
+// Every dependency is refused when absent, because an API built without one
+// would fail at the first request instead of at start-up, and by then a
+// provider is waiting.
+func New(cfg Config) (*API, error) {
+	switch {
+	case cfg.Wagering == nil:
+		return nil, errors.New("httpapi: the API needs a wagering service")
+	case cfg.Wallets == nil:
+		return nil, errors.New("httpapi: the API needs a wallet service")
+	case cfg.Authenticator == nil:
+		return nil, errors.New("httpapi: the API needs an authenticator")
+	case cfg.Logger == nil:
+		return nil, errors.New("httpapi: the API needs a logger")
+	case cfg.MaxBodyBytes <= 0:
+		return nil, errors.New("httpapi: the API needs a positive request body limit")
+	case cfg.ReadinessTimeout <= 0:
+		return nil, errors.New("httpapi: the API needs a positive readiness timeout")
+	}
+	for name, check := range cfg.Readiness {
+		if check == nil {
+			return nil, errors.New("httpapi: readiness check " + name + " is nil")
+		}
+	}
+
+	api := &API{
+		wagering:         cfg.Wagering,
+		wallets:          cfg.Wallets,
+		authenticator:    cfg.Authenticator,
+		readiness:        cfg.Readiness,
+		readinessTimeout: cfg.ReadinessTimeout,
+		maxBody:          cfg.MaxBodyBytes,
+		logger:           cfg.Logger,
+		telemetry:        telemetry.Or(cfg.Telemetry),
+	}
+	api.mux = api.routes()
+	return api, nil
+}
+
+// ServeHTTP answers one request.
+//
+// The correlation is established before anything else, so that every response
+// this package writes — including one for a request that never reached a route
+// — carries one.
+func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	correlation, replaced, err := correlationOf(r)
+	r = r.WithContext(withCorrelation(r.Context(), correlation))
+	w.Header().Set(correlationHeader, correlation)
+	// On the span before anything can refuse the request, for the same reason
+	// the header is set before anything can: the correlation is how a caller
+	// and an operator talk about a request afterwards, and a request that was
+	// refused is the one they talk about.
+	describe(r, telemetry.Correlation(correlation))
+	if replaced {
+		// Not visible to the caller beyond the header not matching what it
+		// sent, so it is said here or nowhere.
+		a.logger.InfoContext(r.Context(), "a supplied correlation was too long to keep",
+			slog.String("correlationId", correlation))
+	}
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+
+	// Applied to the real writer rather than to the wrapper below, because
+	// MaxBytesReader marks the connection as unreusable through the writer it
+	// is handed and can only recognise net/http's own.
+	r.Body = http.MaxBytesReader(w, r.Body, a.maxBody)
+
+	a.mux.ServeHTTP(&routed{ResponseWriter: w, api: a, request: r}, r)
+}

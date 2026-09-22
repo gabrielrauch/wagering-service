@@ -8,6 +8,15 @@
 #	GOTOOLCHAIN=go1.27.0 go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
 version: "2"
 
+run:
+  # The integration and multi-instance suites live behind build tags, so without
+  # these the largest body of test code in the tree is the one body nothing
+  # lints. The tags are additive: no non-test file carries either of them, so
+  # enabling them changes what is checked and not what is built.
+  build-tags:
+    - integration
+    - multi
+
 linters:
   default: standard
   enable:
@@ -53,7 +62,7 @@ linters:
       # constructor there returning (nil, nil) really is a mistake.
       - linters:
           - nilnil
-        path: ^internal/(app|storage)/
+        path: ^internal/(adapters|app|storage)/
 
 formatters:
   enable:

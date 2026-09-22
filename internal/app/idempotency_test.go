@@ -38,6 +38,99 @@ func TestReplayReportsTheBalanceObservedAtTheOriginalProcessing(t *testing.T) {
 	}
 }
 
+// A movement transaction is READ COMMITTED, so the two idempotency lookups see
+// two instants. A submission racing its own twin can read the key before the
+// winner commits and the external id after it, and the row it then finds is its
+// own.
+//
+// This is the interleaving fifty parallel submissions of one operation produced
+// against three API instances, where between one and six of them were answered
+// 409 "already recorded under another idempotency key" for an operation recorded
+// under exactly the key they sent. It is driven here by a step rather than by
+// goroutines and a hope, because the answer has to be the same every time and a
+// race that reproduces four runs in five is not a regression test.
+//
+// It is a contract violation and not merely an unhelpful answer: CONTEXT.md
+// defines a Conflict as a refusal that will be refused again when the same
+// submission is sent unchanged, and sending any of these again is answered as
+// the replay it always was.
+func TestASubmissionThatFindsItsOwnRowAcrossTheSnapshotWindowIsAReplay(t *testing.T) {
+	f := newFixture(t)
+	f.db.seedWallet(t, "player-1", "100.00", "BRL")
+
+	first := f.submit(t, fields(acme, submission{Kind: "BET", External: "ext-1", Key: "key-1", Amount: "25.00"}))
+
+	// The next key lookup answers from before the winner committed; the external
+	// id lookup that follows it answers from after.
+	f.db.hideNextKeyLookup()
+	replay, err := f.trySubmit(t, fields(acme, submission{
+		Kind: "BET", External: "ext-1", Key: "key-1", Amount: "25.00",
+	}))
+	if err != nil {
+		t.Fatalf("a submission that found its own row was refused: %v", err)
+	}
+
+	if !replay.IdempotentReplay {
+		t.Error("a submission that found its own row is a replay")
+	}
+	if replay.TransactionID != first.TransactionID {
+		t.Errorf("replay names %s, want the original %s", replay.TransactionID, first.TransactionID)
+	}
+	if got := replay.Balance.Amount(); got != "75.00" {
+		t.Errorf("replay reports %s, want the original 75.00", got)
+	}
+	if got := f.db.transactionCount(); got != 2 {
+		t.Errorf("%d transactions, want the opening and one bet — a replay records nothing", got)
+	}
+}
+
+// The window is closed by recognising the row, not by ignoring the second
+// lookup: an operation genuinely submitted under two different keys is still
+// the conflict it always was, whichever lookup finds it.
+func TestAnExternalIDUnderADifferentKeyIsStillAConflictAcrossTheSameWindow(t *testing.T) {
+	f := newFixture(t)
+	f.db.seedWallet(t, "player-1", "100.00", "BRL")
+
+	f.submit(t, fields(acme, submission{Kind: "BET", External: "ext-1", Key: "key-1", Amount: "25.00"}))
+
+	f.db.hideNextKeyLookup()
+	_, err := f.trySubmit(t, fields(acme, submission{
+		Kind: "BET", External: "ext-1", Key: "key-2", Amount: "25.00",
+	}))
+
+	assertClass(t, err, app.Conflict)
+	if got := f.db.transactionCount(); got != 2 {
+		t.Errorf("%d transactions, want the opening and one bet — a conflict records nothing", got)
+	}
+}
+
+// And a submission that reuses one key for a different payload is told so from
+// either lookup. Which index found the row is an accident of timing, and a
+// provider must not learn a different outcome from it.
+func TestAReusedKeyIsAPayloadConflictFromEitherLookup(t *testing.T) {
+	f := newFixture(t)
+	f.db.seedWallet(t, "player-1", "100.00", "BRL")
+
+	f.submit(t, fields(acme, submission{Kind: "BET", External: "ext-1", Key: "key-1", Amount: "25.00"}))
+
+	// Found by the key, in one instant.
+	_, direct := f.trySubmit(t, fields(acme, submission{
+		Kind: "BET", External: "ext-1", Key: "key-1", Amount: "30.00",
+	}))
+	// Found by the external id, across the window.
+	f.db.hideNextKeyLookup()
+	_, acrossWindow := f.trySubmit(t, fields(acme, submission{
+		Kind: "BET", External: "ext-1", Key: "key-1", Amount: "30.00",
+	}))
+
+	for name, err := range map[string]error{"by key": direct, "by external id": acrossWindow} {
+		t.Run(name, func(t *testing.T) {
+			assertClass(t, err, app.Conflict)
+			assertCode(t, err, failure.IdempotencyPayloadConflict)
+		})
+	}
+}
+
 func TestReplayOfARejectionKeepsItsCode(t *testing.T) {
 	f := newFixture(t)
 	f.db.seedWallet(t, "player-1", "10.00", "BRL")

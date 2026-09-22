@@ -128,7 +128,7 @@ func (w *Wagering) Submit(ctx context.Context, cmd SubmitOperation) (OperationRe
 		// twice, and would call CannotCarryForward for a live submission that was
 		// never parked, with a transaction id naming a row the rollback removed.
 		return OperationResult{}, conflict(failure.ReferenceAlreadyReversed, err,
-			"reference %q already carries an active reversal", command.ReferenceExternalTransactionID)
+			"reference %q is already reversed", command.ReferenceExternalTransactionID)
 	case err != nil:
 		return OperationResult{}, classify(err)
 	}
@@ -158,6 +158,10 @@ func (w *Wagering) command(f OperationFields, provider wagering.Provider) (wager
 	if err != nil {
 		return wagering.Command{}, classify(err)
 	}
+	wallet, err := wagering.ParseWalletID(f.WalletID)
+	if err != nil {
+		return wagering.Command{}, classify(err)
+	}
 	round, err := wagering.NewRoundID(f.RoundID)
 	if err != nil {
 		return wagering.Command{}, classify(err)
@@ -173,6 +177,7 @@ func (w *Wagering) command(f OperationFields, provider wagering.Provider) (wager
 
 	command := wagering.Command{
 		TransactionID:         w.ids.TransactionID(),
+		WalletID:              wallet,
 		Provider:              provider,
 		ExternalTransactionID: external,
 		IdempotencyKey:        key,
@@ -241,10 +246,11 @@ func (w *Wagering) submitOnce(
 			return nil
 		}
 
-		wallet, err := r.Wallets.LockForMovement(ctx, wagering.WalletKey{
-			PlayerID: command.PlayerID,
-			Currency: command.Money.Currency(),
-		})
+		// By the id the provider named, not by the player and currency: the
+		// wallet is a member of the contract, and a submission that names the
+		// wrong one is refused as a payload rather than resolved to the right
+		// one on its behalf.
+		wallet, err := r.Wallets.LockByID(ctx, command.WalletID)
 		if err != nil {
 			return err
 		}
@@ -252,7 +258,20 @@ func (w *Wagering) submitOnce(
 			// This layer never opens a wallet on a provider's behalf. Nothing is
 			// persisted, so the same submission succeeds under the same key once
 			// the wallet exists.
-			return notFound("player %q holds no %s wallet", command.PlayerID, command.Money.Currency())
+			return notFound("no wallet %s for player %q", command.WalletID, command.PlayerID)
+		}
+		// Before anything is recorded: a wallet held by another player is
+		// answered exactly as a wallet that does not exist — same class, same
+		// sentence, the owner never named. A provider cannot read wallets, and
+		// this is the one place it could otherwise learn, at no cost and under
+		// a key that stays free, whether an identifier is in use and whose it
+		// is. The distinction survives in the error chain for a log line and
+		// nowhere a caller can see it. The currency is deliberately not checked
+		// here — the domain settles a mismatch as a rejection, with a row and
+		// an event, because a wallet that exists and is the player's holding
+		// the wrong kind of money is a business outcome.
+		if err := wagering.WalletBelongsToPlayer(command, wallet); err != nil {
+			return notFoundWrapping(ErrForeignWallet, "no wallet %s for player %q", command.WalletID, command.PlayerID)
 		}
 
 		// Sampled here, under the lock, rather than on the way in: a command that
@@ -312,6 +331,28 @@ func (w *Wagering) submitOnce(
 // already been submitted under a different key?", which is only ever a conflict,
 // and carries no failure code because nothing is persisted for it: the catalogue
 // describes outcomes a provider can act on, and this is not one.
+//
+// # Two lookups, and on the write path two instants
+//
+// [TxManager.WithinMovement] is READ COMMITTED, so these two statements do not
+// share a snapshot, and a submission racing its own twin can fall between them:
+// the first lookup runs before the winner commits and finds nothing under the
+// key, the second runs after it commits and finds the winner under the external
+// id. Read without looking at what was found, that is "this operation is already
+// recorded under another idempotency key" — which is false, because it is
+// recorded under exactly this one, and is the wrong category besides. Conflict
+// promises that the same submission sent again unchanged will be refused again,
+// and this one sent again is a replay. The provider is told to stop retrying
+// something that would have succeeded.
+//
+// The window is closed by recognising the row rather than by widening the
+// transaction. A row found by external id carries the key it was recorded
+// under, so a submission can tell its own row from somebody else's and take the
+// branch the first lookup would have taken. Raising the isolation level would
+// close it too, and would do it by changing the concurrency design that ADR-0011
+// and the wallet lock are built around — a large answer to a window that costs
+// nothing once the row is read for what it is. This layer should not need the
+// isolation to be stronger than the port promises.
 func (w *Wagering) replay(
 	ctx context.Context,
 	store TransactionReader,
@@ -323,43 +364,69 @@ func (w *Wagering) replay(
 		return nil, err
 	}
 	if existing != nil {
-		if err := existing.Transaction.AssertSamePayload(hash); err != nil {
-			// The code is read off the refusal rather than assumed, because
-			// AssertSamePayload has a second one: a transaction carrying no
-			// payload hash at all. Only an opening has none, an opening has no
-			// provider, and this lookup is scoped by provider — so that answer
-			// is the store returning a row it was not asked for, which is this
-			// system's defect and not a conflict to report to a provider.
-			if !failure.Is(err, failure.IdempotencyPayloadConflict) {
-				// Carrying the refusal rather than only naming the condition:
-				// this branch is reached when the assumption behind it is
-				// already wrong, so the one thing worth keeping is what the
-				// domain actually said.
-				return nil, newError(Unretryable, "", err,
-					"operation %s answered a provider-scoped lookup with no payload hash",
-					existing.Transaction.ID())
-			}
-			return nil, conflict(failure.IdempotencyPayloadConflict, err,
-				"idempotency key %q is already bound to another operation", command.IdempotencyKey)
-		}
-		// A still-parked original is replayed as it stands and deliberately not
-		// carried forward here: continuing is the worker's job, and doing it on a
-		// provider's retry would spend the wait budget twice as fast as the
-		// policy says.
-		settled := resultOf(existing.Transaction, true)
-		return &settled, nil
+		return replayOf(existing, command, hash)
 	}
 
 	other, err := store.ByExternal(ctx, command.Provider, command.ExternalTransactionID)
 	if err != nil {
 		return nil, err
 	}
-	if other != nil {
-		return nil, conflict("", nil,
-			"operation %q is already recorded under another idempotency key",
-			command.ExternalTransactionID)
+	if other == nil {
+		return nil, nil
 	}
-	return nil, nil
+	// The key is read off the row rather than inferred from which lookup found
+	// it. Equal means this is the submission's own row, seen across the window
+	// above, and it is answered exactly as the first lookup would have answered
+	// it. Only a different key is the conflict the message below describes.
+	//
+	// A row carrying no key at all is neither case and needs no branch of its
+	// own: only an opening has none, an opening has no provider and no external
+	// id, and this lookup is scoped by both, so it cannot be what was found.
+	if key, ok := other.Transaction.IdempotencyKey(); ok && key == command.IdempotencyKey {
+		return replayOf(other, command, hash)
+	}
+	return nil, conflict("", nil,
+		"operation %q is already recorded under another idempotency key",
+		command.ExternalTransactionID)
+}
+
+// replayOf decides what a row recorded under this submission's own idempotency
+// key means for it: a replay when it carries the same payload, and a conflict
+// when the key has been bound to a different one.
+//
+// It is reached from both lookups in [Wagering.replay] and gives one answer to
+// both, which is the point: which index found the row is an accident of timing,
+// and a submission must not learn a different outcome from it.
+func replayOf(
+	stored *StoredTransaction,
+	command wagering.Command,
+	hash wagering.PayloadHash,
+) (*OperationResult, error) {
+	if err := stored.Transaction.AssertSamePayload(hash); err != nil {
+		// The code is read off the refusal rather than assumed, because
+		// AssertSamePayload has a second one: a transaction carrying no
+		// payload hash at all. Only an opening has none, an opening has no
+		// provider, and both lookups are scoped by provider — so that answer
+		// is the store returning a row it was not asked for, which is this
+		// system's defect and not a conflict to report to a provider.
+		if !failure.Is(err, failure.IdempotencyPayloadConflict) {
+			// Carrying the refusal rather than only naming the condition:
+			// this branch is reached when the assumption behind it is
+			// already wrong, so the one thing worth keeping is what the
+			// domain actually said.
+			return nil, newError(Unretryable, "", err,
+				"operation %s answered a provider-scoped lookup with no payload hash",
+				stored.Transaction.ID())
+		}
+		return nil, conflict(failure.IdempotencyPayloadConflict, err,
+			"idempotency key %q is already bound to another operation", command.IdempotencyKey)
+	}
+	// A still-parked original is replayed as it stands and deliberately not
+	// carried forward here: continuing is the worker's job, and doing it on a
+	// provider's retry would spend the wait budget twice as fast as the policy
+	// says.
+	settled := resultOf(stored.Transaction, true)
+	return &settled, nil
 }
 
 // resolveDuplicate decides what a submission that lost a race actually was.
@@ -581,6 +648,7 @@ func (w *Wagering) Resume(ctx context.Context, principal Principal) (ResumeOutco
 		}
 		out.Result = resultOf(outcome.Transaction, false)
 		out.Woke = woke
+		out.Correlation = correlation
 		if !nextAttemptAt.IsZero() {
 			out.Rescheduled = true
 			out.NextAttemptAt = nextAttemptAt
@@ -622,6 +690,7 @@ func (w *Wagering) rebuild(tx *wagering.WagerTransaction) (wagering.Command, err
 
 	command := wagering.Command{
 		TransactionID:                  tx.ID(),
+		WalletID:                       tx.WalletID(),
 		Provider:                       provider,
 		ExternalTransactionID:          external,
 		IdempotencyKey:                 key,
@@ -720,18 +789,22 @@ func (w *Wagering) TransactionByID(
 }
 
 // TransactionByExternalID reads one operation by the provider's identifier for
-// it. The provider comes from the principal and never from the request, so the
-// query is scoped by construction rather than by a check that could be forgotten.
+// it.
+//
+// The provider is named rather than derived from the principal, because an
+// external id identifies an operation only within the provider that issued it
+// and the service reads every provider's. [Principal.MayReadAs] is what keeps
+// that from widening the scope a provider has: it is answered before any row is
+// looked for, so a provider naming somebody else is refused without this door
+// ever having gone to see whether the operation exists.
 func (w *Wagering) TransactionByExternalID(
 	ctx context.Context,
 	principal Principal,
+	provider wagering.Provider,
 	id wagering.ExternalTransactionID,
 ) (OperationResult, error) {
-	provider, ok := principal.Provider()
-	if !ok {
-		// The provider comes from the principal, so an identity that names none
-		// has no way to address this door at all.
-		return OperationResult{}, unauthorized("only a provider reads its own operations by external id")
+	if err := principal.MayReadAs(provider); err != nil {
+		return OperationResult{}, err
 	}
 	var result OperationResult
 	err := w.tx.WithinSnapshot(ctx, func(ctx context.Context, r *ReadRepos) error {
@@ -830,15 +903,18 @@ func causationOf(cmd SubmitOperation) string {
 func resultOf(tx *wagering.WagerTransaction, replay bool) OperationResult {
 	result := OperationResult{
 		TransactionID:    tx.ID(),
+		WalletID:         tx.WalletID(),
 		Kind:             tx.Kind(),
 		Status:           tx.Status(),
 		Money:            tx.Money(),
 		IdempotentReplay: replay,
 	}
-	// Both accessors return the zero value when they report false, so assigning
-	// it says exactly what a guard would have. Balance is the one that genuinely
+	// Each accessor returns the zero value when it reports false, so assigning
+	// it says exactly what a guard would have: an opening has no provider and
+	// no external id, and names neither. Balance is the one that genuinely
 	// differs: absence is spelled nil there, so it keeps its guard.
 	result.ExternalTransactionID, _ = tx.ExternalTransactionID()
+	result.ProviderID, _ = tx.Provider()
 	result.FailureCode, _ = tx.FailureCode()
 	if balance, ok := tx.Result(); ok {
 		result.Balance = &balance

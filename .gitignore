@@ -3,6 +3,11 @@
 # convenience, never something to ship.
 /migrate
 
+# A local copy of .env.example. The example is committed and holds placeholders;
+# a copy of it holds whatever the developer pointed it at, which is the file
+# that must never reach the history.
+.env
+
 # Compiled test binaries from `go test -c`.
 *.test
 

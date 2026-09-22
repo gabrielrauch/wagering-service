@@ -102,7 +102,7 @@ func (p *Processor) Submit(cmd Command, w *Wallet, ref *ReferenceView, now time.
 	if w == nil {
 		return Outcome{}, failure.New(failure.UninitializedValue, "wallet must be present").WithField("wallet")
 	}
-	if err := walletBelongsToPlayer(cmd, w); err != nil {
+	if err := WalletBelongsToPlayer(cmd, w); err != nil {
 		return Outcome{}, err
 	}
 	tx, err := NewExternalTransaction(cmd, w.ID(), now)
@@ -170,7 +170,7 @@ func (p *Processor) assertContinuable(tx *WagerTransaction, cmd Command, w *Wall
 		return failure.New(failure.ReferenceMismatch,
 			"the transaction belongs to wallet %s, not %s", tx.WalletID(), w.ID()).WithField("walletId")
 	}
-	if err := walletBelongsToPlayer(cmd, w); err != nil {
+	if err := WalletBelongsToPlayer(cmd, w); err != nil {
 		return err
 	}
 	hash, err := cmd.PayloadHash()
@@ -279,18 +279,19 @@ func (p *Processor) wait(tx *WagerTransaction, now time.Time) (Outcome, error) {
 	return Outcome{Transaction: tx, Events: []Event{pending}}, nil
 }
 
-// walletBelongsToPlayer checks that the wallet handed in is the one the command
-// names.
+// WalletBelongsToPlayer checks that the wallet handed in belongs to the player
+// the command names.
 //
-// It is checked before a transaction exists, because a wallet belonging to
-// another player is not something a provider can submit. The command names a
-// player; choosing which wallet to load against that name is this service's
-// work, and getting it wrong is a defect on this side of the line.
+// It is checked before a transaction exists, and it is exported so that the
+// application layer can ask it before recording anything. The command names a
+// wallet and a player, and the wallet is loaded by its id; a wallet held by
+// another player is therefore a submission addressing somebody else's wallet,
+// which is not an operation a provider can perform but a payload to repair.
 //
 // Settling it as a rejection instead would persist a transaction and bind the
-// provider's idempotency key to it permanently — for a mistake they did not
-// make, and with no way for them to get that key back once the lookup here was
-// fixed. Refusing outright records nothing and leaves the key free.
+// provider's idempotency key to it permanently, with no way for them to get
+// that key back once the payload was corrected. Refusing outright records
+// nothing and leaves the key free.
 //
 // The code is correctable, which is the half of this that is easy to get wrong.
 // [failure.Correctable] means precisely "nothing was persisted and the key may
@@ -299,14 +300,18 @@ func (p *Processor) wait(tx *WagerTransaction, now time.Time) (Outcome, error) {
 // very outcome this check exists to prevent. It follows [NewProcessor], which
 // reports a caller's bad argument the same way.
 //
-// Currency is deliberately not checked here. A wallet is identified by player
-// and currency, so a player who holds no wallet in the currency they bet in is
-// a real business outcome, and [Processor.apply] settles it as one.
-func walletBelongsToPlayer(cmd Command, w *Wallet) error {
+// Currency is deliberately not checked here. A wallet holds one currency, so a
+// provider betting in another against it is a real business outcome — the
+// wallet exists, it is the player's, and the money is the wrong kind — and
+// [Processor.apply] settles it as one, under CurrencyMismatch.
+func WalletBelongsToPlayer(cmd Command, w *Wallet) error {
 	if w.PlayerID() != cmd.PlayerID {
+		// The owner is deliberately not named: this message can reach the
+		// provider that sent the wrong identifier, and whose wallet it is
+		// belongs to nobody but the service.
 		return failure.New(failure.InvalidFieldFormat,
-			"wallet %s belongs to player %q, not %q",
-			w.ID(), w.PlayerID(), cmd.PlayerID).WithField("walletId")
+			"wallet %s is not held by player %q",
+			w.ID(), cmd.PlayerID).WithField("walletId")
 	}
 	return nil
 }

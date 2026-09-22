@@ -1,0 +1,47 @@
+# What never reaches the build context.
+#
+# Two reasons, and the second is the one that matters: a smaller context is a
+# faster build, but a context that cannot carry a secret is a build that cannot
+# bake one into a layer. Anything here is invisible to `docker build`, so a
+# `.env` a developer pointed at a real cluster cannot end up in an image even by
+# accident.
+#
+# What the build needs is the module: go.mod, go.sum, cmd/, internal/ and
+# migrations/ — which is embedded, so it must stay.
+
+# A local copy of .env.example, holding whatever the developer pointed it at.
+# The example itself is kept out too: the image reads its configuration from the
+# environment, never from a file in it.
+.env
+.env.example
+
+# History, and the branch state that comes with it. By far the largest thing in
+# the tree, and none of it is compiled.
+.git
+.gitignore
+.github
+
+# Local build and test artefacts, which would otherwise be copied in and then
+# overwritten by the build that produced them.
+/migrate
+*.test
+*.out
+
+# The local stack's own definitions. The realm export and the queue init script
+# are mounted into their containers by docker-compose.yml at run time; they are
+# not part of any image.
+Dockerfile
+.dockerignore
+docker-compose.yml
+deploy/
+
+# Documentation and the developer toolchain's configuration. Read by people and
+# by CI, never by the compiler.
+*.md
+docs/
+Makefile
+.golangci.yml
+
+# Session state for the assistant tooling, and macOS directory metadata.
+.remember/
+.DS_Store

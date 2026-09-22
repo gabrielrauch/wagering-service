@@ -248,7 +248,11 @@ func TestASecondReversalOfOneReferenceIsRejectedAndPersisted(t *testing.T) {
 }
 
 // ADR-0003, end to end: at most one ACTIVE reversal, so undoing a refund gives
-// the bet back and the bet can be reversed again.
+// the bet back — to a rollback. Not to a second refund: the brief's other rule
+// is that a reference never receives two successful reversals of one kind, and
+// the refund that was undone still counts as one. Both are decided by the
+// domain under the wallet lock and persisted as rejections with their event,
+// never raised by the schema's index.
 func TestRollingBackARefundReleasesTheBetItReturned(t *testing.T) {
 	f := newFixture(t)
 	wallet := f.db.seedWallet(t, "player-1", "100.00", "BRL")
@@ -267,22 +271,46 @@ func TestRollingBackARefundReleasesTheBetItReturned(t *testing.T) {
 		Amount:   "25.00", Reference: "ext-refund",
 	}))
 
-	// The refund is undone, so the bet stands again — and is reversible again.
+	// The refund is undone, so the bet stands again.
 	if got := f.db.balanceOf(t, wallet).Amount(); got != "75.00" {
 		t.Fatalf("wallet holds %s, want 75.00", got)
 	}
 
-	fourth := f.submit(t, fields(acme, submission{
-		Kind:     "ROLLBACK",
-		External: "ext-rb2",
-		Key:      "key-4",
-		Amount:   "25.00", Reference: "ext-bet",
-	}))
+	t.Run("a second refund of the bet is rejected", func(t *testing.T) {
+		result := f.submit(t, fields(acme, submission{
+			Kind:     "REFUND",
+			External: "ext-refund-2",
+			Key:      "key-4",
+			Amount:   "25.00", Reference: "ext-bet",
+		}))
 
-	assertStatus(t, fourth, wagering.Processed, "")
-	if got := f.db.balanceOf(t, wallet).Amount(); got != "100.00" {
-		t.Errorf("wallet holds %s, want 100.00", got)
-	}
+		assertStatus(t, result, wagering.Rejected, failure.ReferenceAlreadyReversed)
+		row := f.row(t, result.TransactionID)
+		if row.snap.Status != wagering.Rejected || row.snap.FailureCode != failure.ReferenceAlreadyReversed {
+			t.Errorf("stored as %s (%s), want a persisted %s under %s",
+				row.snap.Status, row.snap.FailureCode, wagering.Rejected, failure.ReferenceAlreadyReversed)
+		}
+		if got := f.db.eventTypes(); got[len(got)-1] != "WagerTransactionRejected" {
+			t.Errorf("last event %s, want WagerTransactionRejected", got[len(got)-1])
+		}
+		if got := f.db.balanceOf(t, wallet).Amount(); got != "75.00" {
+			t.Errorf("wallet holds %s, want 75.00 — the stake was not returned a second time", got)
+		}
+	})
+
+	t.Run("a rollback of the bet is processed", func(t *testing.T) {
+		result := f.submit(t, fields(acme, submission{
+			Kind:     "ROLLBACK",
+			External: "ext-rb2",
+			Key:      "key-5",
+			Amount:   "25.00", Reference: "ext-bet",
+		}))
+
+		assertStatus(t, result, wagering.Processed, "")
+		if got := f.db.balanceOf(t, wallet).Amount(); got != "100.00" {
+			t.Errorf("wallet holds %s, want 100.00", got)
+		}
+	})
 }
 
 // The asymmetry is deliberate: a rollback is a provider saying an operation

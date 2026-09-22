@@ -98,6 +98,42 @@ func (p Principal) MaySubmitAs(provider wagering.Provider) error {
 	return nil
 }
 
+// MayReadAs reports whether this principal may read the operations provider
+// submitted.
+//
+// It is deliberately not [Principal.MaySubmitAs], and the asymmetry is the
+// whole content of this method: a provider may read only as itself, exactly as
+// it may submit only as itself, but the service may read as any provider
+// although it may submit as none. Submitting is refused to the service because
+// an operation raised by this system is not a provider's operation — an opening
+// goes through Wallets.Open, a different door — and a service allowed to submit
+// as anybody would make MaySubmitAs meaningless for the one identity that could
+// bypass it. Reading takes nothing and moves nothing, so that reasoning does
+// not carry over: refusing it would leave the operator of this system unable to
+// answer a provider asking what became of an operation it can only name by its
+// own identifier for it.
+//
+// A provider naming another provider is Unauthorized rather than NotFound, and
+// that is not the same decision as the one [scopedResult] makes. This is
+// answered from the principal and the named provider alone, before anything is
+// read, so it is the same answer for every external id and confirms the
+// existence of none of them. NotFound there, in contrast, is answered after a
+// row has been looked for, which is exactly where an existence oracle would
+// otherwise appear.
+func (p Principal) MayReadAs(provider wagering.Provider) error {
+	switch p.kind {
+	case ServicePrincipal:
+		return nil
+	case ProviderPrincipal:
+		if p.provider != provider {
+			return unauthorized("%s may not read as %q", p.describe(), provider)
+		}
+		return nil
+	default:
+		return unauthorized("%s may not read wager operations", p.describe())
+	}
+}
+
 // MayAdministerWallets reports whether this principal may open, read, page or
 // reconcile a wallet.
 //

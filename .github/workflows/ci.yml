@@ -61,6 +61,24 @@ jobs:
       - name: Test
         run: go test -race -count=1 ./...
 
+      # The adapter suite is behind a build tag because it is slower and needs a
+      # cluster it can create databases on. Behind a tag and absent from CI it
+      # would be a suite nothing ever runs, which is the same as no suite at
+      # all -- so it runs here, against the service container above, as exactly
+      # the command the acceptance checklist names.
+      #
+      # This is the whole of `./...` a second time, so the untagged storage
+      # tests run twice against one cluster. That is why both harnesses name
+      # their databases with a per-RUN identifier rather than a per-process
+      # counter: the counter restarts at 1 in the second run and collided with
+      # the databases the first one left behind.
+      #
+      # The adapter suite fails rather than skips when no cluster is reachable;
+      # the storage suite this command also invokes still skips, which is its
+      # own choice and the reason TEST_DATABASE_URL is set above.
+      - name: Integration test
+        run: go test -race -tags integration -count=1 ./...
+
       - name: Fuzz the parsers briefly
         # The seed corpus runs as part of the tests above. This is a short
         # search for inputs nobody wrote down; `make fuzz` runs it for longer.
@@ -92,6 +110,44 @@ jobs:
       - uses: golang/govulncheck-action@v1
         with:
           go-version-file: go.mod
+
+  # The suite that runs the service as more than one process: three API
+  # replicas and two workers through docker-compose.yml, plus the scenarios
+  # that start, arm and kill the real binaries on the host. It is the one suite
+  # that exercises the compose file, the container image and the health checks
+  # as they ship, and a suite behind a build tag that CI never runs is the same
+  # as no suite -- see the note on the integration step above.
+  #
+  # ubuntu-latest ships Docker with Compose v2, which is all `make test-multi`
+  # needs: the suite brings the stack up itself and builds the two binaries it
+  # drives. No service containers here, deliberately -- the compose stack
+  # publishes 5432, 8080 and 4566 on the runner, and a service container on
+  # any of them would collide.
+  #
+  # The Makefile target already bounds `go test` at twenty minutes. The five
+  # more are for Compose building the images from nothing, which is what a
+  # runner does every time and what internal/multi/doc.go measures at about
+  # three minutes cold.
+  multi:
+    name: multi-instance test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Multi-instance test
+        run: make test-multi
+
+      # Whatever happened above. A runner is discarded afterwards, so this is
+      # not about the runner; it is so the containers' logs are flushed and a
+      # stack that failed half-way is not what a re-run's `--wait` inherits.
+      - name: Take the stack down
+        if: always()
+        run: docker compose down --remove-orphans --volumes
 
   migrate:
     name: migrate command

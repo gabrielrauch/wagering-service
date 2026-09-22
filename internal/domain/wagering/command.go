@@ -23,6 +23,13 @@ type Command struct {
 	// that move money.
 	LedgerEntryID LedgerEntryID
 
+	// WalletID is the wallet the provider addresses. It is submitted rather than
+	// derived: the provider learned it when the wallet was opened, names it on
+	// every operation, and it is hashed with the rest of the business fields.
+	// The wallet must belong to PlayerID, which [WalletBelongsToPlayer] checks
+	// against the wallet actually loaded.
+	WalletID WalletID
+
 	Provider              Provider
 	ExternalTransactionID ExternalTransactionID
 	IdempotencyKey        IdempotencyKey
@@ -58,6 +65,9 @@ func (c Command) Validate() error {
 
 	if c.TransactionID.IsZero() {
 		return missing("transactionId")
+	}
+	if c.WalletID.IsZero() {
+		return missing("walletId")
 	}
 	if c.Kind.MovesMoney() && c.LedgerEntryID.IsZero() {
 		return failure.New(failure.MissingRequiredField,

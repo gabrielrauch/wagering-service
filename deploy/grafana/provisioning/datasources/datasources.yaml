@@ -1,0 +1,28 @@
+# The two datasources, provisioned so that Grafana comes up with both already
+# connected and nothing to click through.
+#
+# The uids are written here rather than generated. They are what the panels in
+# deploy/grafana/dashboards/wagering.json refer to, and a generated uid would
+# make a dashboard provisioned from a file depend on which order Grafana
+# happened to create its datasources in.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      # The scrape interval from deploy/prometheus/prometheus.yml. Grafana
+      # computes $__rate_interval from this, and left unset it assumes fifteen
+      # seconds — three times the real one, which widens every rate window on
+      # the dashboard for no reason.
+      timeInterval: 5s
+
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    access: proxy
+    url: http://tempo:3200

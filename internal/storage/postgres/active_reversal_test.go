@@ -5,12 +5,17 @@ import (
 	"testing"
 )
 
-// The brief asks that a reference never receive two successful reversals. Taken
-// literally that is a unique index on the resolved reference, and it would
-// forbid a sequence the domain permits: ADR-0003 settles on at most one *active*
-// reversal, so rolling back a refund releases the bet it returned and the bet
-// becomes reversible again. These tests pin the domain's rule, not the literal
-// one. See ADR-0007.
+// The brief asks two things of a reference, and the schema keeps them apart.
+//
+// At most one *active* reversal: ADR-0003 settles on that, so rolling back a
+// refund releases the bet it returned. active_reversal is that rule as a
+// primary key (ADR-0007). And never two *successful* reversals of one kind:
+// wager_transaction_one_successful_reversal_per_kind is that rule as a partial
+// unique index on (resolved_reference_id, kind), which does not care whether the
+// first was later undone. A released bet is therefore reversible again by a
+// ROLLBACK and not by a second REFUND. Taken alone, a unique index on the
+// reference would have forbidden the rollback too, which is the literal reading
+// ADR-0007 rejects; taken alone, the active rule allowed the second refund.
 
 // reversalOf is a processed reversal pointing at target.
 // heldBy asserts which reversal currently holds a reference.
@@ -109,9 +114,11 @@ func TestOnlyAProcessedReversalHoldsTheReference(t *testing.T) {
 }
 
 // TestReversingAReversalReleasesTheReference walks the sequence ADR-0003
-// settles on. A rolled-back refund frees the bet again, which is the whole
-// reason this is a derived table rather than a unique index on the resolved
-// reference.
+// settles on, and says exactly what is released: the active slot, for a
+// reversal of a different kind. A rolled-back refund frees the bet to be rolled
+// back, which is the whole reason active_reversal is a derived table rather
+// than a unique index on the resolved reference. It does not free the bet to
+// be refunded again — that is the per-kind rule, tested below.
 func TestReversingAReversalReleasesTheReference(t *testing.T) {
 	t.Parallel()
 	db := migrated(t)
@@ -127,12 +134,80 @@ func TestReversingAReversalReleasesTheReference(t *testing.T) {
 	rollbackOfRefund := reversalOf(w, "ROLLBACK", refund)
 	rollbackOfRefund.accepts(t, db)
 
-	t.Run("the bet is reversible again", func(t *testing.T) {
+	t.Run("the bet is no longer held", func(t *testing.T) {
+		if got := names(t, db, `
+			SELECT reversal_id FROM wagering.active_reversal WHERE reference_id = $1`, bet.id); len(got) != 0 {
+			t.Errorf("the bet is still held by %v after its refund was rolled back", got)
+		}
+		heldBy(t, db, refund, rollbackOfRefund)
+	})
+
+	t.Run("the bet is reversible again, by a rollback", func(t *testing.T) {
 		reversalOf(w, "ROLLBACK", bet).accepts(t, db)
 	})
 
 	t.Run("the refund is not reversible twice", func(t *testing.T) {
 		reversalOf(w, "ROLLBACK", refund).refuses(t, db, uniqueViolation)
+	})
+}
+
+// TestAReferenceReceivesAtMostOneSuccessfulReversalPerKind is the brief's
+// sentence as an index: "guarantee that a reference does not receive two
+// successful reversals of the same kind".
+//
+// The active rule alone let BET → REFUND → ROLLBACK of the refund → REFUND
+// through, because the rollback released the bet and the second refund found
+// the slot free — two PROCESSED refunds of one bet, each returning the stake.
+// The index counts successful reversals by (reference, kind) and never releases,
+// so the second refund is a duplicate key while a rollback of the same bet,
+// being another kind, is not.
+func TestAReferenceReceivesAtMostOneSuccessfulReversalPerKind(t *testing.T) {
+	t.Parallel()
+	db := migrated(t)
+	w := newWallet(t, db, 10000)
+
+	bet := processedBet(t, db, w)
+	refund := reversalOf(w, "REFUND", bet)
+	refund.accepts(t, db)
+	reversalOf(w, "ROLLBACK", refund).accepts(t, db)
+
+	t.Run("a second processed refund of the bet", func(t *testing.T) {
+		second := reversalOf(w, "REFUND", bet)
+		second.refuses(t, db, uniqueViolation)
+		second.refusedBy(t, db, "wager_transaction_one_successful_reversal_per_kind")
+	})
+
+	t.Run("a processed rollback of the bet", func(t *testing.T) {
+		reversalOf(w, "ROLLBACK", bet).accepts(t, db)
+	})
+
+	// The index is partial on success, so it does not count what returned
+	// nothing: a refund that was refused, or one still waiting, leaves the
+	// pair free for the one that eventually takes effect.
+	t.Run("a rejected refund does not count", func(t *testing.T) {
+		other := processedBet(t, db, w)
+		rejected := reversalOf(w, "REFUND", other)
+		rejected.status, rejected.result = "REJECTED", nil
+		rejected.failureCode = "REVERSAL_INSUFFICIENT_FUNDS"
+		rejected.accepts(t, db)
+
+		reversalOf(w, "REFUND", other).accepts(t, db)
+	})
+
+	// And the other way a reversal reaches PROCESSED: parked, then settled by
+	// an update. The index is on the row, so it sees the update too.
+	t.Run("settling a parked second refund is refused the same way", func(t *testing.T) {
+		other := processedBet(t, db, w)
+		reversalOf(w, "REFUND", other).accepts(t, db)
+
+		parked := reversalOf(w, "REFUND", other)
+		parked.status, parked.result = "PENDING", nil
+		parked.accepts(t, db)
+
+		refusesRule(t, db, "wager_transaction_one_successful_reversal_per_kind", `
+			UPDATE wagering.wager_transaction
+			SET status = 'PROCESSED', result_balance_minor = $2, updated_at = $3
+			WHERE id = $1`, parked.id, int64(10000), base.Add(1))
 	})
 }
 

@@ -20,9 +20,14 @@ type OperationFields struct {
 	ExternalTransactionID string
 	IdempotencyKey        string
 	PlayerID              string
-	RoundID               string
-	GameID                string
-	Kind                  string
+	// WalletID is the wallet the provider addresses, in its canonical UUID
+	// form. It must belong to PlayerID: a submission naming somebody else's
+	// wallet is refused with nothing persisted, and one naming a wallet that
+	// does not exist is not found. It is hashed with the other business fields.
+	WalletID string
+	RoundID  string
+	GameID   string
+	Kind     string
 
 	// Amount is a plain decimal with exactly two fraction digits, and Currency
 	// three uppercase letters. Neither is normalised: the canonical payload is
@@ -101,11 +106,16 @@ type OpenWalletCommand struct {
 type OperationResult struct {
 	TransactionID         wagering.TransactionID
 	ExternalTransactionID wagering.ExternalTransactionID
-	Kind                  wagering.Kind
-	Status                wagering.Status
-	Money                 money.Money
-	Balance               *money.Money
-	FailureCode           failure.Code
+	// WalletID is the wallet the operation was applied to.
+	WalletID wagering.WalletID
+	// ProviderID is the provider that submitted the operation, and is zero for
+	// an opening, which no provider submits.
+	ProviderID  wagering.Provider
+	Kind        wagering.Kind
+	Status      wagering.Status
+	Money       money.Money
+	Balance     *money.Money
+	FailureCode failure.Code
 
 	// IdempotentReplay reports that this result was read rather than produced:
 	// the same submission had already been settled.
@@ -151,9 +161,15 @@ type Divergence struct {
 
 // Reconciliation is the result of checking a wallet against its ledger. It never
 // alters the balance.
+//
+// CheckedEntries is how many ledger entries were summed to reach Reconstructed:
+// the opening, when the wallet was opened with money in it, and every movement
+// since. It is reported so that a reader can tell a wallet found consistent
+// over its whole ledger from one found consistent over nothing.
 type Reconciliation struct {
 	Divergence
-	Consistent bool
+	Consistent     bool
+	CheckedEntries int
 }
 
 // ResumeOutcome is what one turn of the resume worker did.
@@ -169,6 +185,12 @@ type ResumeOutcome struct {
 	// Woke is how many operations waiting on this one became due in the same
 	// commit.
 	Woke int
+	// Correlation is the thread the operation was submitted under, as the
+	// events this turn stamped carry it: the stored one, or the operation's own
+	// id when the row holds none. It is what ties this turn's log line back to
+	// the request or message that parked the operation, days earlier and on
+	// another door.
+	Correlation string
 }
 
 // DueCandidate is a parked operation that looks due, and the wallet it belongs

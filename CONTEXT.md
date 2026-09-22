@@ -63,7 +63,7 @@ _Avoid_: Reversal, undo, compensation, cancel
 The category covering refunds and rollbacks — any operation whose purpose is to undo another wager transaction.
 
 **Active Reversal**:
-A reversal that has not itself been reversed. A wager transaction may have at most one at a time; when a reversal is undone, the transaction it pointed at becomes reversible again.
+A reversal that has not itself been reversed. A wager transaction may have at most one at a time; when a reversal is undone, the transaction it pointed at becomes reversible again — by a reversal of a different kind, because a transaction never receives two successful reversals of the same kind, undone or not.
 
 **Origin**:
 Whether a wager transaction was submitted by a provider or raised internally by the system. Only internal transactions may be openings; only external ones carry provider fields.
@@ -76,8 +76,12 @@ _Avoid_: Parent, original, source
 ## Provider integration
 
 **Provider**:
-The game operator that submits operations and to which outcomes are reported.
+The game operator that submits operations and to which outcomes are reported. Named on the wire as `providerId`.
 _Avoid_: Partner, vendor, client, integrator
+
+**Wallet Id**:
+The identifier of the wallet an operation addresses, submitted by the provider as `walletId` beside the player. An operation is applied to the wallet it names and to no other; naming a wallet that does not exist, or one the player does not hold, is refused the same way in both cases — nothing recorded, the owner never named — as a submission to repair rather than an operation to redirect.
+_Avoid_: Account id, target
 
 **Round**:
 One play of a game, grouping the operations that belong together.
