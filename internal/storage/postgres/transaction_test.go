@@ -132,10 +132,16 @@ func hashOf(s string) string {
 }
 
 // TestTransactionBelongsToItsWallet is the composite foreign key: a transaction
-// names the wallet, the player and the currency together, so a row claiming a
-// player or a currency the wallet does not have cannot exist. It is
-// CURRENCY_MISMATCH and player misattribution made unrepresentable rather than
-// merely checked.
+// names the wallet and the player together, so a row claiming a player the
+// wallet does not have cannot exist. Player misattribution is made
+// unrepresentable rather than merely checked.
+//
+// The currency is deliberately NOT part of the key since 000009. A provider
+// names the wallet it addresses, so it can address a wallet the player holds
+// in a currency the wallet is not denominated in, and the domain settles that
+// as CURRENCY_MISMATCH — a REJECTED row carrying the money the provider asked
+// for. A key that made such a row unrepresentable would make the rejection
+// unrecordable.
 func TestTransactionBelongsToItsWallet(t *testing.T) {
 	t.Parallel()
 	db := migrated(t)
@@ -151,16 +157,83 @@ func TestTransactionBelongsToItsWallet(t *testing.T) {
 		x.refuses(t, db, foreignKeyViolation)
 	})
 
-	t.Run("a currency the wallet is not denominated in", func(t *testing.T) {
+	t.Run("a currency the wallet is not denominated in is the domain's to settle", func(t *testing.T) {
 		x := externalTx(w, "BET")
 		x.currency = "USD"
-		x.refuses(t, db, foreignKeyViolation)
+		x.accepts(t, db)
 	})
 
 	t.Run("a wallet that does not exist", func(t *testing.T) {
 		x := externalTx(w, "BET")
 		x.walletID = wagering.NewWalletID().String()
 		x.refuses(t, db, foreignKeyViolation)
+	})
+}
+
+// TestAProcessedTransactionIsInItsWalletsCurrency restores, as a trigger, the
+// half of the old three-column key that 000009 could not keep.
+//
+// The key pinned every transaction's currency to its wallet's, which made a
+// REJECTED CURRENCY_MISMATCH row unrepresentable — and a rejection that cannot
+// be recorded is not a rejection. The key was narrowed to (wallet_id, player_id)
+// so that the domain can settle the mismatch, and this trigger says what the
+// key used to say about the rows that matter: nothing PROCESSED sits in a
+// currency its wallet does not hold. The ledger already refuses such an entry;
+// this reaches the kinds that write none, a LOSS above all.
+func TestAProcessedTransactionIsInItsWalletsCurrency(t *testing.T) {
+	t.Parallel()
+	db := migrated(t)
+	w := newWallet(t, db, 10000)
+
+	const rule = "wager_transaction_processed_in_wallet_currency"
+
+	t.Run("a processed loss in another currency", func(t *testing.T) {
+		loss := externalTx(w, "LOSS")
+		loss.currency, loss.amount = "USD", int64(0)
+		loss.status, loss.result = "PROCESSED", int64(10000)
+		loss.refusedBy(t, db, rule)
+	})
+
+	t.Run("a processed loss in the wallet's currency", func(t *testing.T) {
+		loss := externalTx(w, "LOSS")
+		loss.amount = int64(0)
+		loss.status, loss.result = "PROCESSED", int64(10000)
+		loss.accepts(t, db)
+	})
+
+	t.Run("a rejected bet in another currency is the domain's to settle", func(t *testing.T) {
+		x := externalTx(w, "BET")
+		x.currency = "USD"
+		x.status, x.failureCode = "REJECTED", "CURRENCY_MISMATCH"
+		x.accepts(t, db)
+	})
+
+	t.Run("a pending bet in another currency may still be rejected", func(t *testing.T) {
+		x := externalTx(w, "BET")
+		x.currency = "USD"
+		x.accepts(t, db)
+	})
+
+	t.Run("settling that pending bet as processed", func(t *testing.T) {
+		x := externalTx(w, "LOSS")
+		x.currency, x.amount = "USD", int64(0)
+		x.accepts(t, db)
+
+		refusesRule(t, db, rule, `
+			UPDATE wagering.wager_transaction
+			SET status = 'PROCESSED', result_balance_minor = $2, updated_at = $3
+			WHERE id = $1`, x.id, int64(10000), base.Add(time.Second))
+	})
+
+	t.Run("settling it as rejected", func(t *testing.T) {
+		x := externalTx(w, "BET")
+		x.currency = "USD"
+		x.accepts(t, db)
+
+		accepts(t, db, `
+			UPDATE wagering.wager_transaction
+			SET status = 'REJECTED', failure_code = 'CURRENCY_MISMATCH', updated_at = $2
+			WHERE id = $1`, x.id, base.Add(time.Second))
 	})
 }
 

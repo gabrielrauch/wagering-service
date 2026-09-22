@@ -65,6 +65,21 @@ here; `0001` creates them idempotently precisely so that finding them is normal.
 **ADR-0009**, which also records what the symmetric version broke and how to remove the roles
 for real.
 
+**What each version owns.**
+
+| Version | Owns |
+|---|---|
+| `0001` | the two roles and the value domains |
+| `0002` | the catalogues: `failure_code`, `settling_failure_code`, `event_type`, and their seed |
+| `0003` | `wallet` and `wallet_guard` |
+| `0004` | `wager_transaction`, `wager_transaction_guard`, `active_reversal` and its maintainer |
+| `0005` | `wallet_ledger_entry`, the chain, append-only, and the wallet-iff-ledger pairing |
+| `0006` | `inbox` |
+| `0007` | `outbox`, its counter and its numbering trigger |
+| `0008` | the grants to `wagering_app` |
+| `0009` | `wager_transaction_wallet_fkey` narrowed to `(wallet_id, player_id)`, so that a `CURRENCY_MISMATCH` rejection can be recorded |
+| `0010` | `wager_transaction_one_successful_reversal_per_kind`; `outbox_guard`; `wager_transaction_processed_in_wallet_currency`; the `REFERENCE_ALREADY_REVERSED` and `UNSUPPORTED_CURRENCY` descriptions restated |
+
 **Cancellation and connections.** `cmd/migrate` takes a `context.Context` and stops on an
 interrupt at the next version boundary rather than in the middle of one, so a cancelled run
 leaves the database at a version rather than dirty between two. `Migrator` opens the
@@ -105,7 +120,7 @@ One rule, stated once, reused by every column that holds such a value.
 
 | Domain | Rule | Mirrors |
 |---|---|---|
-| `currency_code` | `^[A-Z]{3}$`, against no allowlist | `money.ParseCurrency`; ADR-0001 |
+| `currency_code` | `^[A-Z]{3}$`, form only | the form half of `money.ParseCurrency`. The domain type also checks the code against the ISO 4217 currencies a fixed scale of two can hold; the schema does not carry that list, so it is the coarser net. ADR-0001, as amended |
 | `opaque_id` | 1–128 **octets**, no control characters, no surrounding whitespace | `wagering.parseOpaque` |
 | `sha256_hex` | `^[0-9a-f]{64}$` | `wagering.PayloadHash` |
 | `minor_amount` | `bigint`, no constraint | says *these are minor units at scale 2*; sign and range belong to the table |
@@ -136,7 +151,8 @@ one to the other is not a change to this contract.
 The SQLSTATE still says which mechanism refused: `23505` a unique index, `23503` a foreign
 key, `23514` a CHECK, `P0001` a trigger. That is worth having for diagnosis and is the wrong
 thing to branch on, because every class holds both ordinary business outcomes and signs that
-something is wrong — `23505` on `active_reversal_pkey` is a reference already reversed, while
+something is wrong — `23505` on `active_reversal_pkey` or on
+`wager_transaction_one_successful_reversal_per_kind` is a reference already reversed, while
 `P0001` on `wallet_ledger_entry_is_append_only` means someone tried to rewrite the ledger.
 The name is what tells them apart.
 
@@ -158,6 +174,7 @@ undifferentiated `P0001`:
 | `wager_transaction_terminal_status_is_final` | leaving `PROCESSED`, `REJECTED` or `FAILED` |
 | `wager_transaction_does_not_return_to_pending` | returning to `PENDING` |
 | `wager_transaction_clock_moves_forward` | `updated_at` running backwards |
+| `wager_transaction_processed_in_wallet_currency` | a `PROCESSED` row in a currency its wallet is not denominated in (`0010`) |
 | `active_reversal_reference_is_reversible` | refunding a reversal, or rolling back a rollback |
 | `wallet_ledger_entry_matches_the_wallet_currency` | an entry in a currency the wallet is not denominated in |
 | `wallet_ledger_entry_first_records_the_opening_version` | a first entry at a version the wallet never reached |
@@ -169,8 +186,11 @@ undifferentiated `P0001`:
 | `wallet_with_no_ledger_holds_nothing` | a wallet holding money with no ledger behind it |
 | `wallet_matches_its_ledger` | a wallet and its ledger ending in different places |
 | `outbox_aggregate_sequence_is_assigned` | an aggregate sequence supplied rather than assigned |
+| `outbox_payload_is_a_snapshot` | an event's identity, aggregate, sequence, type, version, payload or time being rewritten (`0010`) |
 
-The last three are deferred to commit, so they refuse the `COMMIT` rather than a statement.
+`wallet_ledger_entry_names_an_existing_wallet`, `wallet_with_no_ledger_holds_nothing` and
+`wallet_matches_its_ledger` are deferred to commit, so they refuse the `COMMIT` rather than a
+statement.
 
 ## Tables
 
@@ -183,7 +203,7 @@ is denominated in, which a zero balance carries just as well as a positive one.
 | Constraint | Invariant |
 |---|---|
 | `wallet_player_currency_key` `UNIQUE (player_id, currency)` | one wallet per player per currency — `WALLET_ALREADY_EXISTS`. The domain refuses a second wallet when handed the first, but a check against a value cannot win a race; this decides it. |
-| `wallet_identity_key` `UNIQUE (id, player_id, currency)` | redundant with the primary key, and the foreign-key target that makes `CURRENCY_MISMATCH` and player misattribution unrepresentable in `wager_transaction`. |
+| `wallet_player_key` `UNIQUE (id, player_id)` | redundant with the primary key, and the foreign-key target that makes player misattribution unrepresentable in `wager_transaction`. The currency left this key in `0009`: a `CURRENCY_MISMATCH` rejection has to be storable to be a rejection at all. What the three-column key said about processed rows is now `wager_transaction_processed_in_wallet_currency`. |
 | `wallet_balance_is_never_negative` | a wallet never holds less than nothing |
 | `wallet_version_starts_at_one` | a wallet that exists has stood at one balance |
 | `wallet_updated_at_follows_created_at` | |
@@ -206,7 +226,8 @@ provider side, which the domain models as a nullable struct on a single type.
 
 | Constraint | Invariant |
 |---|---|
-| `wager_transaction_wallet_fkey` `(wallet_id, player_id, currency)` → `wallet` | the transaction's currency and player are the wallet's. `CURRENCY_MISMATCH` made unrepresentable. |
+| `wager_transaction_wallet_fkey` `(wallet_id, player_id)` → `wallet` | the transaction's player is the wallet's: player misattribution made unrepresentable. The currency is deliberately not in the key since `0009` — a provider names the wallet it addresses and may pay in a currency it does not hold, and the domain settles that as a `REJECTED` `CURRENCY_MISMATCH` row carrying the currency the provider asked for. |
+| trigger `wager_transaction_processed_in_wallet_currency` (BEFORE INSERT OR UPDATE, when `PROCESSED`) | a processed row is in its wallet's currency — what the old key said, kept for the rows it matters for. The ledger already refuses such an entry; this reaches a `LOSS`, which writes none. `REJECTED`, `FAILED`, `PENDING` and `PENDING_REFERENCE` rows may carry another currency, because that is the shape a mismatch has on its way to being rejected (`0010`). |
 | `wager_transaction_kind_is_known`, `..._status_is_known` | the closed sets, checked against `wagering.Kinds()` and `Statuses()` by test |
 | `wager_transaction_origin_carries_its_fields` | `num_nonnulls(provider, external_transaction_id, idempotency_key, payload_hash, round_id, game_id) = 0` for an `OPENING` and `6` otherwise. One line; exactly `validateOrigin`. |
 | `correlation_id` `NOT NULL` | the trace the operation arrived under. Required on **every** row, openings included, and deliberately outside the constraint above: that one counts the six fields the *provider* owns, and this one is ours. Causation is not stored — on the queue path it is the message id, which already has an inbox row, and a resumed operation has no causing event with an identity. |
@@ -228,6 +249,7 @@ provider side, which the domain models as a nullable struct on a single type.
 | `wager_transaction_only_waiting_is_scheduled` | settled work leaves the scheduler's index |
 | `wager_transaction_provider_external_key` `UNIQUE (provider, external_transaction_id)` | persistent idempotency; a financial operation cannot be reapplied under another key |
 | `wager_transaction_provider_idempotency_key` `UNIQUE (provider, idempotency_key)` | one key, one transaction |
+| `wager_transaction_one_successful_reversal_per_kind` `UNIQUE (resolved_reference_id, kind) WHERE status = 'PROCESSED' AND kind IN ('REFUND', 'ROLLBACK')` | a reference never receives two successful reversals of one kind, whether or not the first was later undone — `REFERENCE_ALREADY_REVERSED`. The brief's sentence as an index (`0010`); how it fits beside `active_reversal_pkey` is under [`active_reversal`](#active_reversal). |
 
 **Concurrent duplicates** are serialised by those two unique constraints and nothing else.
 The second `INSERT` blocks on the uncommitted duplicate key; once the first commits it
@@ -274,7 +296,9 @@ deliberately holds nothing on.
 The trigger deletes the row keyed on the reversal *being reversed*, then inserts the new
 hold. That delete is what releases a bet when its refund is rolled back — the sequence
 `BET → REFUND → ROLLBACK of the refund` leaves the bet free, and a later `ROLLBACK of the
-bet` can take it.
+bet` can take it. A later `REFUND of the bet` cannot: it is refused by
+`wager_transaction_one_successful_reversal_per_kind`, which is the other half of the rule
+and is explained below.
 
 Two triggers rather than one, because a `WHEN` clause cannot mention `OLD` on an insert, and
 the update trigger needs it: `UPDATE OF status` fires whenever the column is assigned, even
@@ -305,9 +329,33 @@ but it is the **weaker** guarantee: it only holds while both reversals move mone
 refund and a rollback of one bet where neither writes a ledger entry, so the version is never
 consulted, and the bet is still reversed exactly once.
 
-**There is deliberately no unique index on `resolved_reference_id`.** The literal reading of
-the brief would forbid `BET → REFUND → ROLLBACK → ROLLBACK of the bet`, which ADR-0003
-permits. See **ADR-0007**.
+#### Two rules, kept apart
+
+The brief asks two things of a reference, and this schema states them as two objects
+because they count different things.
+
+**At most one active reversal** — `active_reversal_pkey`, above. It releases: rolling back
+a refund frees the bet, and a `ROLLBACK` of the bet may then take it.
+
+**Never two successful reversals of one kind** —
+`wager_transaction_one_successful_reversal_per_kind` on `wager_transaction`, a partial unique
+index on `(resolved_reference_id, kind) WHERE status = 'PROCESSED' AND kind IN ('REFUND',
+'ROLLBACK')`. It never releases: a `PROCESSED` refund counts whether or not it was later
+rolled back. `resolved_reference_id` is never `NULL` on a row it covers, which
+`wager_transaction_processed_reversal_is_resolved` guarantees.
+
+The first rule alone allowed `BET → REFUND → ROLLBACK of the refund → REFUND`: the rollback
+released the bet, the second refund found the slot free and took it, and the bet had been
+refunded twice with each refund returning the stake. The second rule alone — the literal
+reading of the brief that ADR-0007 rejected, a unique index on the reference — would have
+forbidden `BET → REFUND → ROLLBACK of the refund → ROLLBACK of the bet`, which is the
+sequence the business wants. Keyed by kind as well, the index forbids exactly the repeat:
+after the refund is rolled back the bet is reversible again **by a rollback**, and by
+nothing else. Both surface as `23505`, both map to the same sentinel in the adapter, and
+the domain refuses both first under `REFERENCE_ALREADY_REVERSED` — from a reference view
+that carries every processed reversal and not only the one holding the reference, because a
+view built from `active_reversal` alone has forgotten the refund that was undone. See
+**ADR-0007**, as amended.
 
 ### `wallet_ledger_entry`
 
@@ -386,6 +434,7 @@ commit together.
 | `outbox_payload_is_an_object` | |
 | `outbox_claim_is_whole` | a claim is all three of `claimed_by`, `claimed_at`, `claim_expires_at`, or none |
 | `outbox_claim_expires_after_it_is_taken` | |
+| trigger `outbox_guard` (BEFORE UPDATE) | `event_id`, `aggregate_type`, `aggregate_id`, `aggregate_sequence`, `event_type`, `event_version`, `payload` and `occurred_at` are immutable, for every role including the owner — `outbox_payload_is_a_snapshot`. The publisher's columns stay writable and `DELETE` stays allowed (`0010`). |
 
 **The counter is a table, not `max()` over the outbox.** The outbox is prunable and the
 numbering is not: retention eventually removes every row for a quiet wallet, and a `max()`
@@ -404,6 +453,16 @@ financial aggregate, and it is the natural FIFO group key for a queue.
 
 Payload is `jsonb`. Money crosses this boundary as a string (`"25.00"`), so there is no
 number for jsonb's handling to touch, and an operator can query it.
+
+**The event is a snapshot.** `wagering_app` holds `UPDATE` on the whole table because
+publishing *is* an update — a claim, an attempt count, a schedule, a publication time — and
+until `0010` nothing kept that privilege off the event itself: `UPDATE wagering.outbox SET
+payload = '{}'` succeeded. `outbox_guard` refuses any change to what describes the event,
+compared with `IS DISTINCT FROM` so that restating a column to the value it already holds
+is not a change. It is a trigger rather than column privileges so that it binds the owner
+too, as `ledger_append_only` does, and so that a publisher column added later needs no
+grant restated. `DELETE` is deliberately not refused: retention prunes published rows, and
+the ledger — not the outbox — is what is kept forever.
 
 **`$trace` is in the payload and is not part of the event.** An operation submitted over HTTP
 and the event it causes have to be one trace, and the outbox is the handover that breaks it:
@@ -481,7 +540,10 @@ PostgreSQL has no partial foreign key and a CHECK cannot consult another table. 
 **derived** from `failure_code` by the seeding migration rather than listed a second time.
 
 `TestFailureCodeCatalogueMatchesTheDomain` compares the seeded rows against `failure.All()`
-with both axes, so adding a code without a migration fails the build.
+with both axes, so adding a code without a migration fails the build. Descriptions are not
+compared, and are the one thing a later migration restates: `0010` rewrote
+`REFERENCE_ALREADY_REVERSED` to cover both reversal rules and `UNSUPPORTED_CURRENCY` to say
+that the code is checked against the currencies scale 2 can hold, not only for its form.
 
 ## The queries the indexes serve
 
@@ -491,8 +553,9 @@ with both axes, so adding a code without a migration fails the build.
 | `wager_transaction_provider_external_key` | resolve a reference by `(provider, external_transaction_id)`; detect a duplicate submission |
 | `wager_transaction_provider_idempotency_key` | find the transaction an idempotency key is bound to |
 | `wager_transaction_one_opening_per_wallet` | a wallet has at most one opening credit |
+| `wager_transaction_one_successful_reversal_per_kind` | a reference receives at most one successful `REFUND` and one successful `ROLLBACK`; the backstop and serialisation point behind the domain's per-kind check |
 | `wager_transaction_reference_idx` | "what points at this operation?" — building a `ReferenceView` |
-| `wager_transaction_resolved_reference_idx` | the resolved side of the same; backs the self-referencing FK |
+| `wager_transaction_resolved_reference_idx` | the resolved side of the same — every processed reversal of a reference, which is what the `ReferenceView` is built from; backs the self-referencing FK |
 | `wager_transaction_due_idx` | workers claiming due `PENDING_REFERENCE` work, in claim order; the trailing `id` makes that order **total**, which matters because `MakeDue` wakes every waiter in one commit with one instant |
 | `wager_transaction_wallet_history_idx` | a wallet's operations, newest first |
 | `wager_transaction_correlation_idx` | everything that happened under one trace |

@@ -294,6 +294,75 @@ func TestOutboxKeepsEventIdentityAcrossRepublication(t *testing.T) {
 	}
 }
 
+// TestOutboxPayloadIsASnapshot: an event is what happened, written once. The
+// application holds UPDATE on the whole table because publishing IS an update —
+// a claim, an attempt count, a schedule, a publication time — and before this
+// guard nothing kept that privilege off the event itself. `UPDATE outbox SET
+// payload = '{}'` succeeded. The trigger refuses any change to the event's
+// identity, ordering, type, payload and time, for every role including the
+// owner; the publisher's columns stay writable, and DELETE stays allowed
+// because retention needs it.
+func TestOutboxPayloadIsASnapshot(t *testing.T) {
+	t.Parallel()
+	db := migrated(t)
+	w := newWallet(t, db, 0)
+	other := newWallet(t, db, 0)
+
+	const rule = "outbox_payload_is_a_snapshot"
+
+	for _, c := range []struct {
+		name   string
+		column string
+		value  any
+	}{
+		{"the payload", "payload", `{}`},
+		{"the event type", "event_type", "WalletBalanceChanged"},
+		{"the event version", "event_version", int32(2)},
+		{"when it occurred", "occurred_at", base.Add(time.Hour)},
+		{"the event's identity", "event_id", wagering.NewTransactionID().String()},
+		{"the aggregate", "aggregate_id", other.id},
+		{"the aggregate's numbering", "aggregate_sequence", int64(99)},
+		{"the aggregate type", "aggregate_type", "PLAYER"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			id := emit(t, db, w, "WagerTransactionProcessed", base)
+			refusesRule(t, db, rule,
+				`UPDATE wagering.outbox SET `+c.column+` = $2 WHERE event_id = $1`, id, c.value)
+		})
+	}
+
+	// Restating a column to the value it already holds changes nothing, and is
+	// not refused: the publisher's statements do not touch these columns, but
+	// an operator's UPDATE ... SET payload = payload should not fail either.
+	t.Run("restating the payload unchanged", func(t *testing.T) {
+		id := emit(t, db, w, "WagerTransactionProcessed", base)
+		accepts(t, db, `UPDATE wagering.outbox SET payload = payload WHERE event_id = $1`, id)
+	})
+
+	t.Run("the publisher's own columns are still writable", func(t *testing.T) {
+		id := emit(t, db, w, "WagerTransactionProcessed", base)
+		at := base.Add(time.Second)
+		accepts(t, db, `
+			UPDATE wagering.outbox SET
+				claimed_by = 'publisher-1', claimed_at = $2, claim_expires_at = $3, attempts = attempts + 1
+			WHERE event_id = $1`, id, at, at.Add(time.Minute))
+		accepts(t, db, `
+			UPDATE wagering.outbox SET next_attempt_at = $2,
+				claimed_by = NULL, claimed_at = NULL, claim_expires_at = NULL
+			WHERE event_id = $1`, id, at.Add(time.Minute))
+		accepts(t, db, `
+			UPDATE wagering.outbox SET published_at = $2,
+				claimed_by = NULL, claimed_at = NULL, claim_expires_at = NULL
+			WHERE event_id = $1`, id, at.Add(2*time.Second))
+	})
+
+	t.Run("retention still deletes", func(t *testing.T) {
+		id := emit(t, db, w, "WagerTransactionProcessed", base)
+		accepts(t, db, `UPDATE wagering.outbox SET published_at = $2 WHERE event_id = $1`, id, base)
+		accepts(t, db, `DELETE FROM wagering.outbox WHERE event_id = $1 AND published_at IS NOT NULL`, id)
+	})
+}
+
 func TestOutboxRefusesWhatItCannotPublish(t *testing.T) {
 	t.Parallel()
 	db := migrated(t)

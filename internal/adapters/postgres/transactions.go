@@ -69,27 +69,42 @@ var (
 		`WHERE id = $1 AND status = 'PENDING_REFERENCE' AND reference_next_attempt_at <= $2 ` +
 		`FOR NO KEY UPDATE`
 
-	// selectReference reads the transaction an operation points at and whatever
-	// currently holds it, in one round trip.
+	// selectReference reads the transaction an operation points at and every
+	// processed reversal that resolved to it, in one round trip.
 	//
-	// The hold comes from active_reversal rather than from a scan of everything
-	// that references the row, because active_reversal IS the answer to "what
-	// holds this?" — one indexed row per held reference, maintained by the
-	// trigger and by nothing else (ADR-0007). A released hold is deleted rather
-	// than marked, so a row that is there is a hold that still stands and
-	// ReversalView.Reversed is always false.
+	// Every processed reversal, and not only the one that currently holds the
+	// reference. Two domain rules read the view and they count different
+	// things: the active-reversal rule wants the one reversal still holding the
+	// reference, and the per-kind rule wants every reversal of a kind that ever
+	// took effect, undone or not. active_reversal answers the first exactly —
+	// one row per held reference (ADR-0007) — and is silent on the second,
+	// because a released hold is deleted rather than marked: after BET → REFUND
+	// → ROLLBACK of the refund it has forgotten the refund, and a view built
+	// from it alone would let the bet be refunded again. So the reversals come
+	// from wager_transaction, over wager_transaction_resolved_reference_idx, and
+	// active_reversal is consulted per reversal for one bit: whether it still
+	// holds. That bit is ReversalView.Reversed, inverted.
+	//
+	// Whether a processed reversal that is absent from active_reversal has been
+	// reversed is not an inference. The maintainer inserts a hold for every
+	// reversal that reaches PROCESSED and deletes it only when that reversal is
+	// itself reversed, so absence and "reversed" are the same fact.
 	//
 	// The two shapes are unioned rather than joined so that every row has the
-	// same columns. A LEFT JOIN would leave the holder's non-nullable columns
-	// NULL when there is no hold, which is a shape the row scanner would have
-	// to learn to tell apart from a real one.
+	// same columns. A LEFT JOIN would leave the reversal's non-nullable columns
+	// NULL when there is none, which is a shape the row scanner would have to
+	// learn to tell apart from a real one. The leading pair of booleans says
+	// which shape a row is and, for a reversal, whether it has been undone.
 	selectReference = `WITH reference AS (SELECT ` + columns(transactionColumns) +
 		` FROM wagering.wager_transaction WHERE provider = $1 AND external_transaction_id = $2) ` +
-		`SELECT true, r.* FROM reference r ` +
-		`UNION ALL SELECT false, ` + qualified("h", transactionColumns) +
-		` FROM wagering.active_reversal a ` +
-		`JOIN wagering.wager_transaction h ON h.id = a.reversal_id ` +
-		`JOIN reference ON reference.id = a.reference_id`
+		`SELECT true, false, r.* FROM reference r ` +
+		`UNION ALL SELECT false, ` +
+		`NOT EXISTS (SELECT 1 FROM wagering.active_reversal a WHERE a.reversal_id = h.id), ` +
+		qualified("h", transactionColumns) +
+		` FROM wagering.wager_transaction h ` +
+		`JOIN reference ON reference.id = h.resolved_reference_id ` +
+		`WHERE h.status = 'PROCESSED' AND h.kind IN ('REFUND', 'ROLLBACK') ` +
+		`ORDER BY 1 DESC, created_at, id`
 )
 
 const (
@@ -159,7 +174,9 @@ func (t transactions) ByIdempotencyKey(
 		string(p), string(k))
 }
 
-// ReferenceFor builds the view of the transaction an operation points at.
+// ReferenceFor builds the view of the transaction an operation points at: the
+// reference, and every processed reversal that resolved to it, each flagged
+// with whether it has since been reversed itself.
 //
 // A reference that is not found is (nil, nil), never a NotFound: the domain
 // distinguishes "named a reference that has not arrived" from "named none", and
@@ -182,8 +199,9 @@ func (t transactions) ReferenceFor(
 		var (
 			row         transactionRow
 			isReference bool
+			reversed    bool
 		)
-		if err := rows.Scan(append([]any{&isReference}, row.dest()...)...); err != nil {
+		if err := rows.Scan(append([]any{&isReference, &reversed}, row.dest()...)...); err != nil {
 			return nil, fail(what, err)
 		}
 		tx, err := row.transaction()
@@ -195,10 +213,11 @@ func (t transactions) ReferenceFor(
 			continue
 		}
 		// Rehydrated as a real transaction rather than signalled by a flag:
-		// ReferenceView.ActiveReversal skips a view whose Transaction is nil,
-		// so a synthetic holder would put REFERENCE_ALREADY_REVERSED out of the
-		// domain's reach and leave the rule living only in the schema.
-		view.Reversals = append(view.Reversals, wagering.ReversalView{Transaction: tx})
+		// both ReferenceView.ActiveReversal and HasSuccessfulReversalOfKind
+		// skip a view whose Transaction is nil, so a synthetic holder would
+		// put REFERENCE_ALREADY_REVERSED out of the domain's reach and leave
+		// the rule living only in the schema.
+		view.Reversals = append(view.Reversals, wagering.ReversalView{Transaction: tx, Reversed: reversed})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fail(what, err)

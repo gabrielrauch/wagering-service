@@ -18,9 +18,17 @@ import (
 //
 // Reversals are the transactions that point back at Transaction. A caller may
 // pass everything that references it — a query for "transactions referencing X"
-// naturally returns wins too — and [ReferenceView.ActiveReversal] ignores
-// anything that is not a reversal, so a bet does not become unreturnable the
-// moment it pays out.
+// naturally returns wins too — and both [ReferenceView.ActiveReversal] and
+// [ReferenceView.HasSuccessfulReversalOfKind] ignore anything that is not a
+// reversal, so a bet does not become unreturnable the moment it pays out.
+//
+// What a caller must not leave out is a processed reversal that has since been
+// undone. Two rules read this view, and they count different things: the
+// active-reversal rule wants the one reversal still holding the reference, and
+// the per-kind rule wants every reversal of a kind that ever took effect, undone
+// or not. A view carrying only the current holder answers the first and is
+// silent on the second, which puts REFERENCE_ALREADY_REVERSED for a repeated
+// refund out of the domain's reach and leaves it to the schema alone.
 //
 // Each reversal carries whether it has itself been reversed, which is as deep
 // as this ever needs to go: a rollback cannot be reversed, and a refund can
@@ -50,8 +58,11 @@ func (v *ReferenceView) Found() bool {
 //
 // A reversal holds the reference while it is processed and has not itself been
 // reversed. Undoing a refund therefore releases the bet it returned, and the
-// bet can be refunded or rolled back again — the sequence bet, refund, rollback
-// of that refund nets to the bet standing, and leaves it reversible.
+// bet can be rolled back — the sequence bet, refund, rollback of that refund
+// nets to the bet standing, and leaves it reversible by a rollback. It does not
+// leave it refundable again: the refund that was undone still counts as a
+// successful refund of the bet, which is [ReferenceView.HasSuccessfulReversalOfKind]
+// and the rule evaluateReference asks first.
 //
 // A rollback applied directly to a bet can never be undone, so it holds the bet
 // permanently. That asymmetry is deliberate: a rollback is a provider saying an
@@ -80,6 +91,39 @@ func (v *ReferenceView) ActiveReversal() (*WagerTransaction, bool) {
 	return nil, false
 }
 
+// HasSuccessfulReversalOfKind reports whether a processed reversal of the given
+// kind already points at the reference — whether or not that reversal has
+// since been reversed itself.
+//
+// This is the brief's rule that a reference never receives two successful
+// reversals of one kind, and it is deliberately blind to release. The
+// active-reversal rule lets a rollback of a refund free the bet, and without
+// this one the bet could then be refunded a second time: BET → REFUND →
+// ROLLBACK of the refund → REFUND, two processed refunds of one bet, each
+// returning the stake. A different kind is still allowed through — the same
+// sequence followed by a ROLLBACK of the bet is the case ADR-0003 exists to
+// permit — so what is counted is the pair (reference, kind), never the
+// reference alone.
+//
+// Only reversals count, and only ones that took effect. A win pointing at the
+// bet is not a reversal of it, and a rejected or still-pending reversal
+// returned nothing. Asking about a kind that is not a reversal answers false,
+// because no such reversal can exist.
+func (v *ReferenceView) HasSuccessfulReversalOfKind(kind Kind) bool {
+	if v == nil || !kind.IsReversal() {
+		return false
+	}
+	for _, r := range v.Reversals {
+		if r.Transaction == nil || r.Transaction.Kind() != kind {
+			continue
+		}
+		if r.Transaction.Status() == Processed {
+			return true
+		}
+	}
+	return false
+}
+
 // referenceOutcome is what the reference says should happen to an operation.
 type referenceOutcome int
 
@@ -100,6 +144,13 @@ const (
 // act on, then whether the amounts agree, and only then whether history already
 // spent it. Everything about the request is settled before anything about what
 // has happened since.
+//
+// History is asked two questions, under one code. Whether a reversal of this
+// kind has already succeeded comes first, because it is the stronger claim: it
+// holds even after the earlier reversal was undone. Whether some reversal is
+// still holding the reference comes second. Both answer
+// REFERENCE_ALREADY_REVERSED, so which one refused is not something a provider
+// has to tell apart.
 func evaluateReference(cmd Command, w *Wallet, ref *ReferenceView) (referenceOutcome, failure.Code) {
 	if !cmd.namesReference() {
 		return referenceApply, ""
@@ -134,6 +185,9 @@ func evaluateReference(cmd Command, w *Wallet, ref *ReferenceView) (referenceOut
 		// operation it undoes moved.
 		if !cmd.Money.Equal(target.Money()) {
 			return referenceReject, failure.ReversalAmountMismatch
+		}
+		if ref.HasSuccessfulReversalOfKind(cmd.Kind) {
+			return referenceReject, failure.ReferenceAlreadyReversed
 		}
 		if _, held := ref.ActiveReversal(); held {
 			return referenceReject, failure.ReferenceAlreadyReversed

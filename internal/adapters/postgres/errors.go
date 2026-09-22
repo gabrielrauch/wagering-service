@@ -45,12 +45,21 @@ var ErrLostUpdate = errors.New("postgres: wallet changed under the movement")
 // own id, which exists as the reference foreign key's target and can only be
 // violated when the pair is; it is here because "whichever it checked first"
 // includes that one.
+//
+// The two reversal rules map to one sentinel for a related reason. A reference
+// is refused a second reversal either because one still holds it
+// (active_reversal_pkey) or because one of this kind already succeeded, undone
+// or not (wager_transaction_one_successful_reversal_per_kind). The domain
+// answers both with REFERENCE_ALREADY_REVERSED from the reference view, so
+// reaching either index means the same thing — the view was built wrongly —
+// and the caller has one branch for it.
 var portErrors = map[string]error{
-	"wager_transaction_provider_external_key":    app.ErrDuplicateSubmission,
-	"wager_transaction_provider_idempotency_key": app.ErrDuplicateSubmission,
-	"wager_transaction_provider_external_id_key": app.ErrDuplicateSubmission,
-	"wallet_player_currency_key":                 app.ErrWalletExists,
-	"active_reversal_pkey":                       app.ErrReferenceAlreadyReversed,
+	"wager_transaction_provider_external_key":            app.ErrDuplicateSubmission,
+	"wager_transaction_provider_idempotency_key":         app.ErrDuplicateSubmission,
+	"wager_transaction_provider_external_id_key":         app.ErrDuplicateSubmission,
+	"wallet_player_currency_key":                         app.ErrWalletExists,
+	"active_reversal_pkey":                               app.ErrReferenceAlreadyReversed,
+	"wager_transaction_one_successful_reversal_per_kind": app.ErrReferenceAlreadyReversed,
 }
 
 // transientRules are the rules whose refusal means "somebody else got there

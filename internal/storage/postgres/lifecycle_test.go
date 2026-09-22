@@ -68,7 +68,7 @@ func TestMigrationsApplyRevertAndApplyAgain(t *testing.T) {
 
 // latestVersion is the highest migration. It is written down so that adding a
 // migration without noticing is a failing test rather than a quiet change.
-const latestVersion = 9
+const latestVersion = 10
 
 // assertSchemaIsComplete checks that a fully applied schema holds what the
 // design says it holds.

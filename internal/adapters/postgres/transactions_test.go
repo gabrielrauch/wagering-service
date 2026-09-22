@@ -214,6 +214,58 @@ func TestTheReferenceViewCarriesWhateverHoldsTheReference(t *testing.T) {
 	}
 }
 
+// TestTheReferenceViewCarriesAReleasedReversalToo is what the per-kind rule
+// needs from the adapter, and what a view read from active_reversal alone
+// cannot give it.
+//
+// Rolling back a refund deletes the refund's hold on the bet rather than
+// marking it, so "what holds this bet?" answers nothing — which is right for
+// the active rule and wrong for the other one: the bet has still been refunded
+// once, successfully, and must not be refunded again. So the view carries every
+// processed reversal that resolved to the reference, and active_reversal
+// answers only whether each one still holds, which is the Reversed flag.
+func TestTheReferenceViewCarriesAReleasedReversalToo(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	w.openWallet(t, "player-released", "100.00", "BRL")
+	w.apply(t, command(t, wagering.Bet, "player-released", "ext-bet", "80.00", "BRL"), at(1))
+	refund := w.apply(t, reversingCommand(
+		command(t, wagering.Refund, "player-released", "ext-refund", "80.00", "BRL"), "ext-bet"), at(2))
+	undo := w.apply(t, reversingCommand(
+		command(t, wagering.Rollback, "player-released", "ext-undo", "80.00", "BRL"), "ext-refund"), at(3))
+
+	view := w.referenceFor(t, "acme", "ext-bet")
+	if _, held := view.ActiveReversal(); held {
+		t.Fatal("a bet whose refund was rolled back still reports a reversal holding it")
+	}
+	if len(view.Reversals) != 1 {
+		t.Fatalf("the view carries %d reversals, wanted the released refund alone", len(view.Reversals))
+	}
+	released := view.Reversals[0]
+	if released.Transaction == nil || released.Transaction.ID() != refund.Transaction.ID() {
+		t.Fatalf("the view carries %v, wanted the refund %s", released.Transaction, refund.Transaction.ID())
+	}
+	if !released.Reversed {
+		t.Fatal("the refund that was rolled back is not flagged as reversed")
+	}
+	if !view.HasSuccessfulReversalOfKind(wagering.Refund) {
+		t.Fatal("a refunded bet does not report a successful refund once the refund is undone")
+	}
+	if view.HasSuccessfulReversalOfKind(wagering.Rollback) {
+		t.Fatal("the bet reports a successful rollback it never received")
+	}
+
+	// The refund's own view: held by the rollback, which still stands.
+	view = w.referenceFor(t, "acme", "ext-refund")
+	holder, held := view.ActiveReversal()
+	if !held || holder.ID() != undo.Transaction.ID() {
+		t.Fatalf("the refund is held by %v, wanted the rollback %s", holder, undo.Transaction.ID())
+	}
+	if len(view.Reversals) != 1 || view.Reversals[0].Reversed {
+		t.Fatalf("the refund's view carries %v, wanted one standing rollback", view.Reversals)
+	}
+}
+
 // TestWakingWaitersIsScopedToTheWallet pins the rule ADR-0011 states: an
 // operation that becomes available wakes only the waiters on its own wallet.
 //

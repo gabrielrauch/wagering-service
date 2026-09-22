@@ -46,6 +46,12 @@ var uniqueRules = map[string]error{
 	// a predicate.
 	"active_reversal_pkey": app.ErrReferenceAlreadyReversed,
 
+	// And never two successful reversals of one kind, whether or not the first
+	// has since been undone. The same sentinel: both rules are refused by the
+	// domain under REFERENCE_ALREADY_REVERSED, and a caller that reached either
+	// index has the same wrongly built view to answer for.
+	"wager_transaction_one_successful_reversal_per_kind": app.ErrReferenceAlreadyReversed,
+
 	// One message, once, per consumer — and the serialisation point between two
 	// consumers that both saw it. Not a sentinel: the loser has recorded
 	// nothing and may send the work again, which errors.go says by classifying
@@ -61,7 +67,7 @@ var uniqueRules = map[string]error{
 
 	// Foreign-key targets: uniqueness the schema needs in order to point at
 	// several columns at once, and which the primary key already guarantees.
-	"wallet_identity_key":                   nil,
+	"wallet_player_key":                     nil,
 	"wager_transaction_wallet_identity_key": nil,
 
 	// A wallet has at most one opening credit, which only this system raises.
@@ -292,6 +298,72 @@ func TestASecondReversalOfOneReferenceIsRefused(t *testing.T) {
 	if got := w.count(t,
 		`SELECT count(*) FROM wagering.wager_transaction WHERE kind = 'ROLLBACK'`); got != 0 {
 		t.Fatalf("%d rollbacks survived, wanted 0", got)
+	}
+}
+
+// TestASecondSuccessfulReversalOfOneKindIsRefused proves the mapping for
+// wager_transaction_one_successful_reversal_per_kind, and reaches it the same
+// way as the test above: with a view built wrongly.
+//
+// After BET → REFUND → ROLLBACK of the refund, nothing holds the bet, so a view
+// that carries only the current holder shows the domain a free bet and a second
+// refund goes through to the row. The adapter's real view carries the refund
+// that was undone, flagged as reversed, and the domain refuses the repeat with
+// a row and an event; this test hands the processor a view that has forgotten
+// it, which is the only way to the index, and the index holds.
+func TestASecondSuccessfulReversalOfOneKindIsRefused(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	wallet := w.openWallet(t, "player-rekind", "100.00", "BRL")
+
+	bet := w.apply(t, command(t, wagering.Bet, "player-rekind", "ext-bet", "80.00", "BRL"), at(1))
+	w.apply(t, reversingCommand(
+		command(t, wagering.Refund, "player-rekind", "ext-refund", "80.00", "BRL"), "ext-bet"), at(2))
+	w.apply(t, reversingCommand(
+		command(t, wagering.Rollback, "player-rekind", "ext-undo", "80.00", "BRL"), "ext-refund"), at(3))
+	if got := w.count(t, `SELECT count(*) FROM wagering.active_reversal WHERE reference_id = $1`,
+		uuidOf(bet.Transaction.ID())); got != 0 {
+		t.Fatalf("the bet is still held %d times after its refund was rolled back", got)
+	}
+
+	again := reversingCommand(
+		command(t, wagering.Refund, "player-rekind", "ext-refund-2", "80.00", "BRL"), "ext-bet")
+	// The view the domain is given has forgotten the refund that was undone.
+	forgetful := &wagering.ReferenceView{Transaction: bet.Transaction}
+
+	err := w.tm.WithinMovement(t.Context(), func(ctx context.Context, r *app.Repos) error {
+		locked, err := r.Wallets.LockByID(ctx, wallet.ID())
+		if err != nil {
+			return err
+		}
+		tx, err := wagering.NewExternalTransaction(again, wallet.ID(), at(4))
+		if err != nil {
+			return err
+		}
+		if err := r.Transactions.Record(ctx, tx, "second-refund"); err != nil {
+			return err
+		}
+		outcome, err := processor(t).Continue(tx, again, locked, forgetful, at(4))
+		if err != nil {
+			return err
+		}
+		if outcome.Transaction.Status() != wagering.Processed {
+			t.Fatalf("the forgetful refund is %s, wanted PROCESSED", outcome.Transaction.Status())
+		}
+		return r.Settle(ctx, outcome, time.Time{})
+	})
+
+	if !errors.Is(err, app.ErrReferenceAlreadyReversed) {
+		t.Fatalf("a second refund reported %v, wanted ErrReferenceAlreadyReversed", err)
+	}
+	refusedBy(t, err, "wager_transaction_one_successful_reversal_per_kind")
+	if got := w.count(t,
+		`SELECT count(*) FROM wagering.wager_transaction WHERE kind = 'REFUND' AND status = 'PROCESSED'`); got != 1 {
+		t.Fatalf("%d processed refunds survived, wanted the first and nothing else", got)
+	}
+	if got := w.count(t, `SELECT balance_minor FROM wagering.wallet WHERE id = $1`,
+		uuidOf(wallet.ID())); got != 2000 {
+		t.Fatalf("the wallet holds %d minor units, wanted the 2000 the rolled-back refund left", got)
 	}
 }
 

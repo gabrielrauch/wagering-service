@@ -128,6 +128,43 @@ func TestApplicationCannotWriteDerivedState(t *testing.T) {
 	})
 }
 
+// TestApplicationCannotRewriteAnEvent: the application holds UPDATE on the
+// outbox because publishing is an update, and that privilege must not reach the
+// event. It is a trigger and not a column privilege that says so, because a
+// column-level grant would have to be restated every time a publisher column
+// was added — and because the owner is held to it too.
+func TestApplicationCannotRewriteAnEvent(t *testing.T) {
+	t.Parallel()
+	db := migrated(t)
+	w := newWallet(t, db, 0)
+	app := asApp(t, db)
+
+	id := wagering.NewTransactionID().String()
+	accepts(t, app, insertEvent, id, w.id, "WagerTransactionProcessed", `{"walletId":"`+w.id+`"}`, base, base)
+
+	t.Run("rewriting the payload", func(t *testing.T) {
+		refusesRule(t, app, "outbox_payload_is_a_snapshot",
+			`UPDATE wagering.outbox SET payload = '{}' WHERE event_id = $1`, id)
+	})
+
+	t.Run("rewriting the event type", func(t *testing.T) {
+		refusesRule(t, app, "outbox_payload_is_a_snapshot",
+			`UPDATE wagering.outbox SET event_type = 'WalletBalanceChanged' WHERE event_id = $1`, id)
+	})
+
+	t.Run("claiming it", func(t *testing.T) {
+		at := base.Add(time.Second)
+		accepts(t, app, claimDue, "publisher-1", at, at.Add(time.Minute), 10)
+	})
+
+	t.Run("marking it published", func(t *testing.T) {
+		accepts(t, app, `
+			UPDATE wagering.outbox SET published_at = $2,
+				claimed_by = NULL, claimed_at = NULL, claim_expires_at = NULL
+			WHERE event_id = $1`, id, base.Add(2*time.Second))
+	})
+}
+
 // TestApplicationCannotRewriteTheCatalogues: the closed sets belong to the
 // migrations, so a code or an event type appears by deployment and never at
 // runtime.
