@@ -73,7 +73,7 @@ inbox. They are three service definitions sharing a YAML anchor rather than
 port — and a port *range* binds but assigns by start order, so a demonstration
 that submits to one replica and reads back from another could not say which was
 which. Two worker replicas, which can use `deploy.replicas`, because a worker
-publishes nothing and has nothing to collide over.
+publishes no port and has nothing to collide over.
 
 The worker has no healthcheck: it serves nothing, and its start-up — the pool,
 the queue resolution, the loops — is its check. A worker that is `Up` has
@@ -137,7 +137,7 @@ service is accepting requests, and that script creates all three queues:
 
 | Queue | |
 |---|---|
-| `wager-transactions.fifo` | what the consumer reads. `MessageGroupId` is the **wallet id**; `MessageDeduplicationId` is the envelope's **messageId**. Visibility 30s, redrive to the DLQ on the fifth receipt, long polling at 20s. |
+| `wager-transactions.fifo` | what the consumer reads. `MessageGroupId` is the **wallet id**; `MessageDeduplicationId` is the envelope's **messageId**. Visibility 30s, long polling at 20s, and a redrive policy that moves a message to the DLQ when its receive count **exceeds** five — the fifth delivery is still handled, and it is when that one is spent that the message moves. |
 | `wager-transactions-dlq.fifo` | where a message goes once its five deliveries are spent. |
 | `wallet-events.fifo` | where the outbox publisher sends. `MessageGroupId` is the **aggregate id**, which is always a wallet; `MessageDeduplicationId` is the **eventId**, which is stable across republication — so a publisher killed between sending and marking the outbox row cannot put a second copy on the wire when it comes back. |
 
@@ -145,6 +145,19 @@ service is accepting requests, and that script creates all three queues:
 `messageId` is the identity the inbox keys on, and a content hash would make two
 bodies differing only in whitespace into two messages, which is the opposite of
 what the inbox says they are.
+
+The script also attaches a **resource policy** to each queue, for three IAM
+roles: `wagering-producer` may `SendMessage` on the inbound queue and nothing
+else; `wagering-worker` may receive, delete and change the visibility of
+inbound messages, send to `wallet-events.fifo`, and is the only role that may
+receive from the DLQ; `wagering-api` may only `GetQueueUrl` and
+`GetQueueAttributes` on the two live queues, for the start-up check and the
+readiness probe, and may send nowhere. No statement grants to `*` and there is
+no `Deny`. `docker-compose.yml` sets each service's `AWS_ACCESS_KEY_ID` to the
+name of its role so the intended identity is visible where the credentials
+are. LocalStack Community provisions the policy and reads it back — a test
+checks every grant — but does not enforce it, so a denied call cannot be shown
+locally; on AWS the three roles have to exist before the script runs.
 
 The script's header comment is where those choices are argued at length. To see
 what it made:
@@ -181,9 +194,9 @@ port. Against a database created for the purpose:
 ```
 $ SCRATCH='postgres://postgres:postgres@localhost:5432/wagering_migrate_demo?sslmode=disable'
 $ make migrate-up      DATABASE_URL="$SCRATCH"
-8
+10
 $ make migrate-version DATABASE_URL="$SCRATCH"
-8
+10
 $ make migrate-down    DATABASE_URL="$SCRATCH"
 0
 $ make migrate-version DATABASE_URL="$SCRATCH"
@@ -196,7 +209,11 @@ service connects as a member of `wagering_app`, which has no DDL and no `UPDATE`
 or `DELETE` on the ledger. That is why `.env.example`'s `DATABASE_URL` carries
 `options=-c%20role%3Dwagering_app` and the Makefile's does not — connecting the
 service as the owner would quietly remove half of what makes the ledger
-append-only. [`docs/schema.md`](docs/schema.md) has the grant table.
+append-only. The service checks this for itself at start-up: a process whose
+connection can `UPDATE` or `DELETE` `wagering.wallet_ledger_entry` refuses to
+start, saying *"the database connection can rewrite the ledger; connect as a
+member of wagering_app — DATABASE_URL should carry options=-c
+role=wagering_app"*. [`docs/schema.md`](docs/schema.md) has the grant table.
 
 A full revert leaves both roles standing, holding nothing in this database. That
 is ADR-0009 and not an oversight: roles are cluster-wide and a migration is
@@ -255,10 +272,10 @@ Every response below — here, in *Submitting over the queue*, and in *Grafana* 
 is from a real run of exactly these calls, against the stack `make up` brings
 up. Two things are edited, and nothing else: the bodies are wrapped to fit the
 page, and the run-scoped suffix is dropped from the identifiers a *caller* chose
-— `player-demo` was `player-demo-1790032067`, and likewise for the external ids,
+— `player-demo` was `player-demo-1790056534`, and likewise for the external ids,
 the idempotency keys and the message id. Everything the
-**service** produced — every transaction id, timestamp, status, failure code and
-balance — is as it came back.
+**service** produced — every transaction id, wallet id, timestamp, status,
+failure code and balance — is as it came back.
 
 ```
 INTERNAL=$(make token CLIENT=wallet-service)
@@ -278,32 +295,40 @@ $ curl -i -X POST http://localhost:8081/wallets \
 
 HTTP/1.1 201 Created
 Content-Type: application/json
-Location: /wallets/01a0c639-bc89-774b-9b4c-7a1de7643a09
+Location: /wallets/01a0c7af-13bb-7af5-9257-0ca1bad355bb
 X-Correlation-Id: demo-open
 
-{"walletId":"01a0c639-bc89-774b-9b4c-7a1de7643a09","playerId":"player-demo",
+{"id":"01a0c7af-13bb-7af5-9257-0ca1bad355bb","playerId":"player-demo",
  "balance":{"amount":"100.00","currency":"BRL"},"version":1,
- "createdAt":"2026-09-21T23:07:47.722729Z","updatedAt":"2026-09-21T23:07:47.722729Z",
- "opening":{"transactionId":"01a0c639-bc89-7754-999a-2134c115c377","kind":"OPENING",
+ "createdAt":"2026-09-22T05:55:34.973706Z","updatedAt":"2026-09-22T05:55:34.973706Z",
+ "opening":{"transactionId":"01a0c7af-13bb-7b00-a60e-969b2c208fc9","kind":"OPENING",
   "status":"PROCESSED","money":{"amount":"100.00","currency":"BRL"},
   "balance":{"amount":"100.00","currency":"BRL"},"idempotentReplay":false}}
 ```
 
-`opening` is the internal wager transaction that records the starting balance.
-It is absent for a wallet opened at `"0.00"`, because an opening records a
-starting balance and a wallet opened at zero has none.
+`id` is the wallet's identifier — the one every submission below names as its
+`walletId`. `opening` is the internal wager transaction that records the
+starting balance. It is absent for a wallet opened at `"0.00"`, because an
+opening records a starting balance and a wallet opened at zero has none.
+
+The currency has to be one a fixed scale of two can hold — one of the ISO 4217
+codes with two minor-unit digits. `JPY` is refused with 400
+`UNSUPPORTED_CURRENCY`, and so is a well-formed code that names nothing.
 
 ### A full BET → WIN → REFUND → ROLLBACK
 
 Four submissions, one round, on the wallet above. Each one is legal *given the
 ones before it*, and the sequence is chosen to show why: a refund reverses a
-bet, a rollback undoes a transaction, and a reference may carry only one
-**active reversal** at a time.
+bet, a rollback undoes a transaction, a reference may carry only one **active
+reversal** at a time, and it receives at most one **successful reversal of each
+kind**.
 
 Every submission carries `Idempotency-Key`. It is read from the header and
 nowhere else, is never trimmed, and is never computed from the body — deriving
 one would make every distinct payload its own key, which is the opposite of what
-the header is for.
+the header is for. Every submission also names its `walletId`: the operation is
+applied to that wallet and to no other, and a wallet that does not exist or
+that the player does not hold is one 404, with nothing recorded.
 
 **1. `BET` 25.00** — debits. `100.00 → 75.00`.
 
@@ -311,14 +336,15 @@ the header is for.
 $ curl -i -X POST http://localhost:8081/wagering/transactions \
     -H "Authorization: Bearer $PROVIDER" -H 'Content-Type: application/json' \
     -H 'Idempotency-Key: demo-key-bet' -H 'X-Correlation-Id: demo-flow' \
-    -d '{"provider":"provider-a","externalTransactionId":"demo-bet","playerId":"player-demo",
+    -d '{"providerId":"provider-a","externalTransactionId":"demo-bet","playerId":"player-demo",
+         "walletId":"01a0c7af-13bb-7af5-9257-0ca1bad355bb",
          "roundId":"demo-round","gameId":"lucky-sevens","kind":"BET",
          "money":{"amount":"25.00","currency":"BRL"}}'
 
 HTTP/1.1 200 OK
 X-Correlation-Id: demo-flow
 
-{"transactionId":"01a0c639-cccf-766c-8be6-85e750289a60","externalTransactionId":"demo-bet",
+{"transactionId":"01a0c7af-13d4-71e0-b657-f8f38cd10250","externalTransactionId":"demo-bet",
  "kind":"BET","status":"PROCESSED","money":{"amount":"25.00","currency":"BRL"},
  "balance":{"amount":"75.00","currency":"BRL"},"idempotentReplay":false}
 ```
@@ -332,14 +358,15 @@ bet — so the bet is still refundable afterwards.
 $ curl -i -X POST http://localhost:8082/wagering/transactions \
     -H "Authorization: Bearer $PROVIDER" -H 'Content-Type: application/json' \
     -H 'Idempotency-Key: demo-key-win' -H 'X-Correlation-Id: demo-flow' \
-    -d '{"provider":"provider-a","externalTransactionId":"demo-win","playerId":"player-demo",
+    -d '{"providerId":"provider-a","externalTransactionId":"demo-win","playerId":"player-demo",
+         "walletId":"01a0c7af-13bb-7af5-9257-0ca1bad355bb",
          "roundId":"demo-round","gameId":"lucky-sevens","kind":"WIN",
          "money":{"amount":"40.00","currency":"BRL"},
          "referenceExternalTransactionId":"demo-bet"}'
 
 HTTP/1.1 200 OK
 
-{"transactionId":"01a0c639-d523-77ec-b3c9-7b0ffa9a6f5e","externalTransactionId":"demo-win",
+{"transactionId":"01a0c7af-13e4-7fa3-bae8-01f1b6220e05","externalTransactionId":"demo-win",
  "kind":"WIN","status":"PROCESSED","money":{"amount":"40.00","currency":"BRL"},
  "balance":{"amount":"115.00","currency":"BRL"},"idempotentReplay":false}
 ```
@@ -352,14 +379,15 @@ bet moved: partial reversals do not exist.
 $ curl -i -X POST http://localhost:8083/wagering/transactions \
     -H "Authorization: Bearer $PROVIDER" -H 'Content-Type: application/json' \
     -H 'Idempotency-Key: demo-key-refund' -H 'X-Correlation-Id: demo-flow' \
-    -d '{"provider":"provider-a","externalTransactionId":"demo-refund","playerId":"player-demo",
+    -d '{"providerId":"provider-a","externalTransactionId":"demo-refund","playerId":"player-demo",
+         "walletId":"01a0c7af-13bb-7af5-9257-0ca1bad355bb",
          "roundId":"demo-round","gameId":"lucky-sevens","kind":"REFUND",
          "money":{"amount":"25.00","currency":"BRL"},
          "referenceExternalTransactionId":"demo-bet"}'
 
 HTTP/1.1 200 OK
 
-{"transactionId":"01a0c639-ddc3-7a55-bef6-196a89e2085f","externalTransactionId":"demo-refund",
+{"transactionId":"01a0c7af-13f8-71c1-9155-82c88799b2e5","externalTransactionId":"demo-refund",
  "kind":"REFUND","status":"PROCESSED","money":{"amount":"25.00","currency":"BRL"},
  "balance":{"amount":"140.00","currency":"BRL"},"idempotentReplay":false}
 ```
@@ -375,14 +403,15 @@ payload for good, and the answer is 422 with the failure code in the body.
 $ curl -i -X POST http://localhost:8081/wagering/transactions \
     -H "Authorization: Bearer $PROVIDER" -H 'Content-Type: application/json' \
     -H 'Idempotency-Key: demo-key-rollback-bet' -H 'X-Correlation-Id: demo-flow' \
-    -d '{"provider":"provider-a","externalTransactionId":"demo-rollback-bet","playerId":"player-demo",
+    -d '{"providerId":"provider-a","externalTransactionId":"demo-rollback-bet","playerId":"player-demo",
+         "walletId":"01a0c7af-13bb-7af5-9257-0ca1bad355bb",
          "roundId":"demo-round","gameId":"lucky-sevens","kind":"ROLLBACK",
          "money":{"amount":"25.00","currency":"BRL"},
          "referenceExternalTransactionId":"demo-bet"}'
 
 HTTP/1.1 422 Unprocessable Entity
 
-{"transactionId":"01a0c639-eadc-7dd0-a955-051f510ab872",
+{"transactionId":"01a0c7af-140a-7f7a-b7d5-53837bfd827c",
  "externalTransactionId":"demo-rollback-bet","kind":"ROLLBACK","status":"REJECTED",
  "money":{"amount":"25.00","currency":"BRL"},"failureCode":"REFERENCE_ALREADY_REVERSED",
  "idempotentReplay":false}
@@ -390,23 +419,27 @@ HTTP/1.1 422 Unprocessable Entity
 
 **4. `ROLLBACK` 25.00 of the *refund*** — undoes the refund, debiting the 25.00
 back out. `140.00 → 115.00`. This is the legal rollback, and undoing the refund
-**releases the bet**: it becomes reversible again, which is the whole reason
-"at most one reversal" is stated over *active* reversals rather than over
-reversals. A rollback can never itself be reversed, so one applied straight to a
-bet holds it permanently, while a refund can always be revisited.
+**releases the bet** — to a rollback, and to nothing else. It is reversible
+again, which is why "at most one reversal" is stated over *active* reversals
+rather than over reversals; but a second `REFUND` of it would be refused with
+the same `REFERENCE_ALREADY_REVERSED`, because a reference never receives two
+successful reversals of one kind, undone or not. A rollback can never itself be
+reversed, so one applied straight to a bet holds it permanently, while a refund
+can be revisited once.
 
 ```
 $ curl -i -X POST http://localhost:8081/wagering/transactions \
     -H "Authorization: Bearer $PROVIDER" -H 'Content-Type: application/json' \
     -H 'Idempotency-Key: demo-key-rollback' -H 'X-Correlation-Id: demo-flow' \
-    -d '{"provider":"provider-a","externalTransactionId":"demo-rollback","playerId":"player-demo",
+    -d '{"providerId":"provider-a","externalTransactionId":"demo-rollback","playerId":"player-demo",
+         "walletId":"01a0c7af-13bb-7af5-9257-0ca1bad355bb",
          "roundId":"demo-round","gameId":"lucky-sevens","kind":"ROLLBACK",
          "money":{"amount":"25.00","currency":"BRL"},
          "referenceExternalTransactionId":"demo-refund"}'
 
 HTTP/1.1 200 OK
 
-{"transactionId":"01a0c639-f58c-72eb-85c7-1562670dd246","externalTransactionId":"demo-rollback",
+{"transactionId":"01a0c7af-1416-7d17-96f0-f51e1ce649f0","externalTransactionId":"demo-rollback",
  "kind":"ROLLBACK","status":"PROCESSED","money":{"amount":"25.00","currency":"BRL"},
  "balance":{"amount":"115.00","currency":"BRL"},"idempotentReplay":false}
 ```
@@ -425,18 +458,18 @@ $ curl -X POST http://localhost:8082/wagering/transactions \
     -H "Authorization: Bearer $PROVIDER" -H 'Idempotency-Key: demo-key-bet' \
     -H 'X-Correlation-Id: demo-flow' -d '{ …the bet, byte for byte… }'
 
-{"transactionId":"01a0c639-cccf-766c-8be6-85e750289a60","externalTransactionId":"demo-bet",
+{"transactionId":"01a0c7af-13d4-71e0-b657-f8f38cd10250","externalTransactionId":"demo-bet",
  "kind":"BET","status":"PROCESSED","money":{"amount":"25.00","currency":"BRL"},
  "balance":{"amount":"75.00","currency":"BRL"},"idempotentReplay":true}
 ```
 
 **Same key, a different payload — 409.** The key is bound to the payload it was
-first used for.
+first used for. (The bet again, at `26.00`, under `demo-flow`.)
 
 ```
 {"code":"IDEMPOTENCY_PAYLOAD_CONFLICT",
  "message":"idempotency key \"demo-key-bet\" is already bound to another operation",
- "correlationId":"01a0c63f-481b-7682-ad57-b738f315dfb3"}
+ "correlationId":"demo-flow"}
 ```
 
 **A different key, the same `externalTransactionId` — 409, with no failure
@@ -447,7 +480,7 @@ occasion.
 ```
 {"code":"CONFLICT",
  "message":"operation \"demo-bet\" is already recorded under another idempotency key",
- "correlationId":"01a0c63f-4823-7b7c-b0f9-89c5e66d94aa"}
+ "correlationId":"demo-flow"}
 ```
 
 **A new key and a new operation** is the first case above, and is the only one
@@ -459,12 +492,12 @@ A provider sees its own; `internal` sees all. **A read is always 200**, whatever
 the operation came to — the read succeeded, and `status` says what was read.
 
 ```
-$ curl -i http://localhost:8081/wagering/transactions/01a0c639-cccf-766c-8be6-85e750289a60 \
+$ curl -i http://localhost:8081/wagering/transactions/01a0c7af-13d4-71e0-b657-f8f38cd10250 \
     -H "Authorization: Bearer $PROVIDER"
 
 HTTP/1.1 200 OK
 
-{"transactionId":"01a0c639-cccf-766c-8be6-85e750289a60","externalTransactionId":"demo-bet",
+{"transactionId":"01a0c7af-13d4-71e0-b657-f8f38cd10250","externalTransactionId":"demo-bet",
  "kind":"BET","status":"PROCESSED","money":{"amount":"25.00","currency":"BRL"},
  "balance":{"amount":"75.00","currency":"BRL"},"idempotentReplay":false}
 ```
@@ -481,7 +514,7 @@ $ curl -i http://localhost:8081/providers/provider-a/wagering/transactions/demo-
 
 HTTP/1.1 200 OK
 
-{"transactionId":"01a0c639-cccf-766c-8be6-85e750289a60","externalTransactionId":"demo-bet",
+{"transactionId":"01a0c7af-13d4-71e0-b657-f8f38cd10250","externalTransactionId":"demo-bet",
  "kind":"BET","status":"PROCESSED","money":{"amount":"25.00","currency":"BRL"},
  "balance":{"amount":"75.00","currency":"BRL"},"idempotentReplay":false}
 ```
@@ -493,14 +526,14 @@ external id and confirms the existence of none of them.
 ### `GET /wallets/{walletId}` — role `internal`
 
 ```
-$ curl -i http://localhost:8081/wallets/01a0c639-bc89-774b-9b4c-7a1de7643a09 \
+$ curl -i http://localhost:8081/wallets/01a0c7af-13bb-7af5-9257-0ca1bad355bb \
     -H "Authorization: Bearer $INTERNAL"
 
 HTTP/1.1 200 OK
 
-{"walletId":"01a0c639-bc89-774b-9b4c-7a1de7643a09","playerId":"player-demo",
+{"id":"01a0c7af-13bb-7af5-9257-0ca1bad355bb","playerId":"player-demo",
  "balance":{"amount":"115.00","currency":"BRL"},"version":5,
- "createdAt":"2026-09-21T23:07:47.722729Z","updatedAt":"2026-09-21T23:08:02.317963Z"}
+ "createdAt":"2026-09-22T05:55:34.973706Z","updatedAt":"2026-09-22T05:55:35.063265Z"}
 ```
 
 ### `GET /wallets/{walletId}/ledger?cursor=&limit=` — role `internal`
@@ -510,28 +543,28 @@ Oldest first, ordered by wallet version — which is an exact order, where
 The cursor is opaque and is carried through untouched.
 
 ```
-$ curl -i 'http://localhost:8081/wallets/01a0c639-bc89-774b-9b4c-7a1de7643a09/ledger?limit=3' \
+$ curl -i 'http://localhost:8081/wallets/01a0c7af-13bb-7af5-9257-0ca1bad355bb/ledger?limit=3' \
     -H "Authorization: Bearer $INTERNAL"
 
 HTTP/1.1 200 OK
 
-{"walletId":"01a0c639-bc89-774b-9b4c-7a1de7643a09","entries":[
- {"ledgerEntryId":"01a0c639-bc89-7755-b87f-4bfd9c6c577c",
-  "transactionId":"01a0c639-bc89-7754-999a-2134c115c377","direction":"CREDIT",
+{"walletId":"01a0c7af-13bb-7af5-9257-0ca1bad355bb","entries":[
+ {"id":"01a0c7af-13bb-7b01-a3fb-f9904d569f15","walletId":"01a0c7af-13bb-7af5-9257-0ca1bad355bb",
+  "transactionId":"01a0c7af-13bb-7b00-a60e-969b2c208fc9","direction":"CREDIT",
   "money":{"amount":"100.00","currency":"BRL"},"balanceBefore":{"amount":"0.00","currency":"BRL"},
   "balanceAfter":{"amount":"100.00","currency":"BRL"},"walletVersion":1,
-  "createdAt":"2026-09-21T23:07:47.722729Z"},
- {"ledgerEntryId":"01a0c639-cccf-7679-895e-f18faca22e63",
-  "transactionId":"01a0c639-cccf-766c-8be6-85e750289a60","direction":"DEBIT",
+  "createdAt":"2026-09-22T05:55:34.973706Z"},
+ {"id":"01a0c7af-13d4-71e9-afc1-ab6353b16345","walletId":"01a0c7af-13bb-7af5-9257-0ca1bad355bb",
+  "transactionId":"01a0c7af-13d4-71e0-b657-f8f38cd10250","direction":"DEBIT",
   "money":{"amount":"25.00","currency":"BRL"},"balanceBefore":{"amount":"100.00","currency":"BRL"},
   "balanceAfter":{"amount":"75.00","currency":"BRL"},"walletVersion":2,
-  "createdAt":"2026-09-21T23:07:51.889253Z"},
- {"ledgerEntryId":"01a0c639-d523-77f4-bad6-3d99056a81b3",
-  "transactionId":"01a0c639-d523-77ec-b3c9-7b0ffa9a6f5e","direction":"CREDIT",
+  "createdAt":"2026-09-22T05:55:34.997062Z"},
+ {"id":"01a0c7af-13e4-7faf-b5e8-e58262fceca8","walletId":"01a0c7af-13bb-7af5-9257-0ca1bad355bb",
+  "transactionId":"01a0c7af-13e4-7fa3-bae8-01f1b6220e05","direction":"CREDIT",
   "money":{"amount":"40.00","currency":"BRL"},"balanceBefore":{"amount":"75.00","currency":"BRL"},
   "balanceAfter":{"amount":"115.00","currency":"BRL"},"walletVersion":3,
-  "createdAt":"2026-09-21T23:07:54.022861Z"}],
- "nextCursor":"MDFhMGM2MzktYmM4OS03NzRiLTliNGMtN2ExZGU3NjQzYTA5OjM"}
+  "createdAt":"2026-09-22T05:55:35.015469Z"}],
+ "nextCursor":"MDFhMGM3YWYtMTNiYi03YWY1LTkyNTctMGNhMWJhZDM1NWJiOjM"}
 ```
 
 Pass `nextCursor` back as `cursor` for the next page. Its **absence** on the
@@ -545,20 +578,24 @@ never corrects anything.** 200 whether or not the wallet balances, because the
 check ran and the report is the answer.
 
 ```
-$ curl -i -X POST http://localhost:8081/wallets/01a0c639-bc89-774b-9b4c-7a1de7643a09/reconciliation \
+$ curl -i -X POST http://localhost:8081/wallets/01a0c7af-13bb-7af5-9257-0ca1bad355bb/reconciliation \
     -H "Authorization: Bearer $INTERNAL"
 
 HTTP/1.1 200 OK
 
-{"walletId":"01a0c639-bc89-774b-9b4c-7a1de7643a09","consistent":true,
- "stored":{"amount":"115.00","currency":"BRL"},
- "reconstructed":{"amount":"115.00","currency":"BRL"},
- "difference":{"amount":"0.00","currency":"BRL"}}
+{"walletId":"01a0c7af-13bb-7af5-9257-0ca1bad355bb",
+ "storedBalance":{"amount":"115.00","currency":"BRL"},
+ "calculatedBalance":{"amount":"115.00","currency":"BRL"},
+ "difference":{"amount":"0.00","currency":"BRL"},
+ "consistent":true,"checkedEntries":5}
 ```
 
-`difference` is stored less reconstructed and is the one signed amount on this
-contract. A finding that the stored records are wrong in a way that is not a
-mere imbalance answers 500 with the finding's own code — that is an **audit
+`storedBalance` is what the wallet row holds, `calculatedBalance` is its ledger
+summed, `difference` is stored less calculated and is the one signed amount on
+this contract, and `checkedEntries` is how many ledger entries the sum took in
+— the opening included, which is why five entries make the 115.00 above. A
+finding that the stored records are wrong in a way that is not a mere
+imbalance answers 500 with the finding's own code — that is an **audit
 failure**, addressed to an operator, and there is no payload for anybody to
 repair.
 
@@ -591,21 +628,24 @@ status with a captured body.
 ## Submitting over the queue
 
 The same use case, reached by the other door. There is no token on a queue: the
-queue *is* the authorisation boundary, and the principal is a provider principal
-minted from `data.provider`.
+queue *is* the authorisation boundary — the resource policy above says who may
+send — and the principal is a provider principal minted from `data.providerId`.
 
-The envelope's `type` has one accepted value, `WagerTransactionSubmitted`. The
-kind lives in `data.kind` exactly as it does over HTTP, so the envelope type
-names what the message *is* rather than which operation it carries, and one
-payload is not described in two places. The idempotency key is a **member** here
-where HTTP takes it in a header, because there is no header on a queue.
+The envelope's `type` has one accepted value, the specification's
+`WagerTransactionRequested`. The kind lives in `data.kind` exactly as it does
+over HTTP, so the envelope type names what the message *is* rather than which
+operation it carries, and one payload is not described in two places. The
+idempotency key is a **member** here where HTTP takes it in a header, because
+there is no header on a queue; `data.walletId` is required, exactly as over
+HTTP; and `occurredAt` is accepted with or without fractional seconds.
 
 ```
 $ cat > /tmp/body.json <<'EOF'
-{"messageId":"demo-msg-1","type":"WagerTransactionSubmitted",
- "occurredAt":"2026-09-21T23:08:22Z",
- "data":{"provider":"provider-a","externalTransactionId":"demo-queue-win",
+{"messageId":"demo-msg-1","type":"WagerTransactionRequested",
+ "occurredAt":"2026-09-22T05:55:35.000Z",
+ "data":{"providerId":"provider-a","externalTransactionId":"demo-queue-win",
          "idempotencyKey":"demo-key-queue-win","playerId":"player-demo",
+         "walletId":"01a0c7af-13bb-7af5-9257-0ca1bad355bb",
          "roundId":"demo-round","gameId":"lucky-sevens","kind":"WIN",
          "money":{"amount":"10.00","currency":"BRL"},
          "referenceExternalTransactionId":"demo-bet"}}
@@ -613,44 +653,64 @@ EOF
 
 $ docker compose exec -T localstack awslocal sqs send-message \
     --queue-url http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/wager-transactions.fifo \
-    --message-group-id 01a0c639-bc89-774b-9b4c-7a1de7643a09 \
+    --message-group-id 01a0c7af-13bb-7af5-9257-0ca1bad355bb \
     --message-deduplication-id demo-msg-1 \
     --message-body "$(cat /tmp/body.json)"
 
 {
-    "MD5OfMessageBody": "c63edf98076f8b28e881982746bab198",
-    "MessageId": "768f8975-ce50-4d9c-b07f-dc5dcad716c1",
-    "SequenceNumber": "15376227406398358470"
+    "MD5OfMessageBody": "b9127a91a5af561fca9349382416c5f1",
+    "MessageId": "3b61622e-4b5e-43ed-b643-bb3558636600",
+    "SequenceNumber": "15376468551632158722"
 }
 ```
 
-`--message-group-id` is the **wallet id** and `--message-deduplication-id` is
-the envelope's own `messageId`. Both are required: the queues have
-`ContentBasedDeduplication` off, and the adapter refuses a send that omits
-either.
+`--message-group-id` is the **wallet id** — the same value as `data.walletId` —
+and `--message-deduplication-id` is the envelope's own `messageId`. Both are
+required: the queues have `ContentBasedDeduplication` off, and the adapter
+refuses a send that omits either.
 
 A second or so later, the worker says so — the consumer's own line, which
-carries the queue's `receiveCount` and whether this was a replay:
+carries the queue's `receiveCount`, the operation's identity, and whether this
+was a replay:
 
 ```
 $ docker compose logs worker --since 3m | grep demo-msg-1
 
-worker-1  | {"time":"2026-09-21T23:08:22.816137674Z","level":"INFO",
+worker-1  | {"time":"2026-09-22T05:55:35.598869094Z","level":"INFO",
  "msg":"the operation was applied","service":"wagering","consumer":"wager-consumer",
- "queueMessageId":"768f8975-ce50-4d9c-b07f-dc5dcad716c1","receiveCount":1,
+ "queueMessageId":"3b61622e-4b5e-43ed-b643-bb3558636600","receiveCount":1,
  "correlationId":"demo-msg-1","messageId":"demo-msg-1",
- "transactionId":"01a0c63a-4595-7c38-92c1-da80d68ebb64","kind":"WIN","status":"PROCESSED",
- "failureCode":"","replay":false,"traceId":"0f19f45dec87e96e3480bd88c3afa35e",
- "spanId":"1ae5ba2f74e5f592"}
+ "transactionId":"01a0c7af-1625-7eda-bffc-4d8aca8cc8d1",
+ "walletId":"01a0c7af-13bb-7af5-9257-0ca1bad355bb","providerId":"provider-a",
+ "kind":"WIN","status":"PROCESSED","failureCode":"","replay":false,
+ "traceId":"98fd2ae42fe92a8ae57d97cfc658d609","spanId":"ad5b7872038948b6"}
 ```
 
-and the operation reads back over HTTP exactly as an HTTP-submitted one does:
+The API writes the counterpart line for a submission it answered over HTTP —
+the same identifiers, `"msg":"the operation was answered"` and
+`"source":"http"` — so an operation is found in the logs by correlation,
+transaction, wallet or provider whichever door it came in by. The bet at the top
+of the flow left this one on `api-1`:
+
+```
+api-1-1  | {"time":"2026-09-22T05:55:34.999967219Z","level":"INFO",
+ "msg":"the operation was answered","service":"wagering","source":"http",
+ "correlationId":"demo-flow","transactionId":"01a0c7af-13d4-71e0-b657-f8f38cd10250",
+ "walletId":"01a0c7af-13bb-7af5-9257-0ca1bad355bb","providerId":"provider-a",
+ "kind":"BET","status":"PROCESSED","failureCode":"","replay":false,
+ "traceId":"4b150f84225975bac162c1d578a0d6b9","spanId":"aaa8dc450e1a4e7e"}
+```
+
+Neither line carries an amount, a balance or a player: those are a financial
+payload, and a log is not where one belongs.
+
+The operation reads back over HTTP exactly as an HTTP-submitted one does:
 
 ```
 $ curl http://localhost:8081/providers/provider-a/wagering/transactions/demo-queue-win \
     -H "Authorization: Bearer $INTERNAL"
 
-{"transactionId":"01a0c63a-4595-7c38-92c1-da80d68ebb64",
+{"transactionId":"01a0c7af-1625-7eda-bffc-4d8aca8cc8d1",
  "externalTransactionId":"demo-queue-win","kind":"WIN","status":"PROCESSED",
  "money":{"amount":"10.00","currency":"BRL"},"balance":{"amount":"125.00","currency":"BRL"},
  "idempotentReplay":false}
@@ -658,7 +718,15 @@ $ curl http://localhost:8081/providers/provider-a/wagering/transactions/demo-que
 
 `115.00 + 10.00 = 125.00`. One operation, one wallet, whichever door it came in
 by — which `TestOneOperationOverHTTPAndOverTheQueueSettlesOnceInEitherOrder`
-proves for the same operation arriving over **both**, in either order.
+proves for the same operation arriving over **both**, in either order, and
+`TestOneOperationSubmittedOverHTTPAndTheQueueAtTheSameTimeSettlesOnce` for both
+arriving at the same moment.
+
+A message the consumer cannot read — not a JSON envelope, a `type` it does not
+handle, a member the envelope does not have, a `messageId` already handled with
+a different body — is never applied and never touched: one ERROR line with the
+queue's message id, the receive count and the failure class, and the redrive
+policy moves it to the DLQ once its five deliveries are spent.
 
 ---
 
@@ -704,24 +772,28 @@ query here has to know about.
 
 Every span carries `correlationId` — the value `X-Correlation-Id` echoes, the
 error body returns, and every log line names. Every submission above went in
-under `demo-flow` — the four that moved money, the one that was refused, and the
-replay — so:
+under `demo-flow` — the four that moved money, the one that was refused, the
+replay, and the two conflicts — so:
 
 ```
 $ make trace CORRELATION=demo-flow
 
 {"traces":[
- {"traceID":"d27307a5c2bc512f813832e59f6a915a","rootServiceName":"wagering",
-  "rootTraceName":"POST /wagering/transactions","durationMs":2, …},
- {"traceID":"34533739c8469d7a3d5310242c55dd6a", … "durationMs":479, …},
+ {"traceID":"8d1f93108776c182201975bba333b71e","rootServiceName":"wagering",
+  "rootTraceName":"POST /wagering/transactions","durationMs":1, …},
+ {"traceID":"849d3b91907fb3c682640779c1719f2", …},
+ …
+ {"traceID":"a876f1c85e5612b5c48418ec6ac8b17b", … "durationMs":2980, …},
  …
 ]}
 ```
 
-six traces, one per submission, each between 7 and 18 spans — the HTTP request,
-the use case, the SQL transaction, and the wallet events the outbox publisher
-put on the queue **seconds later, in another container**. They are in the same
-trace because that is where the event came from.
+eight traces, one per request, each between 7 and 18 spans — the HTTP request,
+the use case, the SQL transaction, and for the ones that moved money the wallet
+events the outbox publisher put on the queue **seconds later, in another
+container**. They are in the same trace because that is where the event came
+from, which is also why `durationMs` runs to seconds on those: it spans from
+the request to the publisher's turn, not the request alone.
 
 In a browser it is *Explore* → the **Tempo** datasource → the **TraceQL** tab.
 The query, the same query over `.transactionId` / `.walletId` / `.providerId` /
@@ -738,14 +810,15 @@ its correlation — `make trace CORRELATION=demo-msg-1` finds the one above.
 
 ```
 go vet ./...                             # under a second
-go test ./...                            # ~10s   — needs Docker
-go test -race ./...                      # ~11s   — needs Docker
-go test -race -tags integration ./...    # ~57s   — ten containers
-go test -race -tags multi ./...          # ~51s   — starts the compose stack itself
+go test ./...                            # about 10s     — one PostgreSQL, or skips without one
+go test -race ./...                      # about 11s     — the same
+go test -race -tags integration ./...    # about 60s     — ten containers
+go test -race -tags multi ./...          # 65 to 85s     — starts the compose stack itself
 ```
 
-Wall clock, measured on this tree on 8 CPUs with the images pulled, the compose
-stack already healthy and the build cache warm. `make test`, `make test-race`,
+Approximate wall clock, measured on this tree on 8 CPUs with the images pulled,
+the compose stack already healthy and the build cache warm; `Makefile` and
+`internal/multi/doc.go` carry the same numbers. `make test`, `make test-race`,
 `make test-integration` and `make test-multi` are the same commands with
 `-count=1` where it matters.
 
@@ -760,37 +833,41 @@ so `go test` returns while the daemon is still deleting; the `multi` suite is
 Compose's, and expects to own its project's containers and network from the
 first command. The second `up` lands in the middle of the first suite's
 teardown. Leave a few seconds between them, or run them in separate steps —
-which is what `make test-integration` and `make test-multi` are for. CI runs
-the untagged and `integration` suites as two separate steps and so never meets
-this; it does not run the `multi` suite at all, because that suite brings up
-Compose and the workflow has no Docker Compose stage. Running it is a local
-step today.
+which is what `make test-integration` and `make test-multi` are for. CI never
+meets this: the untagged and `integration` suites are two steps of one job,
+and `make test-multi` runs in a job of its own on a runner with Docker Compose,
+which takes the stack down afterwards whatever happened.
 
-**`go test ./...` already needs Docker.** `internal/storage/postgres` runs its
-schema-conformance suite against a real PostgreSQL 16 through testcontainers,
-with no build tag, because there is nothing to conform to without one.
-`TEST_DATABASE_URL` points it at an existing cluster instead.
+**`go test ./...` wants Docker, and skips without it.** `internal/storage/postgres`
+runs its schema-conformance suite against a real PostgreSQL 16 through
+testcontainers, with no build tag, because there is nothing to conform to
+without one. When no cluster can be started the suite **skips** and the run is
+green with the schema never checked — Docker is a prerequisite for coverage,
+not for passing. `TEST_DATABASE_URL` points it at an existing cluster instead,
+which is what CI does, so that the skip cannot happen there.
 
 | Tag | What it adds | What it needs |
 |---|---|---|
-| *(none)* | The domain, the application layer, every adapter's unit tests, the composition root's wiring, and the schema-conformance suite. | Docker (one PostgreSQL). |
+| *(none)* | The domain, the application layer, every adapter's unit tests, the composition root's wiring, and the schema-conformance suite. | Docker (one PostgreSQL), or the suite skips. |
 | `integration` | `internal/adapters/postgres` against the real schema, `internal/adapters/sqs` against LocalStack, `internal/messaging` for the queue path, `internal/integration` for the authenticated HTTP path and `internal/fxmod` for the whole graph — the last two against a real Keycloak running **this repository's own realm**. | Docker. Ten containers: five PostgreSQL, three LocalStack, two Keycloak — plus testcontainers' own reaper. |
-| `multi` | `internal/multi` — three API instances and two workers, with independent connections and independent memory, against one database and one set of queues. Ten scenarios: four drive the compose replicas themselves, and six build a world of their own — a database, three FIFO queues, and processes this suite starts, arms with `FAULT_POINT`, kills and replaces. | Docker, and it brings the compose stack up itself. |
+| `multi` | `internal/multi` — three API instances and two workers, with independent connections and independent memory, against one database and one set of queues. Fourteen scenarios: seven drive the compose replicas themselves — two of them pause PostgreSQL and then LocalStack with `docker compose pause` and watch the deployment answer without them and recover — and seven build a world of their own — a database, three FIFO queues, and processes this suite starts, arms with `FAULT_POINT`, kills and replaces. | Docker, and it brings the compose stack up itself. |
 
 No mock, fake or in-memory substitute stands in for PostgreSQL, SQS or Keycloak
-in any of them. Ordering, deadlock-freedom, `SKIP LOCKED` and the deferred
-COMMIT-time triggers are container tests or nothing, and the unit tests say so
-rather than pretending to cover them.
+in the container suites. Ordering, deadlock-freedom, `SKIP LOCKED` and the
+deferred COMMIT-time triggers are container tests or nothing, and the untagged
+unit suites — which fake the application layer's *ports*, since that is what
+the ports are for — say so rather than pretending to cover them.
 
 The `multi` suite needs nothing started first: it runs `docker compose up
 --build --detach --wait` itself, which is idempotent and costs about two seconds
 against a stack that is already healthy, then builds `cmd/api` and `cmd/worker`
 with the race detector — because the binaries it drives are the thing under
-test. The package itself takes **43 to 46 seconds** warm, of which the ten
-scenarios are about thirty; the `./...` figure above is that plus every other
-package's tests. Budget about ninety seconds when Compose has to rebuild an
-image, which it does on any run where a file the `Dockerfile` copies has
-changed, and three minutes from nothing at all.
+test. Budget sixty-five to eighty-five seconds for the `./...` run warm, with
+the fourteen scenarios about a minute of that; the spread is one delivery to
+the deployment's own queue that LocalStack occasionally swallows and returns
+only at the thirty-second visibility timeout. Budget about ninety seconds when
+Compose has to rebuild an image, which it does on any run where a file the
+`Dockerfile` copies has changed, and three minutes from nothing at all.
 `internal/multi/doc.go` breaks that down.
 
 ```
@@ -802,6 +879,22 @@ make vuln     # govulncheck
 
 `make check` uses `test-race` rather than `test`, because the race detector is
 the part of this gate that finds what review does not.
+
+### Simulating a failure by hand
+
+The recovery scenarios kill a real process at a named instant, and the same
+instants are available to a worker you start yourself: `FAULT_POINT=<point> go
+run ./cmd/worker` writes one line to standard error and exits with status 99
+the moment it reaches that point. Five points exist — `after_commit_before_ack`,
+`after_claim_before_publish`, `after_publish_before_mark`,
+`after_pending_commit` and `before_commit` — and the `FAULT_POINT` block in
+[`.env.example`](.env.example) says what each one proves and what to watch for
+afterwards. `before_commit` fires on every movement transaction, including one
+that wrote nothing, so a worker armed with it runs the consumer alone:
+`FAULT_POINT=before_commit REFERENCE_WORKER_ENABLED=false
+PUBLISHER_ENABLED=false go run ./cmd/worker`. The points are on the production
+path — not behind a flag, not behind a build tag — and inert unless the variable
+names one of them.
 
 ---
 
@@ -817,5 +910,5 @@ the part of this gate that finds what review does not.
 | `internal/telemetry` | The logger and the instruments every component reports through. |
 | `internal/{integration,messaging,multi}` | The suites that cross packages, each in a package of its own so that a failure's first question — *whose fault?* — is not answered wrongly by where the file lives. |
 | `cmd/{api,worker,migrate}` | Three binaries. |
-| `migrations/` | Eight migrations, embedded in `cmd/migrate`. |
+| `migrations/` | Ten migrations, embedded in `cmd/migrate`. |
 | `deploy/` | Keycloak's realm, LocalStack's queues, and the observability stack's configuration. |

@@ -196,9 +196,10 @@ func TestAnExpiredClaimIsTakenUpByAnotherPublisher(t *testing.T) {
 // the deduplication id SQS is given, so a publisher that sent an event and died
 // before marking the row puts no second copy on the queue when it comes back.
 // That state — on the wire, unmarked — is reproduced here by putting the rows
-// back, because the only other way into it is killing the process at the fault
-// point the production path marks, and the machinery for that belongs to a
-// later task.
+// back. The other way into it is killing the process at the fault point the
+// production path marks, faults.AfterPublishBeforeMark, which is what
+// internal/multi/publishers_test.go does with a real binary; this suite holds
+// the same guarantee without a process to kill, on the adapter's own path.
 func TestPublishedEventsKeepTheirEventIdAcrossRepublication(t *testing.T) {
 	t.Parallel()
 

@@ -199,7 +199,7 @@ func TestRunTellsACleanShutdownFromOneThatLeftWorkBehind(t *testing.T) {
 			// context, because a cancellation that lands while Fx is still
 			// running OnStart hooks fails the START — which is a different
 			// exit code and not the one under test. The signal path is proved
-			// end to end by TestRunCarriesTheWorkerFromTheEnvironmentToACleanExit.
+			// end to end by TestRunCarriesTheAPIFromTheEnvironmentToACleanExit.
 			graph := func(config.Config) fx.Option {
 				return fx.Options(
 					fx.StopTimeout(5*time.Second),

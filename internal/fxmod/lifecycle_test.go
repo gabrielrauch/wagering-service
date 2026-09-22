@@ -610,16 +610,18 @@ func reach(t *testing.T, url string) error {
 	return nil
 }
 
-// TestRunCarriesTheWorkerFromTheEnvironmentToACleanExit is the only test that
-// drives a binary the way its main does.
+// TestRunCarriesTheAPIFromTheEnvironmentToACleanExit is the only test that
+// drives a binary the way its main does, and the binary it drives is cmd/api.
 //
 // Everything else here builds a graph from a config.Config; this reads the
-// environment, builds the graph, starts it against the containers, waits for
-// the signal a deployment sends, drains and reports an exit code. What it pins
-// is that those six steps join up — the exit code a supervisor sees for a clean
-// shutdown is zero, and it is zero because every drain finished rather than
-// because nothing checked.
-func TestRunCarriesTheWorkerFromTheEnvironmentToACleanExit(t *testing.T) {
+// environment, builds the API graph, starts it against the containers, waits
+// for the signal a deployment sends, drains and reports an exit code. What it
+// pins is that those six steps join up — the exit code a supervisor sees for a
+// clean shutdown is zero, and it is zero because every drain finished rather
+// than because nothing checked. The worker's graph goes through the same Run
+// and is held by the tests above; it is not the one driven here, for the
+// reason the first comment in the body gives.
+func TestRunCarriesTheAPIFromTheEnvironmentToACleanExit(t *testing.T) {
 	requireDatabase(t)
 	requireQueues(t)
 

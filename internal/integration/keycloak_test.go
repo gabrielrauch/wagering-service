@@ -92,12 +92,12 @@ var (
 // than a fixture of this suite's, so that the realm under test is the artefact
 // that ships and not a copy of it that could drift.
 //
-// deploy/ holds that file and nothing else today: the compose service that is
-// to import it automatically belongs to a later task and does not exist yet.
-// Until it does, this suite is the only thing that imports the export, and the
-// arguments below — the command, the import path, the bootstrap administrator
-// — are the shape that service will need rather than a description of one that
-// is already written.
+// docker-compose.yml's keycloak service imports the same file the same way —
+// `start-dev --import-realm`, the export mounted under
+// /opt/keycloak/data/import, the bootstrap administrator from the environment —
+// so the arguments below are that service restated for a container this suite
+// owns, on a port testcontainers chooses, rather than a second description of
+// how the realm is loaded.
 func startKeycloak(ctx context.Context) (testcontainers.Container, error) {
 	export, err := repositoryFile("deploy", "keycloak", "realm-export.json")
 	if err != nil {

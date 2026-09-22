@@ -54,10 +54,11 @@ type Authenticator interface {
 // ReadinessCheck reports whether one dependency this process needs is
 // answering. A nil error is ready.
 //
-// *postgres.Health satisfies it. The queue's equivalent does not exist yet, so
-// readiness takes a set of named checks and lets the composition root say what
-// is in it — an adapter that invented a queue client in order to probe one
-// would be guessing at a contract another task owns.
+// *postgres.Health satisfies it, and so does the composition root's
+// queueReadiness in internal/fxmod, which asks the outbound queue for its
+// attributes. Readiness takes a set of named checks and lets the composition
+// root say what is in it, so this package never has to know how a dependency
+// is probed — only that it answers.
 type ReadinessCheck interface {
 	Ready(ctx context.Context) error
 }

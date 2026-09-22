@@ -12,17 +12,17 @@ schema in detail. [`README.md`](README.md) is how to run it.
 | [Idempotency](#idempotency) | the key, the hash, and the four answers |
 | [The state machine](#the-state-machine) | the statuses, and what counts as transient |
 | [Pending references](#pending-references) | the wait budget and how parked work is carried forward |
-| [Reversals](#reversals) | the single-reversal rule, and every combination |
-| [The inbox and the outbox](#the-inbox-and-the-outbox) | claims, backoff, recovery |
-| [SQS](#sqs) | the queues' parameters, and the ordering they buy |
+| [Reversals](#reversals) | the two reversal rules, and every combination |
+| [The inbox and the outbox](#the-inbox-and-the-outbox) | claims, backoff, the five fault points |
+| [SQS](#sqs) | the queues' parameters, the ordering they buy, the three roles, the outbound contract |
 | [Authentication and authorisation](#authentication-and-authorisation) | the model, and why Keycloak |
 | [Composition and shutdown](#composition-and-shutdown) | Fx, start-up checks, the stop order |
 | [The HTTP API](#the-http-api) | the status table, and every endpoint with a captured body |
 | [Observability](#observability) | the dashboard, the metric catalogue, finding a trace |
 | [Failure codes](#failure-codes) | twenty-five codes on two axes |
-| [Interpretations](#interpretations) | forty-five decisions taken where the specification was absent |
+| [Interpretations](#interpretations) | where the contracts depart from the specification, and forty-five decisions taken where it is silent |
 | [Limitations](#limitations) | what is bounded, and by what |
-| [Not completed](#not-completed) | nothing, and the evidence for saying so |
+| [Not completed](#not-completed) | what is not here by decision, and the exposure that remains |
 
 ## Money
 
@@ -42,7 +42,7 @@ the middle.
 |---|---|
 | Representable range | −92,233,720,368,547,758.08 to 92,233,720,368,547,758.07 |
 | Accepted input | `(0\|[1-9][0-9]*)\.[0-9]{2}` — one spelling per value |
-| Currency | `^[A-Z]{3}$`, against **no list of any kind** |
+| Currency | `^[A-Z]{3}$`, **and** on the list of ISO 4217 codes whose minor unit is two digits |
 
 `"25"`, `"25.0"`, `"25.000"`, `"25."`, `".25"`, `"007.00"`, `"+25.00"`,
 `"-25.00"`, `" 25.00 "`, `"1e2"`, `"NaN"`, `"Infinity"` and any non-ASCII digit
@@ -73,18 +73,27 @@ to write an amount would eventually write one of them the wrong way.
 two-exponent: JPY, KRW, VND, CLP, ISK and the African franc family carry no
 minor unit at all, the Gulf dinars carry three, and CLF and UYW carry four —
 roughly a tenth of the standard cannot be held faithfully at scale 2.
-**Currencies whose exponent is not 2 are out of scope.** Opening a `JPY` wallet
-would succeed and would misrepresent every amount in it by a factor of a
-hundred. No allowlist is kept, and that is the point rather than an omission: a
-list would imply currencies can be added, and most cannot — supporting them
-means a per-currency scale, which changes parsing, rendering, the limits and
-the persisted representation. ADR-0001 records the two alternatives and why
-neither was taken.
+**Currencies whose exponent is not 2 are out of scope, and they are refused at
+the boundary.** `money.ParseCurrency` accepts a code only when it is three
+uppercase ASCII letters *and* appears on its list of the 134 ISO 4217 codes
+whose minor unit is exactly two digits; opening a `JPY` wallet fails with
+`UNSUPPORTED_CURRENCY`, and so do `KWD`, `CLF`, the fund codes, and a
+well-formed code that names nothing such as `ABC` or `XXX`. The list is not a
+list of currencies an operator chose to support — it is exactly the set a fixed
+scale of two can hold faithfully, so nothing can be added to it that the scale
+does not already serve, and supporting anything off it still means a
+per-currency scale, which changes parsing, rendering, the limits and the
+persisted representation. The database's `currency_code` domain stays
+form-only, because a list kept in two places drifts; the domain type is the
+gate and the schema is the coarser net. ADR-0001 records the two alternatives,
+why neither was taken at first, and the amendment that explains why the list
+resolves the original objection to keeping one rather than overruling it.
 
 What the type does carry is the currency. Arithmetic and comparison refuse to
-cross currencies, a wallet is identified by player **and** currency, and every
-movement must match its wallet — so the model never assumes BRL even though only
-BRL flows through it.
+cross currencies, a player holds at most one wallet per currency, and every
+movement must match the currency of the wallet the submission names — a
+mismatch is settled as a `CURRENCY_MISMATCH` rejection — so the model never
+assumes BRL even though only BRL flows through it.
 
 ## The write path
 
@@ -179,13 +188,17 @@ rows.
 
 Three mechanisms stop a balance being computed from a value that has moved:
 
-1. **The row lock.** `LockForMovement` / `LockByID` take `FOR NO KEY UPDATE` on
-   the wallet before its balance is read and before the domain is asked anything,
-   so concurrent movements on one wallet queue rather than interleave. The inbox
-   and the two idempotency lookups run ahead of it, exactly as the order above
-   says, and none of them reads a balance. It is an explicit operation rather than
-   something a repository does on the way past, because *where* in the
-   transaction the lock is taken is the whole of the concurrency design.
+1. **The row lock.** `LockByID` takes `FOR NO KEY UPDATE` on the wallet before
+   its balance is read and before the domain is asked anything, so concurrent
+   movements on one wallet queue rather than interleave. The submission path
+   locks the wallet the body's `walletId` names, and the resume worker the one
+   its parked row names; `LockForMovement`, which finds a wallet by player and
+   currency, remains on the port for a caller that knows no id and is used by no
+   use case. The inbox and the two idempotency lookups run ahead of the lock,
+   exactly as the order above says, and none of them reads a balance. It is an
+   explicit operation rather than something a repository does on the way past,
+   because *where* in the transaction the lock is taken is the whole of the
+   concurrency design.
 2. **The version condition.** The wallet update is conditioned on the version it
    was read at, and the settle door writes the wallet before the ledger entry so
    that the version-conditioned update is the first gate on a stale balance and
@@ -200,6 +213,18 @@ Three mechanisms stop a balance being computed from a value that has moved:
    — and the unique index is unreachable serially, since the chain always demands
    the next version and the next version is by definition free, so it is purely a
    concurrency guard.
+
+The wager transaction's foreign key into `wallet` is `(wallet_id, player_id)`,
+so a row can never book one player's operation against another player's
+wallet. The currency is deliberately **not** in that key since migration
+`000009`: a provider names the wallet it addresses and may pay in a currency
+it does not hold, and the domain settles that as a `REJECTED`
+`CURRENCY_MISMATCH` row carrying the currency the provider asked for — which
+has to be storable to be a rejection at all. What the three-column key used to
+say about processed rows is now the trigger
+`wager_transaction_processed_in_wallet_currency` (`000010`): a `PROCESSED` row
+is in its wallet's currency, and a `REJECTED`, `PENDING` or `PENDING_REFERENCE`
+row may not be.
 
 **The resume worker obeys the same order, which is why it finds its work with a
 plain `SELECT` that takes no row lock.** Claiming the parked row first and then
@@ -243,22 +268,25 @@ ASCII order, no insignificant whitespace:
 ```json
 {"externalTransactionId":"…","gameId":"…","kind":"BET",
  "money":{"amount":"25.00","currency":"BRL"},
- "playerId":"…","provider":"…",
- "referenceExternalTransactionId":"…","roundId":"…"}
+ "playerId":"…","providerId":"…",
+ "referenceExternalTransactionId":"…","roundId":"…","walletId":"…"}
 ```
 
-**Included:** `provider`, `externalTransactionId`, `kind`, `money`, `playerId`,
-`roundId`, `gameId`, and `referenceExternalTransactionId` when the operation
-names one. The reference key is **omitted entirely** when there is none, rather
+**Included:** `providerId`, `externalTransactionId`, `kind`, `money`,
+`playerId`, `walletId`, `roundId`, `gameId`, and
+`referenceExternalTransactionId` when the operation names one. The wallet id is
+among them because the provider submits it: it is the wallet the operation
+addresses, and two submissions naming different wallets are two different
+operations. The reference key is **omitted entirely** when there is none, rather
 than emitted as `null`, so that "no reference" has one representation.
 
 **Excluded:** the idempotency key itself — the hash exists to decide whether one
 key has been reused for two different operations, and including it would make
-every submission trivially unique. The wallet id, because it is derived from the
-player and currency rather than submitted. And all transport metadata:
-timestamps, correlation and causation ids, queue message ids, headers, delivery
-counts, retry attempts. None of them says anything about what the provider asked
-for.
+every submission trivially unique. The identifiers this system mints for the
+transaction and the ledger entry, which say nothing about what was asked for.
+And all transport metadata: timestamps, correlation and causation ids, queue
+message ids, headers, delivery counts, retry attempts. None of them says
+anything about what the provider asked for.
 
 Strings are escaped minimally per RFC 8259 — quote, backslash and the control
 characters — with no HTML escaping and no `\u` encoding of anything else. Every
@@ -344,7 +372,7 @@ and there is no moment at which the opening is awaiting anything.
 
 | Status | |
 |---|---|
-| `PENDING` | recorded, processing not finished. **Never committed**: `Record` writes it and the same transaction goes on to settle or park it, so a committed row is never `PENDING`. |
+| `PENDING` | recorded, processing not finished. **Never committed**: `Record` writes it and the same transaction goes on to settle or park it, so a committed row is never `PENDING`. The schema admits one — `PENDING` is a known status and nothing refuses committing it — and no worker resumes one; the guarantee is the single-transaction control flow, not a constraint. |
 | `PENDING_REFERENCE` | waiting for the transaction it points at. The only non-terminal status ever committed, and it is **always** written with a schedule — `wager_transaction_only_waiting_is_scheduled` is an equivalence in the schema, which is why one statement writes both. |
 | `PROCESSED` | completed. Terminal. |
 | `REJECTED` | a business rule settled it. Terminal. |
@@ -398,12 +426,18 @@ anybody has established is safe to repeat.
 **In the consumer**, where the decision is whether a message is worth another
 delivery, `app.Retryable` is the obvious one and `app.NotFound` is the
 interesting one. The only way this system produces `NotFound` on that path is a
-submission for a player who holds no wallet in that currency: nothing is
-persisted, the key is still free, and the same message succeeds unchanged once
-the wallet is opened. Sending it straight to the dead-letter queue would turn an
-ordering race between opening a wallet and the first operation on it into an
-operator's morning. It stays bounded — the redrive policy ends the message after
-its five deliveries, exactly as it would have. **Everything else is permanent,
+submission naming a wallet that does not exist **or that the player does not
+hold** — the two are one answer, *"no wallet `<id>` for player `<playerId>`"*,
+so that a submission cannot be used to learn whether a wallet exists or whose
+it is. Nothing is persisted, the key is still free, and the same message
+succeeds unchanged once the wallet is opened. Sending it straight to the
+dead-letter queue would turn an ordering race between opening a wallet and the
+first operation on it into an operator's morning. It stays bounded — the
+redrive policy ends the message after its five deliveries, exactly as it would
+have, which is also where a message that named somebody else's wallet ends. The
+neighbouring outcome is *not* transient: a wallet the player holds whose
+currency is not the money's is settled as a `REJECTED` `CURRENCY_MISMATCH` row
+with a `WagerTransactionRejected` event. **Everything else is permanent,
 including every business refusal** — and those are not failures at all: a
 rejection is an outcome with a row and an event behind it, and it never reaches
 that function.
@@ -430,7 +464,7 @@ whether the amounts agree, and only then whether history has already spent it.
 | `PROCESSED`, but disagreeing on provider, player, wallet, currency or round | **reject**: `REFERENCE_MISMATCH` |
 | `PROCESSED`, wrong kind for this reversal | **reject**: `REFERENCE_NOT_REVERSIBLE` |
 | `PROCESSED`, a reversal of a different amount | **reject**: `REVERSAL_AMOUNT_MISMATCH` — partial reversals do not exist |
-| `PROCESSED` and already actively reversed | **reject**: `REFERENCE_ALREADY_REVERSED` |
+| `PROCESSED` and already actively reversed, or already the reference of a successful reversal of this kind | **reject**: `REFERENCE_ALREADY_REVERSED` |
 | `PROCESSED`, and a **`WIN`** naming anything that is not a `BET` | **reject**: `REFERENCE_MISMATCH` |
 | `PROCESSED` and agreeing | **apply** |
 
@@ -438,6 +472,10 @@ whether the amounts agree, and only then whether history has already spent it.
 `REFERENCE_ALREADY_REVERSED` are the reversal branch, asked in that order. The
 `WIN` branch has exactly one check of its own — the reference must be a bet —
 because a win need not match the stake and does not hold what it points at.
+`TestReferenceMustAgreeOnEveryField` walks the five fields of the agreement
+check one at a time, and `TestAReversalOnAnotherWalletOfTheSamePlayerIsAMismatch`
+pins the one that is easiest to get wrong now that a submission names its
+wallet: the same player, another of their wallets, is a mismatch.
 
 ### The wait budget
 
@@ -543,49 +581,77 @@ Starting from a processed `BET` of 25.00 on a wallet opened at 100.00:
 | `BET → REFUND` | the stake is back; the refund now holds the bet | 100.00 |
 | `BET → REFUND → REFUND` | **rejected** `REFERENCE_ALREADY_REVERSED` — the same 25.00 twice | 100.00 |
 | `BET → REFUND → ROLLBACK` *of the bet* | **rejected** `REFERENCE_ALREADY_REVERSED`, for the same reason | 100.00 |
-| `BET → REFUND → ROLLBACK` *of the refund* | the refund is undone, the bet stands debited — **and is reversible again** | 75.00 |
+| `BET → REFUND → ROLLBACK` *of the refund* | the refund is undone, the bet stands debited — **and is reversible again, by a rollback** | 75.00 |
 | `… → ROLLBACK` *of the bet*, now | applied; the bet is held permanently | 100.00 |
+| `… → REFUND` *of the bet*, now | **rejected** `REFERENCE_ALREADY_REVERSED` — the bet has already received a successful refund, undone or not | 75.00 |
 | `BET → ROLLBACK` *of the bet* | applied; the bet is held permanently, because a rollback cannot be reversed | 100.00 |
-| `BET → REFUND → ROLLBACK → REFUND → …` | unbounded, each pair netting zero | alternates |
 | `BET → REFUND` of 20.00 | **rejected** `REVERSAL_AMOUNT_MISMATCH` | 75.00 |
 | `REFUND` of a `WIN` | **rejected** `REFERENCE_NOT_REVERSIBLE` — a refund returns a bet and nothing else | — |
 | `ROLLBACK` of a `ROLLBACK` | **rejected** `REFERENCE_NOT_REVERSIBLE` | — |
 
-The unbounded case is not capped. Every step is individually valid, audited, and
-leaves the balance correct; a cap would be a number with no business meaning.
+The chain is therefore bounded, and by the rules rather than by a number: a bet
+may be refunded once and rolled back once, a refund may be rolled back once,
+and a rollback may not be reversed at all. Two rules, kept apart because they
+count different things — **at most one active reversal**, which releases when
+the reversal holding the reference is itself undone, and **never two successful
+reversals of one kind**, which never releases. Undoing a refund hands the bet
+back to a rollback and to nothing else.
 
 ### Where the rule is enforced
 
-In the **schema**, as a primary key. `wagering.active_reversal` has
+In the **domain** first. `ReferenceView` carries the reference plus every
+`PROCESSED` reversal pointing at it, each flagged with whether it has itself
+been reversed, and the reversal branch asks two questions in order:
+`HasSuccessfulReversalOfKind(kind)` — is there a processed reversal of this
+kind, held or released — and then `ActiveReversal()` — is anything currently
+holding the reference. Both answer `REFERENCE_ALREADY_REVERSED`, so a provider
+reads one code for "this has already been reversed" however history got there.
+The view has to carry the released reversals as well as the active one: a view
+built from what currently holds the reference has forgotten the refund that was
+undone, and would let a second refund through to the schema, where it would be
+refused as an error rather than rejected as an outcome.
+
+In the **schema** twice, one object per rule. `wagering.active_reversal` has
 `reference_id` as its primary key and `reversal_id` unique, maintained by two
 triggers on `wager_transaction` — one on insert, one on settle — sharing one
 `SECURITY DEFINER` function; a second active reversal of one bet is a duplicate
 key, surfacing as `23505` on `active_reversal_pkey`. The trigger deletes the
 row keyed on the reversal being reversed before inserting the new one, which is
-exactly "rolling back a refund releases the bet".
+exactly "rolling back a refund releases the bet". Beside it, migration `000010`
+adds the partial unique index
+`wager_transaction_one_successful_reversal_per_kind` on
+`(resolved_reference_id, kind) WHERE status = 'PROCESSED' AND kind IN
+('REFUND', 'ROLLBACK')`, which counts what *ever* succeeded and never releases.
+The adapter maps `23505` on either name to the same sentinel, and the domain
+refuses both first.
 
 The literal reading of the rule — a partial unique index on
-`resolved_reference_id WHERE status = 'PROCESSED' AND kind IN ('REFUND',
-'ROLLBACK')` — is one line and is **wrong**, in a way that only shows up on a
-sequence the business explicitly wants. After `BET → REFUND → ROLLBACK of that
-refund`, the bet has two processed reversals pointing at it, and a later
-rollback of the bet is legitimate; the literal index refuses it, the domain
-produces a valid outcome, the processor reports success, and the write fails at
-`COMMIT`. ADR-0007 records why the derived table was preferred, and ADR-0003 why
-a mutable `reversedBy` slot was not.
+`resolved_reference_id` alone, without the kind — is one line and is **wrong**,
+in a way that only shows up on a sequence the business explicitly wants. After
+`BET → REFUND → ROLLBACK of that refund`, the bet has two processed reversals
+pointing at it, and a later rollback of the bet is legitimate; that index
+refuses it, the domain produces a valid outcome, the processor reports success,
+and the write fails at `COMMIT`. The derived table alone was wrong the other
+way: it permitted `BET → REFUND → ROLLBACK of the refund → REFUND`, two
+successful refunds of one bet, each returning the stake. Keyed by kind as well
+as by reference, the index refuses exactly the repeat and nothing else. ADR-0007
+records why the derived table was preferred and, as amended, why this index is
+right where the literal one was not; ADR-0003 records why a mutable
+`reversedBy` slot was not taken, and its amendment states the second rule.
 
 The domain's own guarantee is weaker and still holds: every reversal moves
 money, so two concurrent reversals must write the same wallet, and the wallet's
 version serialises them. The schema's is the stronger of the two because it
 does not depend on that — `TestTwoReversalsCannotRaceForOneReference` races a
 refund and a rollback that write no ledger entry and touch no balance, so the
-version is never consulted, and the reference is still held exactly once.
+version is never consulted, and the reference is still held exactly once. Two
+refunds of one released bet racing each other are decided the same way: both
+pass the domain, the second blocks on the uncommitted index entry, and receives
+`23505` when the first commits.
 
 The recursion is provably bounded at two levels: a rollback cannot be reversed
-and a refund can only be reversed by a rollback, so "does this bet have an
-active reversal?" never walks an open-ended chain. `ReferenceView` carries the
-reference plus its reversals, each flagged with whether it has been reversed,
-and that is always enough.
+and a refund can only be reversed by a rollback, so neither question above ever
+walks an open-ended chain.
 
 ## The inbox and the outbox
 
@@ -613,6 +679,17 @@ call site without the compiler noticing, and a transposed lookup here finds
 nothing — which reads as "not handled yet" and lets a redelivery be processed
 twice.
 
+One consequence of the row committing with the work is worth knowing when
+reading the inbox. A queue delivery that loses the duplicate-key race to its
+HTTP twin — the same operation, submitted over both doors at the same moment —
+recorded its inbox row in the transaction the unique violation aborted, and is
+answered by the re-read in a second transaction that writes nothing. So when the
+message is the replay, there is **no inbox row for it**. That is not a defect: a
+later redelivery of the same message is answered by the idempotency key rather
+than by the inbox, once, with the same transaction.
+`TestOneOperationSubmittedOverHTTPAndTheQueueAtTheSameTimeSettlesOnce` asserts
+the row only when the queue side arrived first, for that reason.
+
 ### The outbox
 
 An event is written in the same breath as the change that caused it, so there is
@@ -625,6 +702,18 @@ layer publishes**; a separate worker reads the outbox afterwards.
 | `UNIQUE (aggregate_id, aggregate_sequence)` | contiguous per-wallet ordering, so a consumer can tell a gap from an ending |
 | `outbox_claim_is_whole` | a claim is all three of `claimed_by`, `claimed_at`, `claim_expires_at`, or none |
 | `outbox_event_type_fkey` | only a declared event can be published |
+| trigger `outbox_guard` (`outbox_payload_is_a_snapshot`) | `event_id`, `aggregate_type`, `aggregate_id`, `aggregate_sequence`, `event_type`, `event_version`, `payload` and `occurred_at` are immutable once written, for every role including the owner |
+
+**The event is a snapshot at the database level, not by convention.**
+`wagering_app` holds `UPDATE` on the whole table because publishing *is* an
+update — a claim, an attempt count, a schedule, a publication time — and until
+migration `000010` nothing kept that privilege off the event itself: `UPDATE
+wagering.outbox SET payload = '{}'` succeeded. `outbox_guard` now refuses any
+change to the columns that describe the event, compared with `IS DISTINCT FROM`
+so that restating a value is not a change. It is a trigger rather than column
+privileges so that it binds the owner too, as the ledger's append-only trigger
+does. `DELETE` is deliberately not refused: retention prunes published rows,
+and the ledger — not the outbox — is what is kept for ever.
 
 **Numbering is per aggregate, and the aggregate is the wallet.** The obvious
 outbox — `BIGSERIAL` plus `FOR UPDATE SKIP LOCKED` — has a hole that does not
@@ -690,7 +779,18 @@ and that counts entries the *queue accepted* rather than rows the outbox marked
 around fifty thousand claim round trips in two hundred milliseconds. Failures
 back off from
 `PUBLISHER_BACKOFF_INITIAL` (2s) by a factor of 2 to `PUBLISHER_BACKOFF_MAX`
-(5m).
+(1m).
+
+That ceiling and the claim hold are the two publisher waits that have to stay
+inside SQS's five-minute FIFO deduplication window, and the loader **refuses**
+either `PUBLISHER_HOLD` or `PUBLISHER_BACKOFF_MAX` at five minutes or more,
+naming the window in its refusal. An event is sent again when its claim
+expires or its backoff elapses, and the second send is one message on the wire
+rather than two only while the queue still remembers the first one's
+deduplication id — so a hold or a ceiling at or past the window is a
+configuration under which a publisher killed between sending and marking puts a
+duplicate on the queue. The ceiling's default was once exactly five minutes,
+which is the window itself and not inside it.
 
 `SendMessageBatch` succeeds **partially** — some entries accepted, some
 refused, in one 200 response — so the adapter reports per entry rather than per
@@ -698,16 +798,29 @@ call. A publisher must mark exactly the events that reached the queue, and a
 single error for the call would force it to choose between marking events that
 were refused and republishing events that were not.
 
-Recovery is the four fault points, each marked with a `faults.Hit` on the
+Recovery is the five fault points, each marked with a `faults.Hit` on the
 **production** path — not behind a flag, not behind a build tag — so that a test
-can kill the process exactly there and prove what survives:
+can kill the process exactly there and prove what survives. Four are the
+instant after a transaction has committed and before the effect outside the
+database that was supposed to follow; the fifth is the instant before the
+commit:
 
 | | Where | What survives |
 |---|---|---|
+| `BeforeCommit` | the transaction manager, after the movement's last statement and before `COMMIT` — in whichever process runs the movement: consumer, API or reference worker, and on every movement transaction, including one that wrote nothing | **nothing** — no row, no ledger entry, no inbox row, no event — and the redelivery is a first application, not a replay |
 | `AfterCommitBeforeAck` | consumer, between the commit and the delete | the message is redelivered and the inbox absorbs it |
 | `AfterClaimBeforePublish` | publisher, between taking a claim and sending | the claim expires and another publisher takes the row |
-| `AfterPublishBeforeMark` | publisher, between the send and marking published | the event is sent again under the same `MessageDeduplicationId` — and a claim expires in `PUBLISHER_HOLD`, well inside SQS's five-minute deduplication window — so the queue drops the second copy |
+| `AfterPublishBeforeMark` | publisher, between the send and marking published | the event is sent again under the same `MessageDeduplicationId` — and a claim expires in `PUBLISHER_HOLD`, which the configuration keeps inside SQS's five-minute deduplication window — so the queue drops the second copy |
 | `AfterPendingCommit` | reference worker, after the commit that parked or settled | the schedule is durable; another worker picks it up |
+
+`FAULT_POINT=<name>` arms one of them on a process started by hand, which exits
+with status 99 the moment it reaches that point; `.env.example` lists the five
+names. `BeforeCommit` fires on every movement transaction, an idle turn of the
+reference loop or a pure replay included, so a worker armed with it has to run
+the consumer alone — `REFERENCE_WORKER_ENABLED=false PUBLISHER_ENABLED=false`.
+`internal/multi` kills real binaries at four of the five, and
+`TestAMovementKilledBeforeTheCommitLeavesNothing` in the adapter suite holds
+`BeforeCommit` without a process to kill.
 
 ### Shutdown
 
@@ -784,12 +897,101 @@ would spend the whole delivery budget in one burst.
 
 What that costs, and the precondition it rests on, are both in **Limitations**.
 
-### Credentials
+### A message the consumer cannot apply
+
+A body the consumer cannot read is **never applied and never touched**: a body
+that is not a JSON envelope, an envelope whose `type` is not
+`WagerTransactionRequested`, one naming a member the envelope does not have or
+the same member twice, one missing `messageId`, `type`, `occurredAt` or
+`data.walletId`, a redelivery whose `messageId` was already handled under a
+**different body hash**, and a `kind` of `OPENING`, which the domain refuses
+as `UNSUPPORTED_TRANSACTION_KIND` before any transaction opens
+(`TestAnOpeningSubmittedOverTheQueueIsRefusedAndNeverApplied`). Each is a
+permanent failure. The consumer writes one
+ERROR line — `queueMessageId`, `receiveCount`, `class`, and the envelope's
+`messageId` where it could be read — and leaves the message exactly as it is:
+not deleted, because that would discard an operation a provider believes it
+submitted with no trace of it anywhere but a log line, and not released to
+zero, because that would spend the whole redrive budget in one burst. The
+redrive policy decides: the message is dead-lettered when its receive count
+exceeds five, which at the 30-second visibility timeout is about 150 seconds
+after the first delivery. The line on the fifth delivery says so, and
+`wagering.sqs.dead_letters` counts it.
+
+A message the queue accepted whose body the consumer applied is deleted once the
+transaction has committed. A message naming a wallet that does not exist, or
+that its player does not hold, is the one transient case: it is hidden for a
+backoff and retried within the same redrive budget, because the wallet may be
+opened before the budget runs out — and if it never is, the budget ends it.
+
+### Credentials, and who may do what
 
 The SQS client takes none. It loads the AWS SDK's default chain — environment,
 profile, instance role — so no credential is ever named in this service's own
 configuration, written to a log line, or carried in an error. LocalStack accepts
 any pair; a deployment sets neither and uses an instance role.
+
+Who may do what is the queues' own decision, expressed as an SQS resource policy
+that `deploy/localstack/01-queues.sh` attaches to each queue for three IAM
+roles in the account:
+
+| Role | `wager-transactions.fifo` | `wager-transactions-dlq.fifo` | `wallet-events.fifo` |
+|---|---|---|---|
+| `wagering-producer` | `SendMessage` | — | — |
+| `wagering-worker` | `ReceiveMessage`, `DeleteMessage`, `ChangeMessageVisibility`, `GetQueueUrl`, `GetQueueAttributes` | the same — the only role that may receive from it | `SendMessage`, `GetQueueUrl`, `GetQueueAttributes` |
+| `wagering-api` | `GetQueueUrl`, `GetQueueAttributes` | — | `GetQueueUrl`, `GetQueueAttributes` |
+
+The producer is the game providers' integration and only ever sends. The worker
+holds the consumer's whole vocabulary on the inbound queue and the publisher's
+on the outbound one. The API only looks — `GetQueueUrl` for the start-up check
+and `GetQueueAttributes` for the readiness probe — and may send nowhere,
+because a submission becomes an outbox row and the worker publishes it. No
+statement grants to `*` and there is no `Deny`: a principal the policy does not
+name is refused by default. `docker-compose.yml` sets each service's
+`AWS_ACCESS_KEY_ID` to the name of the role it is meant to run as, so the
+intended identity is visible where the credentials are.
+
+LocalStack Community does not enforce IAM. The policy is provisioned and read
+back — `TestTheDeployedScriptProvisionsWhatTheAdapterAssumes` checks every
+grant above — but a call the policy would deny still succeeds locally, so a
+refusal cannot be demonstrated here. On AWS it is enforced, and the three roles
+must exist before the script runs, because SQS refuses a policy naming a
+principal it cannot resolve.
+
+### The outbound contract
+
+Every event on `wallet-events.fifo` is one `app.Envelope`, rendered by `jsonb`
+from the outbox row, with `MessageGroupId` the **aggregate id** and
+`MessageDeduplicationId` the **`eventId`**:
+
+| Member | |
+|---|---|
+| `eventId` | UUIDv7, minted when the event was written and stable across every republication |
+| `eventType` | one of the four below |
+| `aggregateType` | always `WALLET` |
+| `aggregateId` | the wallet's id |
+| `correlationId` | the thread the causing operation was handled under |
+| `causationId` | the inbound `messageId` for an operation that arrived on the queue; **absent** for one submitted over HTTP or carried forward by the reference worker, which has no causing event with an identity |
+| `occurredAt` | RFC 3339, UTC |
+| `version` | the event's schema version, `1` for all four |
+| `data` | the payload, by type |
+
+Money crosses as `{"amount":"25.00","currency":"BRL"}`; every balance in a
+payload is non-negative by construction.
+
+| `eventType` | `data` |
+|---|---|
+| `WagerTransactionProcessed` | `transactionId`, `walletId`, `playerId`, `kind`, `money`, `balanceAfter`, and `externalTransactionId` — omitted for an opening, which has none |
+| `WagerTransactionRejected` | `transactionId`, `walletId`, `playerId`, `kind`, `money`, `failureCode`, `externalTransactionId` |
+| `WalletBalanceChanged` | `walletId`, `transactionId`, `direction`, `money`, `balanceBefore`, `balanceAfter`, `walletVersion` |
+| `WagerTransactionPendingReference` | `transactionId`, `walletId`, `playerId`, `kind`, `referenceExternalTransactionId`, `attempts`, `externalTransactionId` — emitted every time an operation is parked, so a consumer sees each wait |
+
+Three **message attributes** ride beside the body: `correlationId` and
+`causationId`, copied out of the envelope so that anything routing or logging a
+message can follow a thread without opening a financial payload, and
+`traceparent`, the W3C trace context of the publish span, which is a child of
+the trace the causing operation ran under. `$trace`, the stored copy of that
+context, is stripped by the claim and is never on the wire.
 
 ## Authentication and authorisation
 
@@ -921,9 +1123,12 @@ line or anything this adapter hands back.
 ### On the queue
 
 There is no token on a queue. **The queue is the authorisation boundary**: the
-principal is a provider principal minted from `data.provider`, and whoever can
-send to the queue is trusted to name the provider. That is a deployment's
-decision, expressed as an SQS resource policy, not this service's.
+principal is a provider principal minted from `data.providerId`, and whoever can
+send to the queue is trusted to name the provider. Who that is, is the SQS
+resource policy `01-queues.sh` attaches — `SendMessage` on the inbound queue for
+the `wagering-producer` role and for nobody else — which is a deployment's
+decision to keep, not this service's to check; the table under **SQS** has the
+three roles.
 
 ## Composition and shutdown
 
@@ -952,13 +1157,26 @@ container.
 
 Each binary validates what it will actually use **before it claims to be
 running**, each check bounded by its own timeout as well as by `START_TIMEOUT`.
-`cmd/api` makes all three below; `cmd/worker` builds no identity provider at
+`cmd/api` makes all four below; `cmd/worker` builds no identity provider at
 all, because it verifies no token, and resolves only the queues its enabled
 loops ask for:
 
 - **PostgreSQL**, by the same readiness probe `/health/ready` runs — so a process
   reporting itself up has already answered the question the orchestrator is about
   to ask.
+- **The ledger privilege**, appended after that ping and bounded by the same
+  `DATABASE_HEALTH_TIMEOUT`: `has_table_privilege` on
+  `wagering.wallet_ledger_entry` for `UPDATE` or `DELETE`, asked of the role the
+  connection is running as. A connection that could rewrite the ledger refuses
+  to start — *"the database connection can rewrite the ledger; connect as a
+  member of wagering_app — DATABASE_URL should carry options=-c
+  role=wagering_app"*. The schema makes the ledger append-only twice over, by
+  trigger and by grant, and the second half holds only while the DSN carries
+  that one option, which is exactly the kind of thing a deployment loses in a
+  copy; a process connected as the owner would otherwise start, serve and work
+  identically with nothing to say so. `TestTheServiceStartsAsTheApplicationRole`
+  and `TestTheServiceRefusesToStartOnAConnectionThatCanRewriteTheLedger` hold
+  both sides.
 - **SQS**, by resolving each queue's name to its URL — so a queue nobody
   provisioned is a start-up failure with an operator watching, rather than a
   consumer that receives nothing and says nothing.
@@ -995,15 +1213,19 @@ package relies on that deliberately rather than hand-rolling a sequence. Four
 facts make the append order something nobody has to maintain:
 
 1. Only a handful of constructors append an `OnStop` hook at all, and Fx skips
-   a nil one — so where everything else sits cannot matter.
+   a nil one — so where everything else sits cannot matter. The readiness
+   probe, the ledger guard, the two queues and the authenticator append
+   `OnStart` and nothing else.
 2. The logger is forced during `fx.New` by `fx.WithLogger`, before any invoke
    runs and before any other constructor is asked for — so its hook is the first
    appended and the last run, unconditionally.
 3. The SDK's two providers come next, because the pool takes the `Telemetry` they
    are reached through.
-4. Everything that appends a hook after that is built **from** the pool: the
-   loops through the application services and the outbox claims, the server
-   through the API. A constructor cannot run before its dependencies.
+4. Everything that appends an `OnStop` hook after that is built **from** the
+   pool: the loops through the application services and the outbox claims, the
+   server through the API. A constructor cannot run before its dependencies.
+   That is true of the `OnStop` hooks only — the `OnStart` hooks of the
+   authenticator and the queues do not take the pool, and do not need to.
 
 Reversed, the order is:
 
@@ -1045,7 +1267,7 @@ maps; nothing here re-derives what happened.
 |---|---|---|
 | `INVALID` | 400 Bad Request | A malformed submission. Nothing was persisted and the idempotency key is still free. |
 | `UNAUTHORIZED` | 401 / **403** | 401 when no principal was established (the credential was refused); **403** when one was and it may not do this. The application layer cannot tell these apart — it never sees a request that failed to authenticate. |
-| `NOT_FOUND` | 404 Not Found | Also the answer for a provider reading another provider's operation, byte for byte. |
+| `NOT_FOUND` | 404 Not Found | Also the answer for a provider reading another provider's operation, byte for byte, and for a submission naming a wallet its player does not hold — the same body whether the wallet is absent or somebody else's. |
 | `CONFLICT` | 409 Conflict | Covers both `WALLET_ALREADY_EXISTS` and `IDEMPOTENCY_PAYLOAD_CONFLICT` by one rule rather than two special cases. |
 | `AUDIT` | 500 Internal Server Error | A finding about this service's stored records. The caller has nothing to correct and nothing to retry; the finding keeps its own code. |
 | `RETRYABLE` | 503 Service Unavailable | Carries `Retry-After: 1`. |
@@ -1140,13 +1362,25 @@ key, which is the opposite of what the header is for.
 
 The member names are exactly the ones `wagering.CanonicalPayload` hashes, so the
 bytes a provider sends, the bytes that are hashed and the bytes that come back
-are one vocabulary. `referenceExternalTransactionId` is optional.
+are one vocabulary, and they are the specification's own: `providerId`, and a
+required `walletId` naming the wallet the operation addresses.
+`referenceExternalTransactionId` is optional.
 
 ```json
-{"provider":"acme","externalTransactionId":"acme-tx-1","playerId":"player-1",
- "roundId":"round-1","gameId":"game-1","kind":"BET",
+{"providerId":"provider-a","externalTransactionId":"transaction-123",
+ "playerId":"player-1","walletId":"01a0c7af-13bb-7af5-9257-0ca1bad355bb",
+ "roundId":"round-987","gameId":"fortune-chimp","kind":"BET",
  "money":{"amount":"25.00","currency":"BRL"}}
 ```
+
+The wallet is loaded by that id, never resolved from the player and currency.
+Two things can be wrong with it. A wallet that does not exist and a wallet the
+player does not hold are **one answer, 404**, with nothing persisted and the key
+still free — the same body for both, naming the id and the player the
+submission claimed and never the owner, so that a submission cannot be used to
+learn whether a wallet exists or whose it is. A wallet the player holds whose
+currency is not the money's is **422** `CURRENCY_MISMATCH`, persisted and
+published like every rejection. The bodies for both are below.
 
 **200 — processed**
 
@@ -1173,6 +1407,22 @@ key is bound to this payload for good.
 
 ```json
 {"transactionId":"0199aa00-0000-7000-8000-000000000002","externalTransactionId":"acme-tx-3","kind":"BET","status":"REJECTED","money":{"amount":"25.00","currency":"BRL"},"failureCode":"INSUFFICIENT_FUNDS","idempotentReplay":false}
+```
+
+**422 — the wallet is the player's, the money is not its currency.** The same
+shape; the row carries the currency the provider asked for.
+
+```json
+{"transactionId":"01a0c7af-2729-7e2d-94e2-c7ed121c8331","externalTransactionId":"demo-usd","kind":"BET","status":"REJECTED","money":{"amount":"25.00","currency":"USD"},"failureCode":"CURRENCY_MISMATCH","idempotentReplay":false}
+```
+
+**404 — no such wallet for this player.** The wallet does not exist, or it
+exists and belongs to somebody else; the answer is the same and never says
+which. Nothing is persisted and the key is still free, so the same submission
+succeeds once the wallet is opened.
+
+```json
+{"code":"NOT_FOUND","message":"no wallet 0192f291-27dd-7d3f-8071-5f8685deef37 for player \"0192f28f-5dc0-7d58-bdb2-890057819\"","correlationId":"01a0c7c2-ac43-7fe1-9ade-5fcce2339063"}
 ```
 
 **400 — validation**
@@ -1308,12 +1558,14 @@ the operation is absent, which this route never went to find out.)
 player's balance in one currency. A wallet with nothing in it is opened with
 `"0.00"`.
 
-**201 Created**, with `Location: /wallets/0199aa00-0000-7000-8000-000000000001`
+**201 Created**, with `Location: /wallets/01a0c7af-13bb-7af5-9257-0ca1bad355bb`
 
 ```json
-{"walletId":"0199aa00-0000-7000-8000-000000000001","playerId":"player-1","balance":{"amount":"25.00","currency":"BRL"},"version":1,"createdAt":"2026-09-21T12:00:00Z","updatedAt":"2026-09-21T12:00:00Z","opening":{"transactionId":"0199aa00-0000-7000-8000-000000000002","kind":"OPENING","status":"PROCESSED","money":{"amount":"25.00","currency":"BRL"},"balance":{"amount":"25.00","currency":"BRL"},"idempotentReplay":false}}
+{"id":"01a0c7af-13bb-7af5-9257-0ca1bad355bb","playerId":"player-demo","balance":{"amount":"100.00","currency":"BRL"},"version":1,"createdAt":"2026-09-22T05:55:34.973706Z","updatedAt":"2026-09-22T05:55:34.973706Z","opening":{"transactionId":"01a0c7af-13bb-7b00-a60e-969b2c208fc9","kind":"OPENING","status":"PROCESSED","money":{"amount":"100.00","currency":"BRL"},"balance":{"amount":"100.00","currency":"BRL"},"idempotentReplay":false}}
 ```
 
+`id`, `playerId`, `balance` and `version` are the specification's members;
+`createdAt`, `updatedAt` and `opening` are this implementation's additions.
 `opening` is absent for a wallet opened at `"0.00"`: an opening records a
 starting balance, and a wallet opened at zero has none.
 
@@ -1323,6 +1575,12 @@ starting balance, and a wallet opened at zero has none.
 {"code":"WALLET_ALREADY_EXISTS","message":"player \"player-1\" already holds a BRL wallet","correlationId":"01a0c512-b9b2-74b4-89e3-fd72c1b7cb18"}
 ```
 
+**400 — a currency a fixed scale of two cannot hold**
+
+```json
+{"code":"UNSUPPORTED_CURRENCY","message":"currency \"JPY\" is not a supported ISO 4217 currency with two minor-unit digits","correlationId":"01a0c7af-2732-776a-9d74-3bb15123f298"}
+```
+
 ---
 
 #### `GET /wallets/{walletId}` — role `internal`
@@ -1330,7 +1588,7 @@ starting balance, and a wallet opened at zero has none.
 **200**
 
 ```json
-{"walletId":"0199aa00-0000-7000-8000-000000000001","playerId":"player-1","balance":{"amount":"25.00","currency":"BRL"},"version":1,"createdAt":"2026-09-21T12:00:00Z","updatedAt":"2026-09-21T12:00:00Z"}
+{"id":"01a0c7af-13bb-7af5-9257-0ca1bad355bb","playerId":"player-demo","balance":{"amount":"115.00","currency":"BRL"},"version":5,"createdAt":"2026-09-22T05:55:34.973706Z","updatedAt":"2026-09-22T05:55:35.063265Z"}
 ```
 
 **403 — a provider asking**
@@ -1363,11 +1621,13 @@ layer's default applies; a `limit` that is not a whole number is 400.
 **200**
 
 ```json
-{"walletId":"0199aa00-0000-7000-8000-000000000001","entries":[{"ledgerEntryId":"0199aa00-0000-7000-8000-000000000003","transactionId":"0199aa00-0000-7000-8000-000000000002","direction":"CREDIT","money":{"amount":"25.00","currency":"BRL"},"balanceBefore":{"amount":"0.00","currency":"BRL"},"balanceAfter":{"amount":"25.00","currency":"BRL"},"walletVersion":1,"createdAt":"2026-09-21T12:00:00Z"}],"nextCursor":"MDE5OWFhMDAtMDAwMC03MDAwLTgwMDAtMDAwMDAwMDAwMDAxOjE"}
+{"walletId":"01a0c7af-13bb-7af5-9257-0ca1bad355bb","entries":[{"id":"01a0c7af-13bb-7b01-a3fb-f9904d569f15","walletId":"01a0c7af-13bb-7af5-9257-0ca1bad355bb","transactionId":"01a0c7af-13bb-7b00-a60e-969b2c208fc9","direction":"CREDIT","money":{"amount":"100.00","currency":"BRL"},"balanceBefore":{"amount":"0.00","currency":"BRL"},"balanceAfter":{"amount":"100.00","currency":"BRL"},"walletVersion":1,"createdAt":"2026-09-22T05:55:34.973706Z"}],"nextCursor":"MDFhMGM3YWYtMTNiYi03YWY1LTkyNTctMGNhMWJhZDM1NWJiOjM"}
 ```
 
-`nextCursor` is absent on the last page; its absence is how a caller knows to
-stop. `entries` is `[]` on an empty page, never `null`.
+Each entry carries its own `id` and its `walletId`; `walletVersion` is this
+implementation's addition, and is the order the page is in. `nextCursor` is
+absent on the last page; its absence is how a caller knows to stop. `entries`
+is `[]` on an empty page, never `null`.
 
 **400 — a limit that is not a number**
 
@@ -1380,11 +1640,13 @@ stop. `entries` is `[]` on an empty page, never `null`.
 #### `POST /wallets/{walletId}/reconciliation` — role `internal`
 
 **200 — whether or not the wallet balances.** The check ran and the report says
-what it found; reconciliation never corrects anything. `difference` is stored
-less reconstructed and may be negative.
+what it found; reconciliation never corrects anything. `storedBalance` is what
+the wallet row holds, `calculatedBalance` is its ledger summed, `difference` is
+stored less calculated and may be negative, and `checkedEntries` is how many
+ledger entries the calculation summed, the opening included.
 
 ```json
-{"walletId":"0199aa00-0000-7000-8000-000000000001","consistent":false,"stored":{"amount":"20.00","currency":"BRL"},"reconstructed":{"amount":"25.00","currency":"BRL"},"difference":{"amount":"-5.00","currency":"BRL"}}
+{"walletId":"01a0c7af-2739-7d36-9936-35e6e7d3a249","storedBalance":{"amount":"20.00","currency":"BRL"},"calculatedBalance":{"amount":"25.00","currency":"BRL"},"difference":{"amount":"-5.00","currency":"BRL"},"consistent":false,"checkedEntries":1}
 ```
 
 **500 — an audit finding.** The stored records are wrong in a way that is not a
@@ -1519,9 +1781,18 @@ echoes and the error body returns. It is set on the span that **opens** each
 door, and on those only: the HTTP server span, the consume span and the
 publish-event span. Nothing beneath writes it again, because a value written
 twice is a value that can differ; a TraceQL match on any one span returns the
-whole trace, which is what makes searching by it work anyway. Log lines carry
-`traceId` and `spanId` instead, which is how a line is tied back to the span
-that produced it.
+whole trace, which is what makes searching by it work anyway. Every log line
+carries `traceId` and `spanId`, which is how a line is tied back to the span
+that produced it, and the one line each door writes for an operation that
+reached an answer carries the operation's identity as well: `correlationId`,
+`transactionId`, `walletId`, `providerId`, `kind`, `status`, `failureCode` and
+`replay`. The consumer's is *"the operation was applied"*, with `messageId`,
+`queueMessageId` and `receiveCount` beside them; the API's is *"the operation
+was answered"*, with `source=http`; the reference worker's are *"a parked
+operation was carried forward"* and *"a parked operation is still waiting for
+its reference"*. A wallet opening leaves *"the wallet was opened"* with
+`correlationId` and `walletId` and nothing else — never a player, an amount or
+a balance, which are a financial payload and not what a log is for.
 
 On the queue path the correlation is the `correlationId` message attribute when
 the producer set a usable one, and the envelope's `messageId` when it did not. A
@@ -1547,7 +1818,7 @@ are the OpenTelemetry names; Prometheus renders them with `.` as `_`, appends
 | `wagering.processing.duration` | histogram, **seconds** | `source`, `kind`, `status`, `failureCode` |
 | `wagering.inbox.duplicates` | counter | `consumer` |
 | `wagering.sqs.retries` | counter | `consumer`, `class` |
-| `wagering.sqs.dead_letters` | counter | `consumer` |
+| `wagering.sqs.dead_letters` | counter | `consumer` — a message whose last permitted delivery ended in a failure of **either** class |
 | `wagering.lock_timeouts` | counter | `transaction` — `movement` or `snapshot` |
 | `wagering.version_conflicts` | counter | `transaction` |
 | `wagering.outbox.lag` | observable gauge, **seconds** | none |
@@ -1577,6 +1848,18 @@ scraped sample is `exported_job="wagering"`, `exported_instance="<hostname>"`,
 `wagering.transactions` does **not** count failures. An operation that could
 not be applied has no kind, no status and no failure code, and counting it here
 would put a database outage in the same series as a rejected bet.
+
+`wagering.sqs.dead_letters` counts a message the consumer has seen for the last
+time, whichever way its last delivery ended: a poisoned message left untouched
+for the redrive policy to move, **or** a transient failure on the fifth
+delivery, hidden for a backoff after which the policy moves the message rather
+than delivers it. The second is also counted under `wagering.sqs.retries`, and
+the overlap is deliberate — the retry says the message was handed back, the
+dead letter says nobody will be handed it; the retry rate is a database under
+pressure and recovers, the dead-letter count is work about to be lost. Before
+the second case was counted, a message whose last delivery met a lock timeout
+left the panel at zero, and the class of failure that is an outage was the one
+the alert could not see.
 
 `wagering.lock_timeouts` and `wagering.version_conflicts` are kept apart
 although both are contention, because they mean opposite things: a lock timeout
@@ -1775,7 +2058,7 @@ to live.
 | `INVALID_AMOUNT_SCALE` | a well-formed decimal with the wrong number of fraction digits, too few or too many |
 | `AMOUNT_OUT_OF_RANGE` | an amount that cannot be represented, or arithmetic that would overflow the minor-unit representation |
 | `INVALID_AMOUNT_FOR_KIND` | zero for a `BET`, `WIN`, `REFUND` or `ROLLBACK`; non-zero for a `LOSS` |
-| `UNSUPPORTED_CURRENCY` | not three uppercase ASCII letters |
+| `UNSUPPORTED_CURRENCY` | not a supported ISO 4217 currency with two minor-unit digits, or not three uppercase ASCII letters |
 | `MISSING_REQUIRED_FIELD` | a field the kind requires, absent or empty |
 | `INVALID_FIELD_FORMAT` | present but malformed: surrounding whitespace, an over-long identifier, an unknown enum value |
 | `UNSUPPORTED_TRANSACTION_KIND` | an `OPENING` submitted as an external operation |
@@ -1794,7 +2077,7 @@ to live.
 | `REFERENCE_NOT_FOUND` | the reference never arrived before the wait budget was spent |
 | `REFERENCE_NOT_PROCESSED` | the reference exists but ended unsuccessfully, so there is nothing to reverse |
 | `REFERENCE_NOT_REVERSIBLE` | the reference's kind cannot be reversed by the submitted kind |
-| `REFERENCE_ALREADY_REVERSED` | the reference already carries an active reversal, which would return the same money twice |
+| `REFERENCE_ALREADY_REVERSED` | the reference already carries an active reversal, or already received a successful reversal of this kind; either would return the same money twice |
 | `REFERENCE_MISMATCH` | the reference disagrees on provider, player, wallet, currency or round |
 | `REVERSAL_AMOUNT_MISMATCH` | a reversal of a different amount. Partial reversals do not exist. |
 | `IDEMPOTENCY_PAYLOAD_CONFLICT` | one key reused for a different set of business fields |
@@ -1859,10 +2142,39 @@ derivation. ADR-0002 and ADR-0012.
 
 ## Interpretations
 
-The original challenge specification is not in this repository and could not be
-recovered, so its section 9 — "contracts exactly as in the challenge spec" —
-does not exist. The following were derived from the task text plus the
-`internal/app` surface. Each names what was chosen and why.
+The wire contracts follow the challenge specification's §9 and §10 examples
+member for member: the `POST /wallets` request and response, the
+`POST /wagering/transactions` request under `Idempotency-Key` and its response,
+the reconciliation report, and the `WagerTransactionRequested` queue envelope
+are the specification's spellings, and `TestTheSpecificationsSubmissionBodyIsAcceptedAndProcessed`
+and `TestTheSpecificationsEnvelopeIsAppliedOnce` send the specification's own
+bodies. Where this implementation goes beyond the examples, or answers a
+question they leave open, it is listed here so that the departure is a decision
+and not a drift:
+
+- **Additive members.** The outbound envelope carries `aggregateType`, always
+  `WALLET`, beside the members the specification shows. A ledger entry carries
+  `walletVersion`, the exact order the page is in. `POST /wallets` answers
+  `createdAt`, `updatedAt` and, for a wallet opened with money in it, `opening`.
+  The operation view carries `externalTransactionId`, `kind`, `money` and, when
+  rejected, `failureCode`, beside `transactionId`, `status`, `balance` and
+  `idempotentReplay`. Nothing the specification shows is missing or renamed.
+- **`POST /wallets` answers 201 with `Location`**, not 200: a POST that creates
+  an addressable resource. Interpretation 9.
+- **The error body is `{code, message, correlationId}`**, on which the
+  specification is silent. Interpretations 2–4.
+- **A read is always 200**, whatever the operation came to; the submission
+  status table is applied to submissions only. Interpretation 8.
+- **`WagerTransactionPendingReference` is emitted on every re-park**, not only
+  the first, so a consumer of the events sees each wait.
+- **`Retry-After` is the constant `1`.** Interpretation 19.
+- **`playerId` is an opaque string**, held to `wagering.opaque_id`'s shape, where
+  the specification's examples show a UUID. A UUID is accepted; so is any other
+  identifier a provider's own system uses.
+
+The forty-five decisions below were taken where the specification is silent —
+the task text plus the `internal/app` surface. Each names what was chosen and
+why.
 
 1. **The HTTP package is `httpapi` in `internal/adapters/http`.** The directory
    is what the task specifies. The package is not called `http` because every
@@ -1946,9 +2258,20 @@ does not exist. The following were derived from the task text plus the
     `PayloadHash`, before any I/O — answers `UNSUPPORTED_TRANSACTION_KIND`.
     Duplicating the rule in the transport could only drift from it.
 
-15. **The submission body carries `provider`.** The handler does not fill it
-    from the token, so `app.Principal.MaySubmitAs` remains a live check rather
-    than one trivially satisfied by the transport.
+15. **The submission body carries `providerId` and `walletId`, and both are
+    checked rather than filled.** The handler does not fill `providerId` from
+    the token, so `app.Principal.MaySubmitAs` remains a live check rather than
+    one trivially satisfied by the transport. The wallet is loaded by the id
+    the body names, never resolved from the player and currency on the
+    provider's behalf: a wallet that does not exist and a wallet the player does
+    not hold are one 404, *"no wallet `<id>` for player `<playerId>`"*, which
+    never names the owner — answering them apart would make a submission an
+    oracle for whether a wallet exists and whose it is — and one the player
+    holds in another currency is a `CURRENCY_MISMATCH` rejection. A submission
+    that names the wrong wallet is a payload to repair, not an operation to
+    redirect. `TestABodyInTheWrongCurrencyIsRejectedWithOneRow` and
+    `TestABodyNamingAnotherPlayersWalletIsRefusedAndWritesNothing` hold the two
+    over a real listener.
 
 16. **`app.Principal.MayReadAs` was added to `internal/app`, and
     `Wagering.TransactionByExternalID` now takes the provider it reads as.**
@@ -2062,12 +2385,15 @@ The rest of the system made its own, in the same way and for the same reason.
 
 ### Messaging
 
-32. **The envelope `type` has one accepted value, `WagerTransactionSubmitted`.**
-    The spelling is this implementation's. It is PascalCase to match the event
-    types the outbound envelope already carries, and it names what the message
-    *is* — a provider asking for an operation to be applied — rather than which
+32. **The envelope `type` has one accepted value, the specification's
+    `WagerTransactionRequested`, and `data.providerId` and `data.walletId` are
+    required.** Any other `type` is a permanent failure — including
+    `WagerTransactionSubmitted`, the spelling this consumer accepted before the
+    specification was in the tree. The type names what the message *is* — a
+    provider asking for an operation to be applied — rather than which
     operation, because the kind lives in `data.kind` exactly as on HTTP and one
-    payload should not be described in two places.
+    payload should not be described in two places. `occurredAt` is accepted
+    with or without fractional seconds.
 
 33. **The inbox body hash is SHA-256 of the raw body bytes, not of the parsed
     fields.** The idempotency key answers "has this operation been recorded"; the
@@ -2075,14 +2401,21 @@ The rest of the system made its own, in the same way and for the same reason.
     one `messageId` carrying two different bodies detectable.
 
 34. **The principal on the queue path is a provider principal minted from
-    `data.provider`.** There is no token on a queue, so the queue is the
-    authorisation boundary and who may send to it is a deployment's decision.
+    `data.providerId`.** There is no token on a queue, so the queue is the
+    authorisation boundary and who may send to it is a deployment's decision —
+    stated in this repository as the resource policy `01-queues.sh` attaches,
+    which grants `SendMessage` on the inbound queue to the `wagering-producer`
+    role and to nobody else, and which LocalStack Community provisions but does
+    not enforce.
 
 35. **`app.NotFound` is transient on the queue path.** Nothing is persisted and
     the key is still free, so the same message succeeds unchanged once the wallet
-    is opened — and the only way this layer produces it there is an operation for
-    a player who holds no wallet in that currency. It stays bounded by the redrive
-    policy.
+    is opened — and the only way this layer produces it there is a submission
+    naming a wallet that does not exist or that the player does not hold, which
+    are one answer. It stays bounded by the redrive policy, which is also what
+    ends a message that named somebody else's wallet. The neighbouring outcome
+    is not transient: a wallet in another currency is a `CURRENCY_MISMATCH`
+    rejection with a row and an event.
 
 36. **A permanent failure leaves its message alone rather than releasing it to
     zero.** Releasing would spend the whole delivery budget in one burst, turning
@@ -2144,8 +2477,11 @@ The rest of the system made its own, in the same way and for the same reason.
   to the one connection it happened on, so the blast radius is bounded, but a
   panicking handler drops that connection with no correlated response and no
   entry in the error body's shape.
-- **No access log.** Only refusals, failures and the distinctions kept off the
-  wire are logged. A request log belongs to the composition root, which owns the
+- **No per-request access log for reads and health.** Every answered submission
+  and every opened wallet leaves one INFO line — *"the operation was answered"*,
+  *"the wallet was opened"* — and refusals, failures and the distinctions kept
+  off the wire are logged; a read that succeeded and a health probe leave
+  nothing. A request log belongs to the composition root, which owns the
   logger.
 - **`routed` does not forward `http.Flusher`, `http.Hijacker` or
   `io.ReaderFrom`.** Nothing in this API streams, upgrades or sends a file, and
@@ -2224,8 +2560,9 @@ The rest of the system made its own, in the same way and for the same reason.
   reachable**, so `go test ./...` on a machine without Docker is green with the
   whole schema-conformance suite never having run. That is deliberate — a
   migration test that *passed* because there was no database to migrate would be
-  worse — but the green run is the thing to be aware of. `README.md` says Docker
-  is a prerequisite for that reason.
+  worse — but the green run is the thing to be aware of. `README.md` says so,
+  and CI pins `TEST_DATABASE_URL` at a service container so that the skip
+  cannot happen there.
 - **Neither `internal/adapters/postgres` nor `internal/integration` drops its
   test databases on failure.** Also deliberate: a failing test can be
   investigated against the database it failed on. Both drop on success, so a
@@ -2245,61 +2582,64 @@ The rest of the system made its own, in the same way and for the same reason.
   Compose to own its project's containers and network from the first command.
   The second `up` lands in the middle of the first teardown. Nothing here is
   wrong; the suites are simply not meant to overlap, and the README says to run
-  them as separate steps.
-- **CI does not run the `multi` suite.** `.github/workflows/ci.yml` runs the
-  untagged suite and the `integration` suite as two separate steps — which is
-  also why it never meets the contention above — but it has no Docker Compose
-  stage, and the `multi` suite brings the stack up itself. So the one suite that
-  proves three API instances and two workers behave correctly together is a
-  local step, and a regression in it would not fail a pull request. Adding a
-  Compose stage is the fix; it was not in this effort's scope.
+  them as separate steps. CI runs the three suites as three separate jobs —
+  the `multi` job runs `make test-multi` on a runner of its own and takes the
+  stack down whatever happened — so it never meets the contention.
 
 ## Not completed
 
-**Nothing** — measured against the task texts this work was given, since the
-original specification is not in this repository and **Interpretations** above
-is where that is accounted for. Everything asked for is implemented and is
-covered by a test that runs against the real thing. The section is kept rather
-than deleted because its emptiness is the claim, and a reader is entitled to
-see it made rather than to infer it from a heading that is not there.
-
-What stood here until recently was the one genuine gap: **a cross-transport
-test proving that one operation submitted over real HTTP and over a real queue
-produces one movement and one replay.** `internal/messaging` proves one use
-case reached by two callers, which is not the same thing, and its own package
-documentation says so under "What this suite cannot catch" — a note that still
-stands, because it is still true of that suite. `internal/multi`
-closed it. `TestOneOperationOverHTTPAndOverTheQueueSettlesOnceInEitherOrder`
-drives a real `client_credentials` token against a real listener and a real
-FIFO queue, in both orders, and declares its own two wire types rather than
-reusing the adapters' structs — so a rename on either side is caught rather
-than compiled away.
+Everything the specification asks for is implemented and is covered by a test
+that runs against the real thing: the contracts follow its §9 and §10 examples
+member for member, and the departures are listed at the head of
+**Interpretations** rather than left to be discovered. The suites that prove
+it are the untagged one, `integration` and `multi`, and CI runs all three.
 
 For the avoidance of doubt, in the terms the brief set:
 
 - **No test is skipped** to make a suite green. There are three `t.Skip` calls
   in this tree and each is conditional on something that is not the case here:
   two on a PostgreSQL cluster being unreachable — the condition named under
-  Limitations — and one on the catalogue declaring no audit codes at all, which
-  it does not, since it declares `LEDGER_BALANCE_MISMATCH`.
+  Limitations, which CI closes by pinning `TEST_DATABASE_URL` — and one on the
+  catalogue declaring no audit codes at all, which it does not, since it
+  declares `LEDGER_BALANCE_MISMATCH`.
 - **No mock, fake or in-memory substitute stands in for PostgreSQL, SQS or
-  Keycloak** in any integration test. Every one of them runs against a real
+  Keycloak** in the container suites. Every one of them runs against a real
   container, and `internal/multi` runs against the compose deployment itself.
+  The untagged unit suites fake the application layer's *ports* — that is what
+  the ports are for — and say what they cannot cover.
 - **No feature is stubbed.** There is no `TODO`, `FIXME` or unimplemented branch
   anywhere in the tree.
 
-What is *not here* is scope nobody asked for, and it is listed so that its
-absence is a decision rather than a gap:
+What is *not here* is by decision, and it is listed so that its absence is not
+mistaken for a gap:
 
 - **No consumer of `wallet-events.fifo`.** Nothing in this deployment reads it,
   which is also why it has no dead-letter queue: one for a destination nobody
-  reads would collect nothing.
+  reads would collect nothing. The resource policy names no consumer for the
+  same reason; the one that arrives gets a statement of its own.
 - **No outbox retention job.** The schema prescribes the statement, the
-  application role holds the `DELETE` to run it, and
-  `TestAggregateNumberingSurvivesRetention` proves the numbering survives it —
-  but scheduling it is a deployment's, and the aggregate sequence counter is a
-  table precisely so that it can be.
-- **No per-currency scale**, as **Money** above states at length.
-- **No rate limiting**, and **no authorisation of who may send to the inbound
-  queue.** The latter is an SQS resource policy; both belong to a deployment
-  rather than to this service.
+  application role holds the `DELETE` to run it, `outbox_guard` deliberately
+  leaves `DELETE` allowed, and `TestAggregateNumberingSurvivesRetention` proves
+  the numbering survives it — but scheduling it is a deployment's, and the
+  aggregate sequence counter is a table precisely so that it can be.
+- **No per-currency scale.** Only currencies whose ISO 4217 minor unit is two
+  digits are accepted, as **Money** above states at length.
+- **No rate limiting.** It belongs in front of this service rather than in it.
+
+What remains *exposed*, stated so that it is known rather than found:
+
+- **A republished event more than five minutes after a send the process never
+  learned of.** The one window a transaction cannot close is between the queue
+  accepting a send and the outbox row being marked published. A publisher that
+  dies there sends the event again, and SQS drops the second copy only while it
+  still remembers the first one's `MessageDeduplicationId` — five minutes, and
+  nothing here can change it. The configuration keeps `PUBLISHER_HOLD` and
+  `PUBLISHER_BACKOFF_MAX` under that window and the loader refuses either at
+  five minutes or more, which bounds the ordinary case; a resend that succeeds
+  more than five minutes after an accepted send the process never saw — the
+  claim held by a process that was paused rather than killed, say, past the
+  window — is a second copy of the event on the wire, under the same `eventId`,
+  which is what a consumer would have to deduplicate on.
+- **A denied queue call cannot be demonstrated locally.** The resource policy
+  is provisioned and read back, but LocalStack Community does not enforce IAM,
+  so the suite proves what the policy *says* and not what AWS would refuse.
