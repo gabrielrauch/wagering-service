@@ -62,8 +62,9 @@ const (
 	// non-zero for LOSS.
 	InvalidAmountForKind Code = "INVALID_AMOUNT_FOR_KIND"
 
-	// UnsupportedCurrency reports a currency code that is not three uppercase
-	// ASCII letters.
+	// UnsupportedCurrency reports a currency code that is not a supported ISO
+	// 4217 currency with two minor-unit digits, or not three uppercase ASCII
+	// letters.
 	UnsupportedCurrency Code = "UNSUPPORTED_CURRENCY"
 
 	// MissingRequiredField reports a field the kind requires but that was
@@ -136,7 +137,8 @@ const (
 	ReferenceNotReversible Code = "REFERENCE_NOT_REVERSIBLE"
 
 	// ReferenceAlreadyReversed reports a reference that already carries an
-	// active reversal, which would otherwise return the same money twice.
+	// active reversal, or already received a successful reversal of this kind;
+	// either would return the same money twice.
 	ReferenceAlreadyReversed Code = "REFERENCE_ALREADY_REVERSED"
 
 	// ReferenceMismatch reports a reference that disagrees with the operation
