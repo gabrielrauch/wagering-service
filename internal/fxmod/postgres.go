@@ -2,7 +2,10 @@ package fxmod
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/fx"
@@ -14,13 +17,14 @@ import (
 
 // Postgres is the database this service's state lives in: the pool, the
 // transaction manager every command runs inside, the publisher's claim surface,
-// and the readiness probe.
+// the readiness probe, and the check that the connection cannot rewrite the
+// ledger.
 //
-// The invoke is what makes the probe exist in a binary that has no HTTP server
-// to serve it from. Fx builds only what something asks for, so in cmd/worker
-// nothing would reach [postgres.Health] and the start-up check this task
-// requires would quietly not happen — a process that starts against a database
-// it cannot read, and finds out at the first message.
+// The invoke is what makes the probe and the check exist in a binary that has
+// no HTTP server to serve either from. Fx builds only what something asks for,
+// so in cmd/worker nothing would reach [postgres.Health] and the start-up
+// checks this task requires would quietly not happen — a process that starts
+// against a database it cannot read, and finds out at the first message.
 func Postgres() fx.Option {
 	return fx.Module("postgres",
 		fx.Provide(
@@ -28,6 +32,7 @@ func Postgres() fx.Option {
 			newTxManager,
 			newOutboxClaims,
 			newDatabaseHealth,
+			newLedgerGuard,
 		),
 		fx.Invoke(checkDatabase),
 	)
@@ -126,9 +131,83 @@ func newDatabaseHealth(
 	return health, nil
 }
 
-// checkDatabase exists to make the probe above exist.
+// ledgerPrivilegeProbe asks whether the role this process connected as could
+// rewrite the ledger.
+//
+// It asks about the CURRENT role, which is what the DSN's
+// `options=-c role=wagering_app` sets — so a DSN that lost the option answers
+// for the owner, and the owner can do anything. It reads the catalogue and not
+// the table, so it takes no lock a migration would contend with; and it runs
+// once, at start-up, rather than on every readiness probe, because the answer
+// cannot change while the connection is the same one.
+//
+// The first column says whether the ledger exists at all. has_table_privilege
+// raises on a relation that does not, and a process started before the
+// migration job would then be told about a privilege query when the fault is
+// an unmigrated database; the CASE keeps the privilege call from running in
+// that case, and the caller names the right fault.
+const ledgerPrivilegeProbe = `SELECT
+	to_regclass('wagering.wallet_ledger_entry') IS NOT NULL,
+	CASE WHEN to_regclass('wagering.wallet_ledger_entry') IS NULL THEN false
+	     ELSE has_table_privilege('wagering.wallet_ledger_entry', 'UPDATE')
+	       OR has_table_privilege('wagering.wallet_ledger_entry', 'DELETE') END`
+
+// ledgerGuard is the start-up check that this process cannot rewrite the
+// ledger.
+//
+// The schema makes the ledger append-only twice over: a trigger refuses every
+// UPDATE and DELETE, and wagering_app is granted neither. The service holds the
+// second half only by connecting as a member of that role, and the only thing
+// that arranges it is one option in a DSN — exactly the kind of thing a
+// deployment loses in a copy. A process that connected as the owner would
+// start, serve and work identically, with half of what makes the ledger
+// append-only quietly gone and nothing to say so. This is the composition root
+// asking, once, before anything else runs on the connection.
+type ledgerGuard struct {
+	pool    *pgxpool.Pool
+	timeout time.Duration
+}
+
+// newLedgerGuard wires the check, after the readiness ping.
+//
+// It takes the probe as a dependency for the ordering and for nothing else. Fx
+// appends hooks in construction order, so this hook runs after
+// [newDatabaseHealth]'s, and a database that is not answering is reported as
+// that rather than as a privilege query that timed out. The bound is the same
+// health timeout: this is one catalogue read on a connection the ping has just
+// proven, and it should take no longer than the ping did.
+func newLedgerGuard(
+	lc fx.Lifecycle, pool *pgxpool.Pool, cfg config.Postgres, _ *postgres.Health,
+) *ledgerGuard {
+	guard := &ledgerGuard{pool: pool, timeout: cfg.HealthTimeout}
+	lc.Append(fx.Hook{OnStart: guard.check})
+	return guard
+}
+
+// check refuses to start a process whose connection could rewrite the ledger.
+func (g *ledgerGuard) check(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, g.timeout)
+	defer cancel()
+
+	var migrated, canRewrite bool
+	if err := g.pool.QueryRow(ctx, ledgerPrivilegeProbe).Scan(&migrated, &canRewrite); err != nil {
+		return fmt.Errorf("fxmod: check whether the connection can rewrite the ledger: %w", err)
+	}
+	if !migrated {
+		return errors.New("fxmod: the schema is not migrated: wagering.wallet_ledger_entry does not exist; " +
+			"run cmd/migrate before starting the service")
+	}
+	if canRewrite {
+		return errors.New("fxmod: the database connection can rewrite the ledger; " +
+			"connect as a member of wagering_app — DATABASE_URL should carry " +
+			"options=-c role=wagering_app")
+	}
+	return nil
+}
+
+// checkDatabase exists to make the probe and the guard above exist.
 //
 // Every binary here needs the database, and only one of them serves a readiness
-// endpoint; without this the worker would build no probe and run no start-up
-// check.
-func checkDatabase(*postgres.Health) {}
+// endpoint; without this the worker would build no probe, no guard, and run no
+// start-up check.
+func checkDatabase(*postgres.Health, *ledgerGuard) {}

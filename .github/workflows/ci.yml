@@ -111,6 +111,44 @@ jobs:
         with:
           go-version-file: go.mod
 
+  # The suite that runs the service as more than one process: three API
+  # replicas and two workers through docker-compose.yml, plus the scenarios
+  # that start, arm and kill the real binaries on the host. It is the one suite
+  # that exercises the compose file, the container image and the health checks
+  # as they ship, and a suite behind a build tag that CI never runs is the same
+  # as no suite -- see the note on the integration step above.
+  #
+  # ubuntu-latest ships Docker with Compose v2, which is all `make test-multi`
+  # needs: the suite brings the stack up itself and builds the two binaries it
+  # drives. No service containers here, deliberately -- the compose stack
+  # publishes 5432, 8080 and 4566 on the runner, and a service container on
+  # any of them would collide.
+  #
+  # The Makefile target already bounds `go test` at twenty minutes. The five
+  # more are for Compose building the images from nothing, which is what a
+  # runner does every time and what internal/multi/doc.go measures at about
+  # three minutes cold.
+  multi:
+    name: multi-instance test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Multi-instance test
+        run: make test-multi
+
+      # Whatever happened above. A runner is discarded afterwards, so this is
+      # not about the runner; it is so the containers' logs are flushed and a
+      # stack that failed half-way is not what a re-run's `--wait` inherits.
+      - name: Take the stack down
+        if: always()
+        run: docker compose down --remove-orphans --volumes
+
   migrate:
     name: migrate command
     runs-on: ubuntu-latest

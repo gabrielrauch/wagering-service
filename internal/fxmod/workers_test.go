@@ -107,7 +107,7 @@ func TestEverySettingReachesTheWorkerItIsFor(t *testing.T) {
 		"PUBLISHER_DRAIN_TIMEOUT":          "12s",
 		"PUBLISHER_BACKOFF_INITIAL":        "4s",
 		"PUBLISHER_BACKOFF_FACTOR":         "3",
-		"PUBLISHER_BACKOFF_MAX":            "6m",
+		"PUBLISHER_BACKOFF_MAX":            "4m",
 		"REFERENCE_WORKER_NAME":            "some-reference-worker",
 		"REFERENCE_WORKER_INTERVAL":        "5s",
 		"REFERENCE_WORKER_DRAIN_TIMEOUT":   "13s",
@@ -143,7 +143,7 @@ func TestEverySettingReachesTheWorkerItIsFor(t *testing.T) {
 		{"the publisher's interval", publisher.Interval, 2 * time.Second},
 		{"the publisher's drain timeout", publisher.DrainTimeout, 12 * time.Second},
 		{"the publisher's backoff", publisher.Backoff, workers.Backoff{
-			Initial: 4 * time.Second, Factor: 3, Max: 6 * time.Minute,
+			Initial: 4 * time.Second, Factor: 3, Max: 4 * time.Minute,
 		}},
 
 		{"the reference worker's name", reference.Name, "some-reference-worker"},

@@ -5,6 +5,7 @@ package sqs
 import (
 	"encoding/json"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -90,6 +91,53 @@ func TestTheDeployedScriptProvisionsWhatTheAdapterAssumes(t *testing.T) {
 				deadLetter)
 		}
 	})
+
+	// The broker's own access control, by IAM role. LocalStack Community does
+	// not enforce it, so what can be asserted here is that the policy the
+	// script provisions says what it is meant to — a denied call cannot be
+	// demonstrated against this backend, and on AWS it would be.
+	t.Run("the resource policies", func(t *testing.T) {
+		const (
+			producer = "arn:aws:iam::000000000000:role/wagering-producer"
+			worker   = "arn:aws:iam::000000000000:role/wagering-worker"
+			api      = "arn:aws:iam::000000000000:role/wagering-api"
+		)
+
+		inbound := queuePolicy(t, inboundQueue)
+		if !inbound.allows(producer, "sqs:SendMessage") {
+			t.Errorf("%s does not let the producer role send, and the providers' "+
+				"integration is what sends", inboundQueue)
+		}
+		for _, action := range []string{
+			"sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility",
+		} {
+			if !inbound.allows(worker, action) {
+				t.Errorf("%s does not grant %s to the worker role, and the consumer "+
+					"cannot run without it", inboundQueue, action)
+			}
+		}
+		if inbound.allows(api, "sqs:SendMessage") {
+			t.Errorf("%s lets the API role send, and the API never puts anything on a "+
+				"queue itself: a submission is an outbox row the worker publishes",
+				inboundQueue)
+		}
+		if got := inbound.granted("sqs:SendMessage"); !slices.Equal(got, []string{producer}) {
+			t.Errorf("%s may be sent to by %v, want the producer role only", inboundQueue, got)
+		}
+
+		outbound := queuePolicy(t, outboundQueue)
+		if got := outbound.granted("sqs:SendMessage"); !slices.Equal(got, []string{worker}) {
+			t.Errorf("%s may be sent to by %v, want the worker role only: it is where "+
+				"the outbox publisher writes, and nothing else may put an event there",
+				outboundQueue, got)
+		}
+
+		dlq := queuePolicy(t, deadLetter)
+		if got := dlq.granted("sqs:ReceiveMessage"); !slices.Equal(got, []string{worker}) {
+			t.Errorf("%s may be received from by %v, want the worker role only",
+				deadLetter, got)
+		}
+	})
 }
 
 // queueAttributes reads a queue's whole attribute set through the raw client.
@@ -108,6 +156,97 @@ func queueAttributes(t *testing.T, name string) map[string]string {
 		t.Fatalf("read the attributes of %s: %v", name, err)
 	}
 	return attributes.Attributes
+}
+
+// queuePolicy reads a queue's resource policy back and parses it.
+func queuePolicy(t *testing.T, name string) policy {
+	t.Helper()
+	raw := queueAttributes(t, name)["Policy"]
+	if raw == "" {
+		t.Fatalf("%s has no Policy attribute: any credential in the account could send to "+
+			"it or read it", name)
+	}
+	var parsed policy
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		t.Fatalf("read the policy of %s %q: %v", name, raw, err)
+	}
+	if parsed.Version != "2012-10-17" {
+		t.Errorf("the policy of %s is version %q, want 2012-10-17", name, parsed.Version)
+	}
+	return parsed
+}
+
+// policy is the part of an SQS resource policy these assertions read.
+type policy struct {
+	Version   string      `json:"Version"`
+	Statement []statement `json:"Statement"`
+}
+
+type statement struct {
+	Effect    string    `json:"Effect"`
+	Principal principal `json:"Principal"`
+	Action    oneOrMany `json:"Action"`
+}
+
+// principal is `{"AWS": ...}`, or the string "*", which IAM also admits.
+type principal struct {
+	AWS oneOrMany `json:"AWS"`
+}
+
+func (p *principal) UnmarshalJSON(raw []byte) error {
+	if string(raw) == `"*"` {
+		p.AWS = oneOrMany{"*"}
+		return nil
+	}
+	type plain principal
+	var decoded plain
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return err
+	}
+	*p = principal(decoded)
+	return nil
+}
+
+// oneOrMany is a field IAM lets be written as one string or as a list of them.
+type oneOrMany []string
+
+func (o *oneOrMany) UnmarshalJSON(raw []byte) error {
+	var one string
+	if err := json.Unmarshal(raw, &one); err == nil {
+		*o = oneOrMany{one}
+		return nil
+	}
+	var many []string
+	if err := json.Unmarshal(raw, &many); err != nil {
+		return err
+	}
+	*o = many
+	return nil
+}
+
+// allows reports whether an Allow statement names both the principal and the
+// action. Exact names: the script writes no wildcards, and a wildcard that
+// crept in should read as a change rather than as a grant.
+func (p policy) allows(who, action string) bool {
+	return slices.Contains(p.granted(action), who)
+}
+
+// granted lists every principal some Allow statement grants the action to,
+// sorted and without repeats.
+func (p policy) granted(action string) []string {
+	var principals []string
+	for _, s := range p.Statement {
+		if s.Effect != "Allow" || !slices.Contains(s.Action, action) {
+			continue
+		}
+		for _, who := range s.Principal.AWS {
+			if !slices.Contains(principals, who) {
+				principals = append(principals, who)
+			}
+		}
+	}
+	slices.Sort(principals)
+	return principals
 }
 
 // TestOnStartRefusesAQueueNobodyProvisioned is the reason resolution happens at

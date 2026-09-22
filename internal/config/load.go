@@ -77,9 +77,24 @@ const (
 var (
 	defaultWageringBackoff  = Backoff{Initial: time.Second, Factor: 2, Max: time.Minute}
 	defaultConsumerBackoff  = Backoff{Initial: 2 * time.Second, Factor: 2, Max: time.Minute}
-	defaultPublisherBackoff = Backoff{Initial: 2 * time.Second, Factor: 2, Max: 5 * time.Minute}
+	defaultPublisherBackoff = Backoff{Initial: 2 * time.Second, Factor: 2, Max: time.Minute}
 	defaultReferenceBackoff = Backoff{Initial: 2 * time.Second, Factor: 2, Max: time.Minute}
 )
+
+// sqsDeduplicationWindow is how long a FIFO queue remembers a message's
+// deduplication id. SQS fixes it at five minutes and nothing here can change
+// it.
+//
+// It is the one number from outside this process that the publisher's schedule
+// has to respect, and the reason [reader.publisher] checks two of its waits
+// against it. An outbox event is sent again when its claim expires or its
+// backoff elapses, and the second send is one message on the wire rather than
+// two only while the queue still remembers the first one's id — so a claim
+// hold or a backoff ceiling at or past the window is a configuration under
+// which a publisher killed between sending and marking puts a duplicate on the
+// queue. The ceiling's default was once exactly five minutes, which is the
+// window itself and not inside it.
+const sqsDeduplicationWindow = 5 * time.Minute
 
 // Lookup is where a configuration value comes from.
 //
@@ -531,7 +546,7 @@ func (r *reader) consumer() Consumer {
 }
 
 func (r *reader) publisher() Publisher {
-	return Publisher{
+	publisher := Publisher{
 		Enabled:      r.flag("PUBLISHER_ENABLED", true),
 		Name:         r.publisherName(),
 		Batch:        r.count("PUBLISHER_BATCH", defaultClaimBatch),
@@ -539,6 +554,22 @@ func (r *reader) publisher() Publisher {
 		Interval:     r.duration("PUBLISHER_INTERVAL", defaultPollInterval),
 		Backoff:      r.backoff("PUBLISHER", defaultPublisherBackoff),
 		DrainTimeout: r.duration("PUBLISHER_DRAIN_TIMEOUT", defaultDrainTimeout),
+	}
+	// The two waits after which an event may be sent a second time. A value
+	// that would not parse has already been refused and replaced by its
+	// default above, so this never reports the same variable twice.
+	r.insideDeduplicationWindow("PUBLISHER_HOLD", publisher.Hold)
+	r.insideDeduplicationWindow("PUBLISHER_BACKOFF_MAX", publisher.Backoff.Max)
+	return publisher
+}
+
+// insideDeduplicationWindow refuses a publisher wait the queue would not
+// deduplicate across. See [sqsDeduplicationWindow] for why.
+func (r *reader) insideDeduplicationWindow(key string, wait time.Duration) {
+	if wait >= sqsDeduplicationWindow {
+		r.refuse(key, "is %s and must stay under the SQS FIFO deduplication window of %s; "+
+			"an event sent again after the window is a second message on the wire",
+			wait, sqsDeduplicationWindow)
 	}
 }
 

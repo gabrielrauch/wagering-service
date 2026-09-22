@@ -13,7 +13,9 @@
 #   api-1        8081   three API replicas on three host ports
 #   api-2        8082
 #   api-3        8083
-#   worker        --    two replicas, publishing nothing
+#   worker        --    two replicas, publishing no host port: nothing calls
+#                       a worker. It is the process that hosts the outbox
+#                       publisher, the consumer and the reference loop.
 #
 # and the observability stack, which the five service processes reach through
 # one address and nothing else:
@@ -67,10 +69,14 @@ x-app-environment: &app-environment
 
   AWS_REGION: us-east-1
   AWS_ENDPOINT_URL: http://localstack:4566
-  # LocalStack accepts any pair. These are read by the AWS SDK's credential
-  # chain, never by this service, and a deployment sets neither: it uses an
-  # instance role instead.
-  AWS_ACCESS_KEY_ID: test
+  # Half of a pair LocalStack accepts without looking at. Both halves are read
+  # by the AWS SDK's credential chain, never by this service, and a deployment
+  # sets neither: it uses an instance role instead. The other half is written
+  # per service below, as the name of the IAM role that service is meant to
+  # run as, so that the identity each queue policy in
+  # deploy/localstack/01-queues.sh grants to is visible where the credentials
+  # are — LocalStack Community does not enforce the policy, so the name is what
+  # there is to read.
   AWS_SECRET_ACCESS_KEY: test
   # Without it the credential chain falls through to the EC2 metadata service,
   # which on a laptop is black-holed rather than refused — five seconds of
@@ -243,6 +249,11 @@ services:
       target: api
     environment:
       <<: *app-environment
+      # The role the queue policies grant the API: resolve and inspect both
+      # live queues, for the start-up check and the readiness probe, and send
+      # to neither. See the wagering-api statements in
+      # deploy/localstack/01-queues.sh.
+      AWS_ACCESS_KEY_ID: wagering-api
       # Inside the container nothing else wants 8080, so the API takes it and
       # the host port is what tells the three replicas apart. .env.example moves
       # it to 8081 for the opposite reason: on a laptop Keycloak has 8080.
@@ -301,6 +312,11 @@ services:
       replicas: 2
     environment:
       <<: *app-environment
+      # The role the queue policies grant the worker: receive, delete and
+      # re-hide on the inbound queue and the dead-letter queue, send to the
+      # outbound queue. See the wagering-worker statements in
+      # deploy/localstack/01-queues.sh.
+      AWS_ACCESS_KEY_ID: wagering-worker
       # Identical across both replicas, deliberately. The inbox holds one row
       # per consumer per message and that row is what turns a redelivery into a
       # replay; a per-replica name would give each replica its own rows and let

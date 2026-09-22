@@ -50,12 +50,14 @@ set -euo pipefail
 #   waiting the timeout out.
 #
 # Retry limits: maxReceiveCount 5
-#   A message made visible again four times is redriven to the dead-letter
-#   queue on the fifth receipt. Five because the failures worth retrying here
-#   are transient — a lock conflict, a connection lost, the database restarting
-#   — and a handful of attempts spans them; a message that has failed five
-#   times is failing for a reason no further delivery will change, and leaving
-#   it in the queue would put it at the head of its wallet's group forever.
+#   SQS moves a message to the dead-letter queue when its receive count
+#   EXCEEDS this number — the fifth delivery is still handled, and it is when
+#   that one is spent and a sixth is due that the message is moved. Five
+#   because the failures worth retrying here are transient — a lock conflict,
+#   a connection lost, the database restarting — and a handful of attempts
+#   spans them; a message that has failed five times is failing for a reason
+#   no further delivery will change, and leaving it in the queue would put it
+#   at the head of its wallet's group forever.
 #
 # MessageRetentionPeriod: 1209600 seconds (14 days, the SQS maximum)
 #   On all three queues. On the dead-letter queue it is the window an operator
@@ -67,7 +69,75 @@ set -euo pipefail
 #   ask for it still does not spin. On the two live queues and not on the
 #   dead-letter queue, which nothing polls in a loop. The service always asks
 #   explicitly, and a request that names its own wait overrides this.
+#
+# Policy: who may do what, by IAM role
+#   Access to the broker is controlled by the broker: a caller's credentials
+#   identify a principal, and the resource policy on each queue says what that
+#   principal may call on it. Three roles in the account, and the least each
+#   can work with:
+#
+#     wagering-producer   the game providers' integration. sqs:SendMessage on
+#                         the inbound queue and nothing else — it puts
+#                         operations on the wire and never reads them back.
+#     wagering-worker     the consumer and the outbox publisher. On the inbound
+#                         queue: receive, delete and change the visibility of
+#                         messages, which is the consumer's whole vocabulary.
+#                         On the outbound queue: send, which is the
+#                         publisher's. The only role that may receive from the
+#                         dead-letter queue. On all three, GetQueueUrl and
+#                         GetQueueAttributes, because it resolves its queues
+#                         at start-up.
+#     wagering-api        the HTTP replicas. GetQueueUrl and GetQueueAttributes
+#                         on the two live queues, for the start-up check and
+#                         the readiness probe, and SendMessage nowhere: the
+#                         API never puts anything on a queue itself. A
+#                         submission becomes an outbox row, and the worker
+#                         publishes it.
+#
+#   No statement grants to "*", and there is no Deny: a principal the policy
+#   does not name is refused by default.
+#
+#   LocalStack Community does not enforce IAM. The policy is provisioned and
+#   can be read back — the integration suite reads it and checks every grant
+#   above — but a call the policy would deny still succeeds here, so a refusal
+#   cannot be demonstrated locally. On AWS it is enforced, and the three roles
+#   must exist in the account before this runs, because SQS refuses a policy
+#   naming a principal it cannot resolve. docker-compose.yml sets each
+#   service's AWS_ACCESS_KEY_ID to the name of the role it is meant to run as,
+#   so the intended identity is at least visible where the credentials are.
 # ---------------------------------------------------------------------------
+
+# The account is LocalStack's fixed one. On AWS the same three ARNs carry the
+# real account id, and the roles have to exist before the queues do.
+ACCOUNT="000000000000"
+PRODUCER_ROLE="arn:aws:iam::${ACCOUNT}:role/wagering-producer"
+WORKER_ROLE="arn:aws:iam::${ACCOUNT}:role/wagering-worker"
+API_ROLE="arn:aws:iam::${ACCOUNT}:role/wagering-api"
+
+# queue_url and queue_arn look a queue up by name once it exists. The ARN is
+# what a redrive policy and a resource policy both name a queue by, and neither
+# can be formed for a queue that does not exist yet — which is why every queue
+# is created first and configured after.
+queue_url() {
+  awslocal sqs get-queue-url --queue-name "$1" --output text --query QueueUrl
+}
+queue_arn() {
+  awslocal sqs get-queue-attributes --queue-url "$1" \
+    --attribute-names QueueArn --output text --query 'Attributes.QueueArn'
+}
+
+# set_policy attaches a resource policy to a queue.
+#
+# The policy is a JSON document carried as a STRING inside the attributes JSON,
+# so every quote in it is escaped once and the newlines it was written with are
+# dropped — the same shape the redrive policy below is written in by hand, done
+# here by the shell because a policy is ten times as long.
+set_policy() {
+  local policy
+  policy="$(tr -d '\n' <<<"$2")"
+  awslocal sqs set-queue-attributes --queue-url "$1" \
+    --attributes "{\"Policy\":\"${policy//\"/\\\"}\"}"
+}
 
 # The dead-letter queue is created first because the source queue's redrive
 # policy names it by ARN, and an ARN cannot be formed for a queue that does not
@@ -80,9 +150,33 @@ awslocal sqs create-queue \
     "MessageRetentionPeriod":"1209600"
   }' >/dev/null
 
-DLQ_URL="$(awslocal sqs get-queue-url --queue-name wager-transactions-dlq.fifo --output text --query QueueUrl)"
-DLQ_ARN="$(awslocal sqs get-queue-attributes --queue-url "$DLQ_URL" \
-  --attribute-names QueueArn --output text --query 'Attributes.QueueArn')"
+DLQ_URL="$(queue_url wager-transactions-dlq.fifo)"
+DLQ_ARN="$(queue_arn "$DLQ_URL")"
+
+# Receivable by the worker role and by nothing else. Nothing sends to it
+# directly: SQS moves messages here itself under the redrive policy, which
+# needs no grant from this queue.
+set_policy "$DLQ_URL" "$(cat <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "WorkerInspectsTheDeadLetterQueue",
+      "Effect": "Allow",
+      "Principal": {"AWS": "${WORKER_ROLE}"},
+      "Action": [
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:ChangeMessageVisibility",
+        "sqs:GetQueueUrl",
+        "sqs:GetQueueAttributes"
+      ],
+      "Resource": "${DLQ_ARN}"
+    }
+  ]
+}
+EOF
+)"
 
 # The queue the consumer reads. MessageGroupId is the wallet id and
 # MessageDeduplicationId is the envelope's message id — see the note above.
@@ -97,6 +191,49 @@ awslocal sqs create-queue \
     \"RedrivePolicy\":\"{\\\"deadLetterTargetArn\\\":\\\"${DLQ_ARN}\\\",\\\"maxReceiveCount\\\":5}\"
   }" >/dev/null
 
+INBOUND_URL="$(queue_url wager-transactions.fifo)"
+INBOUND_ARN="$(queue_arn "$INBOUND_URL")"
+
+# The producer sends, the worker consumes, the API only looks.
+set_policy "$INBOUND_URL" "$(cat <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ProducerSendsOperations",
+      "Effect": "Allow",
+      "Principal": {"AWS": "${PRODUCER_ROLE}"},
+      "Action": "sqs:SendMessage",
+      "Resource": "${INBOUND_ARN}"
+    },
+    {
+      "Sid": "WorkerConsumesOperations",
+      "Effect": "Allow",
+      "Principal": {"AWS": "${WORKER_ROLE}"},
+      "Action": [
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:ChangeMessageVisibility",
+        "sqs:GetQueueUrl",
+        "sqs:GetQueueAttributes"
+      ],
+      "Resource": "${INBOUND_ARN}"
+    },
+    {
+      "Sid": "APIChecksReadiness",
+      "Effect": "Allow",
+      "Principal": {"AWS": "${API_ROLE}"},
+      "Action": [
+        "sqs:GetQueueUrl",
+        "sqs:GetQueueAttributes"
+      ],
+      "Resource": "${INBOUND_ARN}"
+    }
+  ]
+}
+EOF
+)"
+
 # The destination the outbox publisher sends to. MessageGroupId is the
 # aggregate id and MessageDeduplicationId is the event id — see the note above.
 # No redrive policy: nothing in this deployment consumes it, and a dead-letter
@@ -109,6 +246,42 @@ awslocal sqs create-queue \
     "MessageRetentionPeriod":"1209600",
     "ReceiveMessageWaitTimeSeconds":"20"
   }' >/dev/null
+
+OUTBOUND_URL="$(queue_url wallet-events.fifo)"
+OUTBOUND_ARN="$(queue_arn "$OUTBOUND_URL")"
+
+# The worker sends — it is where the outbox publisher writes — and the API
+# only looks. No consumer is named because this deployment has none; the
+# one that arrives gets a statement of its own here.
+set_policy "$OUTBOUND_URL" "$(cat <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "WorkerPublishesEvents",
+      "Effect": "Allow",
+      "Principal": {"AWS": "${WORKER_ROLE}"},
+      "Action": [
+        "sqs:SendMessage",
+        "sqs:GetQueueUrl",
+        "sqs:GetQueueAttributes"
+      ],
+      "Resource": "${OUTBOUND_ARN}"
+    },
+    {
+      "Sid": "APIChecksReadiness",
+      "Effect": "Allow",
+      "Principal": {"AWS": "${API_ROLE}"},
+      "Action": [
+        "sqs:GetQueueUrl",
+        "sqs:GetQueueAttributes"
+      ],
+      "Resource": "${OUTBOUND_ARN}"
+    }
+  ]
+}
+EOF
+)"
 
 echo "provisioned the wagering queues:"
 awslocal sqs list-queues --output text --query 'QueueUrls[]' | tr '\t' '\n' | sed 's/^/  /'

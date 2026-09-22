@@ -592,3 +592,75 @@ func TestDurationsAreParsedInGoNotation(t *testing.T) {
 		}
 	}
 }
+
+// TestThePublisherStaysInsideTheDeduplicationWindow pins the one number from
+// outside this process that the publisher's schedule has to respect.
+//
+// An outbox event is sent again when its claim expires or its backoff elapses,
+// and the second send is one message on the wire rather than two only while
+// the queue still remembers the first one's deduplication id — which a FIFO
+// queue does for five minutes, and nothing here can change. A hold or a
+// backoff ceiling at or past that window is a configuration under which a
+// publisher killed between sending and marking puts a duplicate on the queue.
+func TestThePublisherStaysInsideTheDeduplicationWindow(t *testing.T) {
+	t.Parallel()
+
+	for _, key := range []string{"PUBLISHER_HOLD", "PUBLISHER_BACKOFF_MAX"} {
+		for _, value := range []string{"5m", "5m1s", "1h"} {
+			t.Run(key+"="+value+" is refused", func(t *testing.T) {
+				t.Parallel()
+
+				_, err := loadFrom(t, with(map[string]string{key: value}))
+				if err == nil {
+					t.Fatalf("%s=%s was accepted, and an event republished after the "+
+						"window is a second message on the wire", key, value)
+				}
+				if !strings.Contains(err.Error(), key) {
+					t.Errorf("the refusal did not name %s: %v", key, err)
+				}
+				if !strings.Contains(err.Error(), "deduplication window") {
+					t.Errorf("the refusal did not name the SQS FIFO deduplication window, "+
+						"which is the reason: %v", err)
+				}
+			})
+		}
+	}
+
+	t.Run("under the window is accepted", func(t *testing.T) {
+		t.Parallel()
+
+		cfg, err := loadFrom(t, with(map[string]string{
+			"PUBLISHER_HOLD":        "4m59s",
+			"PUBLISHER_BACKOFF_MAX": "4m",
+		}))
+		if err != nil {
+			t.Fatalf("a hold and a ceiling under five minutes were refused: %v", err)
+		}
+		if got, want := cfg.Publisher.Hold, 4*time.Minute+59*time.Second; got != want {
+			t.Errorf("hold is %s, want %s", got, want)
+		}
+		if got, want := cfg.Publisher.Backoff.Max, 4*time.Minute; got != want {
+			t.Errorf("backoff ceiling is %s, want %s", got, want)
+		}
+	})
+
+	t.Run("the defaults are under it", func(t *testing.T) {
+		t.Parallel()
+
+		// The ceiling once defaulted to exactly five minutes, which was the
+		// window itself: a process told nothing was a process the rule above
+		// would refuse if it were told the same thing out loud.
+		cfg, err := loadFrom(t, minimal())
+		if err != nil {
+			t.Fatalf("load the minimal environment: %v", err)
+		}
+		if cfg.Publisher.Hold >= 5*time.Minute {
+			t.Errorf("the default hold is %s, which is not under the five-minute window",
+				cfg.Publisher.Hold)
+		}
+		if cfg.Publisher.Backoff.Max >= 5*time.Minute {
+			t.Errorf("the default backoff ceiling is %s, which is not under the five-minute "+
+				"window", cfg.Publisher.Backoff.Max)
+		}
+	})
+}

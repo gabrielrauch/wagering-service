@@ -29,8 +29,9 @@
 // algorithm. Those live with the code that depends on them, and a copy here
 // would be a second place to change and a first place to disagree.
 //
-// The one exception is [Backoff.Factor], and it is an exception for a reason
-// worth writing down. strconv.ParseFloat("NaN", 64) succeeds with no error, so
+// There are two exceptions, and each is one for a reason worth writing down.
+//
+// The first is [Backoff.Factor]. strconv.ParseFloat("NaN", 64) succeeds with no error, so
 // a factor of NaN is a value this package would otherwise hand on, and NaN is
 // not less than anything — so a check of the form "the factor must be at least
 // one" lets it straight through. Both consumers now refuse it where they use
@@ -39,6 +40,16 @@
 // worker's backoff factor is not a number. Only the loader can say which
 // VARIABLE carried it, and only the loader refuses it before anything has been
 // built from it.
+//
+// The second is the publisher's two waits, PUBLISHER_HOLD and
+// PUBLISHER_BACKOFF_MAX, which are refused at five minutes or more. That is not
+// a constructor's rule restated — no constructor has it, because the number is
+// not this tree's. It is SQS's: a FIFO queue deduplicates on the event id for
+// exactly five minutes, so an event sent again after its claim expired or its
+// backoff elapsed is one message on the wire only while that window is still
+// open. Nothing downstream can see the window, and the loader is the only place
+// that can refuse a configuration under which a publisher killed after sending
+// would put a second copy of an event on the queue.
 //
 // # Every value is reported, not the first
 //
