@@ -2235,6 +2235,24 @@ The rest of the system made its own, in the same way and for the same reason.
   starts ten containers — five PostgreSQL, three LocalStack, two Keycloak, plus
   testcontainers' own reaper — and takes about a minute wall clock. Comfortable
   on eight CPUs; ten containers is where a four-CPU CI runner starts to matter.
+- **The `integration` and `multi` suites contend if they are chained.** Each
+  passes repeatedly alone, but running one immediately after the other fails
+  intermittently while the daemon is still busy — `dependency localstack failed
+  to start`, and a `No such container` from Compose. The two suites own their
+  containers by different models: testcontainers hands cleanup to a reaper that
+  force-removes by label *after* the test process has exited, so `go test`
+  returns while the daemon is still deleting, while the `multi` suite expects
+  Compose to own its project's containers and network from the first command.
+  The second `up` lands in the middle of the first teardown. Nothing here is
+  wrong; the suites are simply not meant to overlap, and the README says to run
+  them as separate steps.
+- **CI does not run the `multi` suite.** `.github/workflows/ci.yml` runs the
+  untagged suite and the `integration` suite as two separate steps — which is
+  also why it never meets the contention above — but it has no Docker Compose
+  stage, and the `multi` suite brings the stack up itself. So the one suite that
+  proves three API instances and two workers behave correctly together is a
+  local step, and a regression in it would not fail a pull request. Adding a
+  Compose stage is the fix; it was not in this effort's scope.
 
 ## Not completed
 

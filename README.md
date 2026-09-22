@@ -749,6 +749,23 @@ stack already healthy and the build cache warm. `make test`, `make test-race`,
 `make test-integration` and `make test-multi` are the same commands with
 `-count=1` where it matters.
 
+**Run the two container suites one at a time, not chained.** `integration` and
+`multi` each pass repeatedly on their own, but `go test -tags integration ./...`
+immediately followed by `go test -tags multi ./...` fails intermittently while
+the daemon is still busy, with `dependency localstack failed to start` and a
+`No such container` from Compose. Nothing is wrong with either suite. The
+`integration` suites are testcontainers', which hands cleanup to a reaper that
+force-removes containers by label *after* the test process has already exited,
+so `go test` returns while the daemon is still deleting; the `multi` suite is
+Compose's, and expects to own its project's containers and network from the
+first command. The second `up` lands in the middle of the first suite's
+teardown. Leave a few seconds between them, or run them in separate steps —
+which is what `make test-integration` and `make test-multi` are for. CI runs
+the untagged and `integration` suites as two separate steps and so never meets
+this; it does not run the `multi` suite at all, because that suite brings up
+Compose and the workflow has no Docker Compose stage. Running it is a local
+step today.
+
 **`go test ./...` already needs Docker.** `internal/storage/postgres` runs its
 schema-conformance suite against a real PostgreSQL 16 through testcontainers,
 with no build tag, because there is nothing to conform to without one.
@@ -758,7 +775,7 @@ with no build tag, because there is nothing to conform to without one.
 |---|---|---|
 | *(none)* | The domain, the application layer, every adapter's unit tests, the composition root's wiring, and the schema-conformance suite. | Docker (one PostgreSQL). |
 | `integration` | `internal/adapters/postgres` against the real schema, `internal/adapters/sqs` against LocalStack, `internal/messaging` for the queue path, `internal/integration` for the authenticated HTTP path and `internal/fxmod` for the whole graph — the last two against a real Keycloak running **this repository's own realm**. | Docker. Ten containers: five PostgreSQL, three LocalStack, two Keycloak — plus testcontainers' own reaper. |
-| `multi` | `internal/multi` — three API instances and two workers, with independent connections and independent memory, against one database and one pair of queues. Ten scenarios: four drive the compose replicas themselves, and six build a world of their own — a database, a pair of queues, and processes this suite starts, arms with `FAULT_POINT`, kills and replaces. | Docker, and it brings the compose stack up itself. |
+| `multi` | `internal/multi` — three API instances and two workers, with independent connections and independent memory, against one database and one set of queues. Ten scenarios: four drive the compose replicas themselves, and six build a world of their own — a database, three FIFO queues, and processes this suite starts, arms with `FAULT_POINT`, kills and replaces. | Docker, and it brings the compose stack up itself. |
 
 No mock, fake or in-memory substitute stands in for PostgreSQL, SQS or Keycloak
 in any of them. Ordering, deadlock-freedom, `SKIP LOCKED` and the deferred
@@ -770,7 +787,7 @@ The `multi` suite needs nothing started first: it runs `docker compose up
 against a stack that is already healthy, then builds `cmd/api` and `cmd/worker`
 with the race detector — because the binaries it drives are the thing under
 test. The package itself takes **43 to 46 seconds** warm, of which the ten
-scenarios are about twenty; the `./...` figure above is that plus every other
+scenarios are about thirty; the `./...` figure above is that plus every other
 package's tests. Budget about ninety seconds when Compose has to rebuild an
 image, which it does on any run where a file the `Dockerfile` copies has
 changed, and three minutes from nothing at all.
