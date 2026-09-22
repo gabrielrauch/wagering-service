@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"log/slog"
 	"net/http"
 
 	"github.com/gabrielrauch/wagering-service/internal/app"
@@ -69,11 +70,39 @@ func (a *API) submitOperation(w http.ResponseWriter, r *http.Request, principal 
 	if err == nil {
 		a.applied(ctx, result, done(nil))
 		describe(r, telemetry.TransactionID(result.TransactionID.String()))
+		a.answered(r, result)
 		a.submitted(w, r, result)
 		return
 	}
 	done(err)
 	a.fail(w, r, err)
+}
+
+// answered is the one line an operation that reached an answer over HTTP
+// leaves in the log.
+//
+// It is this door's counterpart of the consumer's "the operation was applied":
+// the same identifiers, so that an operation is found by correlation,
+// transaction, wallet or provider whichever door it came in by, and `source`
+// says which door. Only a SUBMISSION writes it — a read decided nothing — and
+// only one that the use case answered: a refusal has a line of its own, in
+// [API.record], and is the other branch.
+//
+// Written before the response rather than after, so that a line exists for an
+// operation whose answer the caller never received. Nothing of what the
+// operation was worth: an amount, a balance and a player are a financial
+// payload, and a log is not where one belongs.
+func (a *API) answered(r *http.Request, result app.OperationResult) {
+	a.logger.InfoContext(r.Context(), "the operation was answered",
+		slog.String("source", telemetry.SourceHTTP),
+		slog.String("correlationId", correlationFrom(r.Context())),
+		slog.String("transactionId", result.TransactionID.String()),
+		slog.String("walletId", result.WalletID.String()),
+		slog.String("providerId", result.ProviderID.String()),
+		slog.String("kind", result.Kind.String()),
+		slog.String("status", result.Status.String()),
+		slog.String("failureCode", result.FailureCode.String()),
+		slog.Bool("replay", result.IdempotentReplay))
 }
 
 // readOperation reads one operation by this system's identifier for it.

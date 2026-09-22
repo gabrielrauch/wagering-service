@@ -354,10 +354,19 @@ func (w *ReferenceWorker) counted(
 // one that was not has reached a status it will never leave — including the
 // rejection that ends a wait budget, which arrives here as an ordinary settled
 // outcome because that is exactly what it is.
+//
+// Both carry the identifiers the consumer's line carries. A parked operation
+// was submitted on another door, possibly days ago, and the correlation it was
+// submitted under is the only thing that ties this line back to that request or
+// message; the wallet and the provider are what an operator pivots on once
+// there. Nothing of what it was worth, for the reason every line gives.
 func (w *ReferenceWorker) report(ctx context.Context, outcome app.ResumeOutcome) {
 	attrs := []any{
 		slog.String("worker", w.name),
+		slog.String("correlationId", outcome.Correlation),
 		slog.String("transactionId", outcome.Result.TransactionID.String()),
+		slog.String("walletId", outcome.Result.WalletID.String()),
+		slog.String("providerId", outcome.Result.ProviderID.String()),
 		slog.String("kind", outcome.Result.Kind.String()),
 		slog.String("status", outcome.Result.Status.String()),
 		slog.Int("woke", outcome.Woke),

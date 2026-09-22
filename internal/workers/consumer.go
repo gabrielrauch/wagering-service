@@ -565,15 +565,43 @@ func (c *Consumer) handle(ctx context.Context, m sqs.Message) (disposition, time
 		return poisoned, 0
 	}
 	in := wholeSeconds(c.backoff.after(m.ReceiveCount))
-	c.telemetry.RecordQueueRetry(ctx, c.name, string(class))
 	c.telemetry.Failed(span, string(class), telemetry.Class(string(class)))
-	c.logger.WarnContext(ctx, "the operation could not be applied and will be delivered again",
-		c.about(m, submission.Correlation,
-			slog.String("messageId", e.MessageID),
-			slog.String("class", string(class)),
-			slog.Duration("hiddenFor", in),
-			slog.String("error", err.Error()))...)
+	c.handedBack(ctx, m, submission.Correlation, e.MessageID, class, in, err)
 	return deferred, in
+}
+
+// handedBack records a message that failed transiently and is being hidden for
+// another delivery.
+//
+// It is a retry whichever delivery it is, and is counted and said as one. On
+// the last delivery the redrive policy allows it is ALSO a dead letter: the
+// message is hidden for its backoff exactly as any other, but when the backoff
+// runs out the policy moves it rather than delivers it, so this consumer has
+// seen it for the last time. That second fact is counted and said in addition
+// to the first rather than instead of it — the retry rate is a database under
+// pressure and recovers, and the dead-letter count is work about to be lost;
+// they are different incidents, and here they are both true. Before this was
+// written, a message whose last delivery met a lock timeout left the dead-letter
+// count untouched, and the class of failure that is an outage was the one the
+// alert could not see.
+func (c *Consumer) handedBack(
+	ctx context.Context, m sqs.Message, correlation, messageID string,
+	class app.Class, in time.Duration, cause error,
+) {
+	c.telemetry.RecordQueueRetry(ctx, c.name, string(class))
+	attrs := c.about(m, correlation,
+		slog.String("messageId", messageID),
+		slog.String("class", string(class)),
+		slog.Duration("hiddenFor", in),
+		slog.String("error", cause.Error()))
+	c.logger.WarnContext(ctx, "the operation could not be applied and will be delivered again",
+		attrs...)
+	if c.lastDelivery(m) {
+		c.telemetry.RecordDeadLetter(ctx, c.name)
+		c.logger.ErrorContext(ctx,
+			"the operation could not be applied and this was its last delivery before the dead-letter queue",
+			attrs...)
+	}
 }
 
 // counted records what one applied message came to.
@@ -737,7 +765,9 @@ func (c *Consumer) poison(ctx context.Context, m sqs.Message, messageID string, 
 //
 // What it says is the operation's identity and what it came to, and nothing of
 // what it was worth: an amount, a balance and a player are a financial payload,
-// and a log is not where one belongs.
+// and a log is not where one belongs. The wallet and the provider come from the
+// RESULT rather than from the envelope, because the result is what was
+// recorded and the envelope is what was claimed.
 func (c *Consumer) applied(
 	ctx context.Context, m sqs.Message, s app.SubmitOperation, result app.OperationResult,
 ) {
@@ -745,6 +775,8 @@ func (c *Consumer) applied(
 		c.about(m, s.Correlation,
 			slog.String("messageId", s.Inbox.MessageID),
 			slog.String("transactionId", result.TransactionID.String()),
+			slog.String("walletId", result.WalletID.String()),
+			slog.String("providerId", result.ProviderID.String()),
 			slog.String("kind", result.Kind.String()),
 			slog.String("status", result.Status.String()),
 			slog.String("failureCode", result.FailureCode.String()),

@@ -402,6 +402,38 @@ func TestWhatBecameOfAMessageIsCounted(t *testing.T) {
 			},
 		},
 		{
+			name: "a transient failure on the last delivery",
+			// Counted twice, and the two counts are different facts. The retry
+			// says the message was hidden for its backoff, which it was; the
+			// dead letter says that when the backoff runs out the redrive policy
+			// will move it rather than deliver it, which it will. Before this
+			// case existed the second fact was invisible for exactly the class
+			// of failure that is a database outage.
+			deliveries: testMaxReceives,
+			body:       func(t *testing.T) []byte { return validBody(t, nil) },
+			answer: func(context.Context, int, app.SubmitOperation) (app.OperationResult, error) {
+				return app.OperationResult{}, app.AsRetryable(errUnavailable)
+			},
+			counts: []count{
+				{telemetry.MetricQueueDeadLetters, deadLetters, 1},
+				{telemetry.MetricQueueRetries, retries, 1},
+				{telemetry.MetricInboxDuplicates, duplicates, 0},
+				{telemetry.MetricTransactions, applied, 0},
+			},
+		},
+		{
+			name:       "a transient failure with one delivery still to come",
+			deliveries: testMaxReceives - 1,
+			body:       func(t *testing.T) []byte { return validBody(t, nil) },
+			answer: func(context.Context, int, app.SubmitOperation) (app.OperationResult, error) {
+				return app.OperationResult{}, app.AsRetryable(errUnavailable)
+			},
+			counts: []count{
+				{telemetry.MetricQueueRetries, retries, 1},
+				{telemetry.MetricQueueDeadLetters, deadLetters, 0},
+			},
+		},
+		{
 			name:       "a body nobody can read, on its last delivery",
 			deliveries: testMaxReceives,
 			body:       func(*testing.T) []byte { return []byte("{") },

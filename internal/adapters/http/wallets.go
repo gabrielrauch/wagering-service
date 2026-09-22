@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"log/slog"
 	"net/http"
 	"strconv"
 
@@ -49,6 +50,7 @@ func (a *API) openWallet(w http.ResponseWriter, r *http.Request, principal app.P
 		// disagree by exactly the openings.
 		a.applied(ctx, *opening, took)
 	}
+	a.opened(r, view)
 
 	rendered := walletOf(view)
 	if opening != nil {
@@ -57,6 +59,20 @@ func (a *API) openWallet(w http.ResponseWriter, r *http.Request, principal app.P
 	}
 	w.Header().Set("Location", "/wallets/"+view.ID.String())
 	a.writeJSON(w, r, http.StatusCreated, rendered)
+}
+
+// opened is the one line a wallet that was opened leaves in the log: the
+// thread it was opened under, and the wallet's own identifier — which names the
+// wallet without naming whose it is.
+//
+// The player is not on it, for the reason the span above does not carry one.
+// The balance it was opened with is not on it either, and neither is the
+// opening's transaction: an opening that moved money has already been counted
+// as an operation, and the wallet's ledger is where that entry is looked up.
+func (a *API) opened(r *http.Request, view app.WalletView) {
+	a.logger.InfoContext(r.Context(), "the wallet was opened",
+		slog.String("correlationId", correlationFrom(r.Context())),
+		slog.String("walletId", view.ID.String()))
 }
 
 // readWallet reads a wallet.

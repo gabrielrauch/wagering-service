@@ -40,10 +40,18 @@ const (
 
 	// MetricQueueRetries counts messages handed back for another delivery.
 	MetricQueueRetries = "wagering.sqs.retries"
-	// MetricQueueDeadLetters counts messages left on what the redrive policy
-	// says is their last delivery. It is an estimate for the reason
-	// ApproximateReceiveCount is: the count SQS reports is approximate, and the
-	// policy is judged on the same approximate number.
+	// MetricQueueDeadLetters counts messages whose last permitted delivery
+	// ended in a failure of either class: a permanent one, left untouched for
+	// the redrive policy to move, or a transient one, hidden for a backoff
+	// after which the policy moves it rather than delivers it. The second is
+	// also counted under [MetricQueueRetries], and the overlap is deliberate —
+	// the retry says the message was handed back, the dead letter says nobody
+	// will be handed it — so a database outage on a message's fifth delivery
+	// moves both.
+	//
+	// It is an estimate for the reason ApproximateReceiveCount is: the count
+	// SQS reports is approximate, and the policy is judged on the same
+	// approximate number.
 	MetricQueueDeadLetters = "wagering.sqs.dead_letters"
 
 	// MetricLockTimeouts counts transactions that gave up waiting for a row
@@ -192,7 +200,7 @@ func newInstruments(meter metric.Meter) (*instruments, error) {
 	}
 	if i.queueDeadLetters, err = meter.Int64Counter(MetricQueueDeadLetters,
 		metric.WithUnit(unitMessage),
-		metric.WithDescription("Messages left on their last delivery before the dead-letter queue."),
+		metric.WithDescription("Messages whose last delivery before the dead-letter queue ended in a failure."),
 	); err != nil {
 		return nil, fail(MetricQueueDeadLetters, err)
 	}
@@ -306,8 +314,9 @@ func (t *Telemetry) RecordQueueRetry(ctx context.Context, consumer, class string
 	))
 }
 
-// RecordDeadLetter counts a message left on what the redrive policy says is its
-// last delivery.
+// RecordDeadLetter counts a message whose delivery the redrive policy says was
+// its last, whether it was left for the policy or hidden for a backoff it will
+// not be delivered after.
 func (t *Telemetry) RecordDeadLetter(ctx context.Context, consumer string) {
 	if t == nil {
 		return

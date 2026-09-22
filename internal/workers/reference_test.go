@@ -170,6 +170,53 @@ func TestWhatAClaimedTurnReports(t *testing.T) {
 	}
 }
 
+// The carried-forward line names the same identifiers the consumer's line does,
+// because a parked operation's thread started on another door days ago and this
+// is the line that has to be found from it: the correlation the operation was
+// submitted under, the wallet it moved and the provider it was submitted as.
+func TestACarriedForwardOperationIsIdentifiedOnItsLine(t *testing.T) {
+	wallet := wagering.NewWalletID()
+	outcome := app.ResumeOutcome{
+		Claimed:     true,
+		Correlation: "thread-1",
+		Result: app.OperationResult{
+			TransactionID: wagering.NewTransactionID(),
+			WalletID:      wallet,
+			ProviderID:    "acme",
+			Kind:          wagering.Rollback,
+			Status:        wagering.Processed,
+		},
+	}
+	log := &recorder{}
+	resumer := newFakeResumer(func(n int) (app.ResumeOutcome, error) {
+		if n == 0 {
+			return outcome, nil
+		}
+		return app.ResumeOutcome{}, nil
+	})
+	workerOver(t, t.Context(), ReferenceConfig{
+		Wagering: resumer, Logger: log.logger(), Interval: time.Hour,
+	})
+	resumer.awaitTurns(t, 2)
+
+	record := log.await(t, "a parked operation was carried forward")
+	for key, want := range map[string]string{
+		"correlationId": "thread-1",
+		"transactionId": outcome.Result.TransactionID.String(),
+		"walletId":      wallet.String(),
+		"providerId":    "acme",
+	} {
+		if got, ok := attr(record, key); !ok || got != want {
+			t.Errorf("%s = %q, want %q", key, got, want)
+		}
+	}
+	for _, forbidden := range []string{"amount", "balance", "playerId", "body"} {
+		if _, carried := attr(record, forbidden); carried {
+			t.Errorf("the line carries %q, which belongs in the database and not a log", forbidden)
+		}
+	}
+}
+
 // A turn that failed is reported at the level its class deserves and the worker
 // keeps going.
 func TestAFailedTurnIsReportedAndRetried(t *testing.T) {

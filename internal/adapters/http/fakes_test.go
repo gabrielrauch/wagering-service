@@ -354,6 +354,17 @@ func attr(record *slog.Record, key string) string {
 	return found
 }
 
+// attrsOf reads every attribute off a record, rendered, for asserting that a
+// line carries exactly a set of keys and nothing beside them.
+func attrsOf(record *slog.Record) map[string]string {
+	found := make(map[string]string, record.NumAttrs())
+	record.Attrs(func(a slog.Attr) bool {
+		found[a.Key] = a.Value.String()
+		return true
+	})
+	return found
+}
+
 // rendered is everything that was logged, as one string, for asserting that
 // something never appears in any of it.
 func (h *recorder) rendered() string {
