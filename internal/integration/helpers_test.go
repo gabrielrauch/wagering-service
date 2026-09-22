@@ -26,9 +26,10 @@ const currency = "BRL"
 // of the struct the handler decodes into could not notice a member being
 // renamed on one side only.
 type submission struct {
-	Provider                       string `json:"provider"`
+	Provider                       string `json:"providerId"`
 	ExternalTransactionID          string `json:"externalTransactionId"`
 	PlayerID                       string `json:"playerId"`
+	WalletID                       string `json:"walletId"`
 	RoundID                        string `json:"roundId"`
 	GameID                         string `json:"gameId"`
 	Kind                           string `json:"kind"`
@@ -55,9 +56,10 @@ type operation struct {
 	IdempotentReplay      bool    `json:"idempotentReplay"`
 }
 
-// walletView is the view /wallets answers with.
+// walletView is the view /wallets answers with. The wallet's identifier is
+// spelled id, as the specification spells it.
 type walletView struct {
-	WalletID string     `json:"walletId"`
+	WalletID string     `json:"id"`
 	PlayerID string     `json:"playerId"`
 	Balance  amount     `json:"balance"`
 	Version  uint64     `json:"version"`
@@ -72,12 +74,15 @@ type refusalBody struct {
 	CorrelationID string `json:"correlationId"`
 }
 
-// bet builds the submission a provider makes for a wager.
-func bet(provider, external, player, value string) submission {
+// bet builds the submission a provider makes for a wager, against the wallet
+// the scenario opened: a provider names both the player and the wallet it
+// addresses, as one that was told the id at opening would.
+func bet(provider, external string, wallet walletView, value string) submission {
 	return submission{
 		Provider:              provider,
 		ExternalTransactionID: external,
-		PlayerID:              player,
+		PlayerID:              wallet.PlayerID,
+		WalletID:              wallet.WalletID,
 		RoundID:               "round-" + external,
 		GameID:                "game-1",
 		Kind:                  "BET",

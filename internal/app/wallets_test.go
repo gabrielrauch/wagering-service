@@ -117,13 +117,15 @@ func TestAPlayerMayHoldOneWalletPerCurrency(t *testing.T) {
 	}
 }
 
-// A bet for a player with no wallet in that currency is NotFound, and nothing is
-// persisted — so the same submission succeeds under the same key once the wallet
-// exists. This layer never opens a wallet on a provider's behalf.
+// A bet naming a wallet that does not exist is NotFound, and nothing is
+// persisted — so the same key is still free once the provider names a wallet
+// that does. This layer never opens a wallet on a provider's behalf.
 func TestSubmittingAgainstAnUnknownWalletIsNotFoundAndPersistsNothing(t *testing.T) {
 	f := newFixture(t)
 
-	_, err := f.trySubmit(t, fields(acme, submission{Kind: "BET", External: "ext-1", Key: "key-1", Amount: "25.00"}))
+	unknown := fields(acme, submission{Kind: "BET", External: "ext-1", Key: "key-1", Amount: "25.00"})
+	unknown.WalletID = wagering.NewWalletID().String()
+	_, err := f.trySubmit(t, unknown)
 
 	assertClass(t, err, app.NotFound)
 	if got := f.db.transactionCount(); got != 0 {
@@ -137,6 +139,9 @@ func TestSubmittingAgainstAnUnknownWalletIsNotFoundAndPersistsNothing(t *testing
 	result := f.submit(t, fields(acme, submission{Kind: "BET", External: "ext-1", Key: "key-1", Amount: "25.00"}))
 	if result.Status != wagering.Processed {
 		t.Errorf("status %s, want %s", result.Status, wagering.Processed)
+	}
+	if result.IdempotentReplay {
+		t.Error("the corrected submission was answered as a replay of one that was never recorded")
 	}
 }
 

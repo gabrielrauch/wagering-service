@@ -193,13 +193,14 @@ type WalletStore interface {
 	// of the concurrency design, and that decision belongs to the use case that
 	// can see the rest of the statements.
 	LockForMovement(ctx context.Context, key wagering.WalletKey) (*wagering.Wallet, error)
-	// LockByID takes the same lock on a wallet already known by identifier.
+	// LockByID takes the same lock on a wallet known by identifier, which is
+	// how both write paths know it: a submission names the wallet it addresses,
+	// and the resume worker has read a row that names it outright.
 	//
-	// Two doors rather than one because the two write paths know the wallet
-	// differently: a submission has a player and a currency and nothing else,
-	// while the resume worker has read a row that names the wallet outright.
-	// Making the worker look the key up in order to lock by it would add a read
-	// whose only purpose is to restate something it already has.
+	// LockForMovement remains for a caller that knows a wallet only by its key.
+	// No use case in this package takes it any more — a submission once did,
+	// resolving the wallet from the player and currency it named, until the
+	// contract made the wallet a member the provider submits.
 	LockByID(ctx context.Context, id wagering.WalletID) (*wagering.Wallet, error)
 }
 
@@ -210,13 +211,22 @@ type TransactionReader interface {
 	ByExternal(ctx context.Context, p wagering.Provider, e wagering.ExternalTransactionID) (*StoredTransaction, error)
 	ByIdempotencyKey(ctx context.Context, p wagering.Provider, k wagering.IdempotencyKey) (*StoredTransaction, error)
 	// ReferenceFor builds the view of the transaction an operation points at:
-	// the reference itself, and the reversals pointing back at it.
+	// the reference itself, and every PROCESSED reversal pointing back at it,
+	// each flagged with whether it has since been reversed.
 	//
-	// The active reversal must be rehydrated as a real transaction, not
-	// signalled by a flag. ReferenceView.ActiveReversal skips a view whose
-	// Transaction is nil, so a synthetic holder makes REFERENCE_ALREADY_REVERSED
-	// unreachable in the domain — the rule would still be in the schema, and
-	// nowhere else.
+	// Every processed reversal, and not only the one currently holding the
+	// reference. The domain asks the view two things — what holds this, and
+	// which kinds of reversal have already succeeded on it — and a refund that
+	// was later rolled back answers the second while no longer answering the
+	// first. A view that carries only the current holder makes the repeat of
+	// that refund unreachable in the domain, and the rule then lives only in
+	// the schema's index.
+	//
+	// Each reversal must be rehydrated as a real transaction, not signalled by
+	// a flag. Both ReferenceView.ActiveReversal and HasSuccessfulReversalOfKind
+	// skip a view whose Transaction is nil, so a synthetic holder makes
+	// REFERENCE_ALREADY_REVERSED unreachable in the domain — the rule would
+	// still be in the schema, and nowhere else.
 	//
 	// A reference that is not found is (nil, nil), never NotFound. The domain
 	// distinguishes "named a reference that has not arrived" from "named none",

@@ -16,17 +16,18 @@ import (
 
 // MessageType is the one type this consumer accepts on the inbound queue.
 //
-// The original challenge specification is not in this tree, so the spelling is
-// this implementation's and is recorded in ARCHITECTURE.md as such. It is
-// PascalCase to match the event types the outbound envelope already carries —
-// WagerTransactionProcessed and its siblings — and it names what the message
-// is, which is a provider asking for an operation to be applied, rather than
-// which operation: the kind lives in data.kind exactly as it does on the HTTP
-// path, so that one payload is not described in two places.
+// The spelling is the challenge specification's. It is PascalCase like the
+// event types the outbound envelope carries — WagerTransactionProcessed and
+// its siblings — and it names what the message is, which is a provider asking
+// for an operation to be applied, rather than which operation: the kind lives
+// in data.kind exactly as it does on the HTTP path, so that one payload is not
+// described in two places.
 //
 // It is exported because a producer has to be able to name it and because the
-// integration suite sends it. Any other value is a permanent error.
-const MessageType = "WagerTransactionSubmitted"
+// integration suite sends it. Any other value is a permanent error, including
+// the spelling this consumer accepted before the specification was in the
+// tree, WagerTransactionSubmitted.
+const MessageType = "WagerTransactionRequested"
 
 // envelope is the inbound message: what it is, which message it is, when the
 // provider says it happened, and the operation it carries.
@@ -42,23 +43,26 @@ type envelope struct {
 	Data       operation `json:"data"`
 }
 
-// operation is the business fields of one submission.
+// operation is the business fields of one submission, spelled as the
+// specification spells them.
 //
 // The member names are the HTTP body's, because they are the names
 // wagering.CanonicalPayload hashes: the bytes a provider sends over either
 // transport, the bytes that are hashed, and the bytes that come back are one
 // vocabulary, and a submission that arrived by queue must hash to what the same
-// submission would have hashed to over HTTP.
+// submission would have hashed to over HTTP. The wallet is among them: a
+// producer names the wallet it addresses, as a provider does over HTTP.
 //
 // The idempotency key is the one addition, and it is a member here where HTTP
 // takes it in a header. There is no header on a queue; the key is still about
 // this delivery of the operation rather than about the operation, which is why
 // the canonical payload excludes it in both directions.
 type operation struct {
-	Provider                       string     `json:"provider"`
+	Provider                       string     `json:"providerId"`
 	ExternalTransactionID          string     `json:"externalTransactionId"`
 	IdempotencyKey                 string     `json:"idempotencyKey"`
 	PlayerID                       string     `json:"playerId"`
+	WalletID                       string     `json:"walletId"`
 	RoundID                        string     `json:"roundId"`
 	GameID                         string     `json:"gameId"`
 	Kind                           string     `json:"kind"`
@@ -130,7 +134,9 @@ func describeDecode(err error) error {
 // submission said — a second opinion here would be a second place for the two
 // to drift apart. What is checked is what has to be right before a transaction
 // is opened: which message this is, that it is a message this consumer handles
-// at all, and that the provider it claims is a provider.
+// at all, when it happened, and that it names the wallet it addresses — the one
+// business member whose absence is not a malformed value but a message with
+// nothing to be applied to.
 func (e envelope) validate() error {
 	switch {
 	case e.MessageID == "":
@@ -148,6 +154,8 @@ func (e envelope) validate() error {
 			e.Type, MessageType)
 	case e.OccurredAt.IsZero():
 		return errors.New("workers: the envelope carries no occurredAt")
+	case e.Data.WalletID == "":
+		return errors.New("workers: the envelope carries no walletId")
 	}
 	return nil
 }
@@ -184,6 +192,7 @@ func (e envelope) fields() app.OperationFields {
 		ExternalTransactionID:          e.Data.ExternalTransactionID,
 		IdempotencyKey:                 e.Data.IdempotencyKey,
 		PlayerID:                       e.Data.PlayerID,
+		WalletID:                       e.Data.WalletID,
 		RoundID:                        e.Data.RoundID,
 		GameID:                         e.Data.GameID,
 		Kind:                           e.Data.Kind,

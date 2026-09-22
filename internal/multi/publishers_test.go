@@ -65,7 +65,7 @@ func TestTwoPublishersKilledAtEitherEndOfTheSendPublishEveryEventExactlyOnce(t *
 		for j := range 2 {
 			external := scoped(fmt.Sprintf("publishers-bet-%d-%d", i, j))
 			got := operationOf(t, submit(t, w.base, providerA,
-				bet(providerA, external, player, "5.00"), external+"-key"))
+				bet(providerA, external, wallet, "5.00"), external+"-key"))
 			if got.Status != processed {
 				t.Fatalf("the bet %s is %s (%s), wanted %s",
 					external, got.Status, got.FailureCode, processed)

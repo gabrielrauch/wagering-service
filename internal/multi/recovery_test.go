@@ -71,7 +71,7 @@ func TestAConsumerKilledBetweenTheCommitAndTheDeleteAppliesTheMessageOnce(t *tes
 		consumes:   true,
 		faultPoint: faults.AfterCommitBeforeAck,
 	})
-	w.put(t, onTheQueue(bet(providerA, external, player, "30.00"), message,
+	w.put(t, onTheQueue(bet(providerA, external, wallet, "30.00"), message,
 		scoped("killed-key")), wallet.WalletID)
 	diedAtFaultPoint(t, armed, faults.AfterCommitBeforeAck, faultBudget)
 
@@ -163,7 +163,7 @@ func TestAReferenceWorkerKilledAfterItParkedAnOperationIsResumedByAnother(t *tes
 	// The refund first, naming a bet nobody has submitted. The group is the
 	// wallet, so the order these two arrive in is the queue's guarantee rather
 	// than this test's hope.
-	w.put(t, onTheQueue(inRound(refund(providerA, reversal, player, "40.00", stake), round),
+	w.put(t, onTheQueue(inRound(refund(providerA, reversal, wallet, "40.00", stake), round),
 		scoped("killed-reference-refund-message"), scoped("killed-reference-refund-key")),
 		wallet.WalletID)
 
@@ -184,7 +184,7 @@ func TestAReferenceWorkerKilledAfterItParkedAnOperationIsResumedByAnother(t *tes
 
 	// The bet arrives, and a different process finds both it and the operation
 	// the dead one left parked.
-	w.put(t, onTheQueue(inRound(bet(providerA, stake, player, "40.00"), round),
+	w.put(t, onTheQueue(inRound(bet(providerA, stake, wallet, "40.00"), round),
 		scoped("killed-reference-bet-message"), scoped("killed-reference-bet-key")),
 		wallet.WalletID)
 	replacement := w.startWorker(t, "reference-replacement", workerSettings{

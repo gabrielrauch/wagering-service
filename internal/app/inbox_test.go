@@ -19,7 +19,7 @@ func (f *fixture) fromQueue(
 		Principal:   providerPrincipal(t, acme),
 		Correlation: "corr-" + messageID,
 		Inbox:       &app.InboxMessage{Consumer: consumer, MessageID: messageID, BodyHash: bodyHash},
-		Fields:      of,
+		Fields:      f.addressed(of),
 	})
 }
 

@@ -35,7 +35,7 @@ func TestARefusedRequestWritesNothing(t *testing.T) {
 	// existing rows that a weaker snapshot would miss.
 	wallet := s.openWallet(t, "player-audited", "100.00")
 	existing := operationOf(t, s.submit(t, providerA,
-		bet(providerA, "ext-audited", "player-audited", "10.00"), "key-audited"))
+		bet(providerA, "ext-audited", wallet, "10.00"), "key-audited"))
 
 	before := s.snapshot(t)
 	if before["wallet"].rows == 0 || before["wager_transaction"].rows == 0 ||
@@ -62,8 +62,8 @@ func TestARefusedRequestWritesNothing(t *testing.T) {
 		"playerId":       "player-unopened",
 		"initialBalance": amount{Amount: "50.00", Currency: currency},
 	})
-	betBody := encode(t, bet(providerA, "ext-unauthorised", "player-audited", "25.00"))
-	replayBody := encode(t, bet(providerA, "ext-audited", "player-audited", "10.00"))
+	betBody := encode(t, bet(providerA, "ext-unauthorised", wallet, "25.00"))
+	replayBody := encode(t, bet(providerA, "ext-audited", wallet, "10.00"))
 
 	for _, c := range []struct {
 		name string
@@ -153,7 +153,7 @@ func TestARefusedRequestWritesNothing(t *testing.T) {
 	// The control. One authorised submission, and the snapshot has to move —
 	// otherwise everything above passed because the snapshot sees nothing.
 	if got := s.submit(t, providerA,
-		bet(providerA, "ext-control", "player-audited", "5.00"), "key-control"); got.status != http.StatusOK {
+		bet(providerA, "ext-control", wallet, "5.00"), "key-control"); got.status != http.StatusOK {
 		t.Fatalf("the control submission was answered %s", got)
 	}
 	moved := movedTables(before, s.snapshot(t))

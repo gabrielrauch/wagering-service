@@ -116,7 +116,7 @@ func TestOneTraceSpansTheCommandAndTheEventItCaused(t *testing.T) {
 
 	s := newStack(t, withTelemetry(reporting))
 	const player = "player-traced"
-	s.openWallet(t, player, "100.00")
+	wallet := s.openWallet(t, player, "100.00")
 
 	// The span an HTTP request would have opened, and the command inside it.
 	ctx, request := reporting.Start(t.Context(), "POST /wagering/transactions",
@@ -129,7 +129,7 @@ func TestOneTraceSpansTheCommandAndTheEventItCaused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("principal: %v", err)
 	}
-	op := operationOf("BET", "external-traced", player, "25.00")
+	op := operationOf("BET", "external-traced", player, wallet, "25.00")
 	result, err := s.wagering.Submit(ctx, app.SubmitOperation{
 		Principal:   principal,
 		Correlation: "thread-traced",

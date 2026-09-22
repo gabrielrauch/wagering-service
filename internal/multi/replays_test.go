@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -74,7 +75,7 @@ func TestOneBetSubmittedFiftyTimesAcrossThreeInstancesDebitsOnce(t *testing.T) {
 	key := scoped("burst-key")
 
 	wallet := openWallet(t, instances[0], player, "500.00")
-	body := encode(t, bet(providerA, external, player, "7.00"))
+	body := encode(t, bet(providerA, external, wallet, "7.00"))
 	credential := token(t, providerA)
 
 	// Every goroutine built and ready before any of them sends, so that fifty
@@ -210,7 +211,7 @@ func TestTwoConcurrentBetsForMoreThanTheBalanceLeaveExactlyOneRejected(t *testin
 	released := make(chan struct{})
 	var wg sync.WaitGroup
 	for _, b := range bets {
-		body := encode(t, bet(providerA, b.external, player, "80.00"))
+		body := encode(t, bet(providerA, b.external, wallet, "80.00"))
 		wg.Go(func() {
 			<-released
 			b.got, b.err = attempt(call{
@@ -272,7 +273,7 @@ func TestTwoConcurrentBetsForMoreThanTheBalanceLeaveExactlyOneRejected(t *testin
 	before := ledgerOf(t, owner, wallet.WalletID)
 	for i, b := range bets {
 		again := operationOf(t, submit(t, instances[2], providerA,
-			bet(providerA, b.external, player, "80.00"), b.key))
+			bet(providerA, b.external, wallet, "80.00"), b.key))
 		if !again.IdempotentReplay {
 			t.Errorf("resending %s was not answered as a replay, so the resend was not "+
 				"recognised as one", b.external)
@@ -308,9 +309,18 @@ func partition(outcomes []operationAnswer) (processedOnes, rejectedOnes []operat
 	return processedOnes, rejectedOnes
 }
 
-// scoped names a value so that it belongs to this run and to no other.
+// scoped names a value so that it belongs to this run, and to this call within
+// it, and to no other.
 //
 // The deployment's database is shared and outlives a run — nothing drops it —
 // so every row these scenarios assert on is found by an identifier carrying the
-// run rather than by counting what is in a table.
-func scoped(what string) string { return fmt.Sprintf("%s-%s", what, runID) }
+// run rather than by counting what is in a table. The call counter is for
+// `-count`: a scenario run twice in one process opens its wallet twice, and a
+// name that was only the run's would meet WALLET_ALREADY_EXISTS the second
+// time. No scenario names one value twice and expects the same identifier.
+func scoped(what string) string {
+	return fmt.Sprintf("%s-%s-%d", what, runID, scopes.Add(1))
+}
+
+// scopes numbers the identifiers [scoped] hands out.
+var scopes atomic.Uint64

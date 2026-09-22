@@ -157,6 +157,11 @@ func (w *world) apply(t *testing.T, cmd wagering.Command, now time.Time) wagerin
 	t.Helper()
 	var outcome wagering.Outcome
 	err := w.tm.WithinMovement(t.Context(), func(ctx context.Context, r *app.Repos) error {
+		// By key rather than by the id the command carries: [command] does not
+		// know the wallet, so the fixture finds it the way a provider would
+		// have been told it, and addresses the command to it before recording.
+		// The stored hash is then the one the use case would compute for the
+		// same operation.
 		wallet, err := r.Wallets.LockForMovement(ctx, wagering.WalletKey{
 			PlayerID: cmd.PlayerID,
 			Currency: cmd.Money.Currency(),
@@ -167,6 +172,7 @@ func (w *world) apply(t *testing.T, cmd wagering.Command, now time.Time) wagerin
 		if wallet == nil {
 			t.Fatalf("player %q holds no %s wallet", cmd.PlayerID, cmd.Money.Currency())
 		}
+		cmd.WalletID = wallet.ID()
 		tx, err := wagering.NewExternalTransaction(cmd, wallet.ID(), now)
 		if err != nil {
 			return err
@@ -232,7 +238,10 @@ func command(
 ) wagering.Command {
 	t.Helper()
 	cmd := wagering.Command{
-		TransactionID:         wagering.NewTransactionID(),
+		TransactionID: wagering.NewTransactionID(),
+		// A wallet of its own, so the command validates on its own; [world.apply]
+		// readdresses it to the wallet the player actually holds.
+		WalletID:              wagering.NewWalletID(),
 		Provider:              "acme",
 		ExternalTransactionID: wagering.ExternalTransactionID(external),
 		IdempotencyKey:        wagering.IdempotencyKey("key-" + external),
@@ -673,13 +682,16 @@ func (u useCases) balanceOf(t *testing.T, id wagering.WalletID) string {
 // Separate from [command], which builds the domain value the port-level
 // fixtures apply directly. A scenario goes in the front door, so the use case
 // does the parsing and the identifier minting — which is half of what these
-// tests exist to exercise. The currency is BRL because every fixture in this
-// package uses it, and a fourth string parameter saying so at every call site
-// would say nothing.
+// tests exist to exercise. The wallet is the one the scenario opened, and it
+// names both the player and the wallet the submission addresses, as a provider
+// that was told the id at opening would. The currency is BRL because every
+// fixture in this package uses it, and a string parameter saying so at every
+// call site would say nothing.
 func submission(
 	t *testing.T,
 	kind wagering.Kind,
-	player, external, key, amount string,
+	wallet app.WalletView,
+	external, key, amount string,
 ) app.SubmitOperation {
 	t.Helper()
 	return app.SubmitOperation{
@@ -689,7 +701,8 @@ func submission(
 			Provider:              "acme",
 			ExternalTransactionID: external,
 			IdempotencyKey:        key,
-			PlayerID:              player,
+			PlayerID:              wallet.PlayerID.String(),
+			WalletID:              wallet.ID.String(),
 			RoundID:               "round-1",
 			GameID:                "game-1",
 			Kind:                  kind.String(),

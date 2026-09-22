@@ -8,13 +8,22 @@ import (
 	"testing"
 )
 
+// fixedWalletID is the wallet fixedCommand addresses, written out because the
+// canonical payload carries it and is asserted byte for byte.
+const fixedWalletID = "0192f291-27dd-7d3f-8071-5f8685deef37"
+
 // fixedCommand is a submission with every value written out, so the canonical
 // payload can be asserted byte for byte.
 func fixedCommand(t *testing.T) Command {
 	t.Helper()
+	wallet, err := ParseWalletID(fixedWalletID)
+	if err != nil {
+		t.Fatalf("ParseWalletID(%q): %v", fixedWalletID, err)
+	}
 	return Command{
 		TransactionID:         NewTransactionID(),
 		LedgerEntryID:         NewLedgerEntryID(),
+		WalletID:              wallet,
 		Provider:              "acme-games",
 		ExternalTransactionID: "ext-1",
 		IdempotencyKey:        "key-1",
@@ -36,7 +45,8 @@ func TestCanonicalPayload(t *testing.T) {
 		t.Parallel()
 		const want = `{"externalTransactionId":"ext-1","gameId":"game-1","kind":"BET",` +
 			`"money":{"amount":"25.00","currency":"BRL"},` +
-			`"playerId":"player-1","provider":"acme-games","roundId":"round-1"}`
+			`"playerId":"player-1","providerId":"acme-games","roundId":"round-1",` +
+			`"walletId":"` + fixedWalletID + `"}`
 
 		got := fixedCommand(t).CanonicalPayload()
 		if got != want {
@@ -55,8 +65,9 @@ func TestCanonicalPayload(t *testing.T) {
 
 		const want = `{"externalTransactionId":"ext-1","gameId":"game-1","kind":"REFUND",` +
 			`"money":{"amount":"25.00","currency":"BRL"},` +
-			`"playerId":"player-1","provider":"acme-games",` +
-			`"referenceExternalTransactionId":"ext-0","roundId":"round-1"}`
+			`"playerId":"player-1","providerId":"acme-games",` +
+			`"referenceExternalTransactionId":"ext-0","roundId":"round-1",` +
+			`"walletId":"` + fixedWalletID + `"}`
 
 		if got := cmd.CanonicalPayload(); got != want {
 			t.Errorf("CanonicalPayload()\n got %s\nwant %s", got, want)
@@ -80,8 +91,8 @@ func TestCanonicalPayloadKeysAreSorted(t *testing.T) {
 			t.Errorf("keys are not in ascending order: %q then %q, in %v", keys[i-1], keys[i], keys)
 		}
 	}
-	if len(keys) != 8 {
-		t.Errorf("payload has %d keys (%v), want 8", len(keys), keys)
+	if len(keys) != 9 {
+		t.Errorf("payload has %d keys (%v), want 9", len(keys), keys)
 	}
 }
 
@@ -198,6 +209,7 @@ func TestHashCoversEveryBusinessField(t *testing.T) {
 		{"provider", func(c *Command) { c.Provider = "other-games" }},
 		{"external transaction id", func(c *Command) { c.ExternalTransactionID = "ext-2" }},
 		{"player", func(c *Command) { c.PlayerID = "player-2" }},
+		{"wallet", func(c *Command) { c.WalletID = NewWalletID() }},
 		{"round", func(c *Command) { c.RoundID = "round-2" }},
 		{"game", func(c *Command) { c.GameID = "game-2" }},
 		{"kind", func(c *Command) { c.Kind = Rollback }},

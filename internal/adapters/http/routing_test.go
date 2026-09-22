@@ -113,7 +113,7 @@ func TestABodyLargerThanTheLimitIsRefusedBeforeItIsRead(t *testing.T) {
 	h := newHarness(t)
 	h.auth.principal = providerPrincipal(t, "acme")
 
-	oversized := `{"provider":"acme","externalTransactionId":"` + padding(testBodyLimit) + `"}`
+	oversized := `{"providerId":"acme","externalTransactionId":"` + padding(testBodyLimit) + `"}`
 	recorder := h.do(t, submission(oversized))
 
 	assertStatus(t, recorder, http.StatusRequestEntityTooLarge)

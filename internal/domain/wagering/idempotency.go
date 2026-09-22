@@ -22,26 +22,28 @@ func (h PayloadHash) String() string { return string(h) }
 //
 //	{"externalTransactionId":"…","gameId":"…","kind":"BET",
 //	 "money":{"amount":"25.00","currency":"BRL"},
-//	 "playerId":"…","provider":"…",
-//	 "referenceExternalTransactionId":"…","roundId":"…"}
+//	 "playerId":"…","providerId":"…",
+//	 "referenceExternalTransactionId":"…","roundId":"…","walletId":"…"}
 //
 // SHA-256 of those bytes, hex-encoded lowercase, is the [PayloadHash].
 //
 // # What is included
 //
-// Only what identifies the operation as a piece of business: provider,
-// externalTransactionId, kind, money, playerId, roundId, gameId and the
-// reference when there is one.
+// Only what identifies the operation as a piece of business: providerId,
+// externalTransactionId, kind, money, playerId, walletId, roundId, gameId and
+// the reference when there is one. The wallet id is among them because the
+// provider submits it — it is the wallet the operation addresses, and two
+// submissions naming different wallets are two different operations.
 //
 // # What is excluded
 //
 // The idempotency key itself, because the hash exists to decide whether one key
 // has been reused for two different operations — including it would make every
-// submission trivially unique. The wallet id, because it is derived from the
-// player and currency rather than submitted. And all transport metadata:
-// timestamps, correlation and causation ids, queue message ids, headers,
-// delivery counts and retry attempts, none of which say anything about what the
-// provider asked for.
+// submission trivially unique. The identifiers this system mints for the
+// transaction and the ledger entry, which say nothing about what was asked for.
+// And all transport metadata: timestamps, correlation and causation ids, queue
+// message ids, headers, delivery counts and retry attempts, none of which say
+// anything about what the provider asked for.
 //
 // # Normalisation
 //
@@ -73,9 +75,9 @@ func (c Command) CanonicalPayload() string {
 // identifiers of ordinary length does — is encoded, and hashed, without
 // allocating at all.
 //
-// It is generous enough for eight values of UUID length together with the keys
+// It is generous enough for nine values of UUID length together with the keys
 // around them, and small enough to sit on a stack without thought.
-const canonicalPayloadReserve = 512
+const canonicalPayloadReserve = 640
 
 // PayloadHash returns the fingerprint of the command's business fields.
 //
@@ -134,11 +136,14 @@ func (c Command) appendCanonicalPayload(dst []byte) []byte {
 	dst = append(dst, '}')
 
 	dst = appendJSONField(dst, "playerId", string(c.PlayerID))
-	dst = appendJSONField(dst, "provider", string(c.Provider))
+	dst = appendJSONField(dst, "providerId", string(c.Provider))
 	if c.ReferenceExternalTransactionID != "" {
 		dst = appendJSONField(dst, "referenceExternalTransactionId", string(c.ReferenceExternalTransactionID))
 	}
 	dst = appendJSONField(dst, "roundId", string(c.RoundID))
+	// A UUID renders as hex and hyphens, none of which JSON escapes, and it is
+	// the last key in ASCII order.
+	dst = appendJSONField(dst, "walletId", c.WalletID.String())
 
 	return append(dst, '}')
 }

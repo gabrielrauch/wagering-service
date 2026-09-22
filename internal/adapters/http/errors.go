@@ -275,6 +275,8 @@ func (a *API) record(r *http.Request, err error, class app.Class, status int) {
 	switch {
 	case errors.Is(err, app.ErrForeignOperation):
 		a.logger.WarnContext(ctx, "a provider asked for another provider's operation", attrs...)
+	case errors.Is(err, app.ErrForeignWallet):
+		a.logger.WarnContext(ctx, "a provider named a wallet its player does not hold", attrs...)
 	case class == app.Retryable:
 		a.logger.WarnContext(ctx, "request failed", append(attrs, slog.String("error", err.Error()))...)
 	case status >= http.StatusInternalServerError:

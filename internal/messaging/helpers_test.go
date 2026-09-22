@@ -41,10 +41,11 @@ type amount struct {
 // built its message out of the struct the consumer decodes into could not
 // notice a member being renamed on one side only.
 type operation struct {
-	Provider                       string `json:"provider"`
+	Provider                       string `json:"providerId"`
 	ExternalTransactionID          string `json:"externalTransactionId"`
 	IdempotencyKey                 string `json:"idempotencyKey"`
 	PlayerID                       string `json:"playerId"`
+	WalletID                       string `json:"walletId"`
 	RoundID                        string `json:"roundId"`
 	GameID                         string `json:"gameId"`
 	Kind                           string `json:"kind"`
@@ -60,15 +61,18 @@ type envelope struct {
 	Data       operation `json:"data"`
 }
 
-// operationOf builds one operation. The idempotency key and the round are
-// derived from the provider's own external id so that two scenarios sending
-// "the same operation" cannot disagree about what that means.
-func operationOf(kind, external, player, value string) operation {
+// operationOf builds one operation against the wallet the scenario opened: a
+// producer names both the player and the wallet it addresses. The idempotency
+// key and the round are derived from the provider's own external id so that
+// two scenarios sending "the same operation" cannot disagree about what that
+// means.
+func operationOf(kind, external, player, wallet, value string) operation {
 	return operation{
 		Provider:              provider,
 		ExternalTransactionID: external,
 		IdempotencyKey:        "key-" + external,
 		PlayerID:              player,
+		WalletID:              wallet,
 		RoundID:               "round-" + external,
 		GameID:                "game-1",
 		Kind:                  kind,
@@ -136,6 +140,7 @@ func (o operation) fields() app.OperationFields {
 		ExternalTransactionID:          o.ExternalTransactionID,
 		IdempotencyKey:                 o.IdempotencyKey,
 		PlayerID:                       o.PlayerID,
+		WalletID:                       o.WalletID,
 		RoundID:                        o.RoundID,
 		GameID:                         o.GameID,
 		Kind:                           o.Kind,

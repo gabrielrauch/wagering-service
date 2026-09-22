@@ -3,6 +3,9 @@ package workers
 import (
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/gabrielrauch/wagering-service/internal/app"
 )
 
 func TestParsingAnEnvelope(t *testing.T) {
@@ -54,6 +57,27 @@ func TestParsingAnEnvelope(t *testing.T) {
 			name: "an unknown type is refused by name",
 			body: validBody(t, map[string]any{"type": "WagerTransactionCancelled"}),
 			why:  "is not a message type this consumer handles",
+		},
+		{
+			// The spelling this consumer accepted before the specification was
+			// in the tree. A producer still sending it reaches the dead-letter
+			// queue with the expected type in the reason.
+			name: "the superseded type spelling is refused by name",
+			body: validBody(t, map[string]any{"type": "WagerTransactionSubmitted"}),
+			why:  `expected "WagerTransactionRequested"`,
+		},
+		{
+			// Likewise the superseded member name for the provider: strict
+			// decoding refuses it as a member the envelope does not have,
+			// rather than quietly reading no provider at all.
+			name: "the superseded provider member is refused",
+			body: validBody(t, map[string]any{"data": validData(map[string]any{"provider": "acme"})}),
+			why:  "a field this envelope does not have",
+		},
+		{
+			name: "an absent walletId is refused",
+			body: validBody(t, map[string]any{"data": validData(map[string]any{"walletId": ""})}),
+			why:  "carries no walletId",
 		},
 		{
 			name: "an absent type is refused",
@@ -156,10 +180,11 @@ func TestTheEnvelopeCarriesTheBusinessFieldsThrough(t *testing.T) {
 	for _, want := range []struct {
 		name, got, want string
 	}{
-		{"provider", fields.Provider, "acme"},
+		{"providerId", fields.Provider, "acme"},
 		{"externalTransactionId", fields.ExternalTransactionID, "external-1"},
 		{"idempotencyKey", fields.IdempotencyKey, "key-1"},
 		{"playerId", fields.PlayerID, "player-1"},
+		{"walletId", fields.WalletID, "0192f291-27dd-7d3f-8071-5f8685deef37"},
 		{"roundId", fields.RoundID, "round-1"},
 		{"gameId", fields.GameID, "game-1"},
 		{"kind", fields.Kind, "ROLLBACK"},
@@ -170,6 +195,53 @@ func TestTheEnvelopeCarriesTheBusinessFieldsThrough(t *testing.T) {
 		if want.got != want.want {
 			t.Errorf("%s = %q, want %q", want.name, want.got, want.want)
 		}
+	}
+}
+
+// The specification's own example message, verbatim: its type, its member
+// names, and an occurredAt carrying milliseconds. It parses, and every business
+// field reaches the application layer as it was written.
+func TestTheSpecificationsEnvelopeIsAccepted(t *testing.T) {
+	const body = `{
+  "messageId": "msg-123",
+  "type": "WagerTransactionRequested",
+  "occurredAt": "2026-09-08T12:00:00.000Z",
+  "data": {
+    "providerId": "provider-a",
+    "externalTransactionId": "transaction-123",
+    "idempotencyKey": "provider-a:transaction-123",
+    "playerId": "0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1",
+    "walletId": "0192f291-27dd-7d3f-8071-5f8685deef37",
+    "roundId": "round-987",
+    "gameId": "fortune-chimp",
+    "kind": "BET",
+    "money": { "amount": "25.00", "currency": "BRL" }
+  }
+}`
+	e, err := parseEnvelope([]byte(body))
+	if err != nil {
+		t.Fatalf("the specification's envelope was refused: %v", err)
+	}
+	if e.MessageID != "msg-123" || e.Type != MessageType {
+		t.Errorf("read %q of type %q, want msg-123 of type %s", e.MessageID, e.Type, MessageType)
+	}
+	if want := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC); !e.OccurredAt.Equal(want) {
+		t.Errorf("occurredAt = %s, want %s", e.OccurredAt, want)
+	}
+	want := app.OperationFields{
+		Provider:              "provider-a",
+		ExternalTransactionID: "transaction-123",
+		IdempotencyKey:        "provider-a:transaction-123",
+		PlayerID:              "0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1",
+		WalletID:              "0192f291-27dd-7d3f-8071-5f8685deef37",
+		RoundID:               "round-987",
+		GameID:                "fortune-chimp",
+		Kind:                  "BET",
+		Amount:                "25.00",
+		Currency:              "BRL",
+	}
+	if got := e.fields(); got != want {
+		t.Errorf("the application layer would be given\n%+v\nwant\n%+v", got, want)
 	}
 }
 

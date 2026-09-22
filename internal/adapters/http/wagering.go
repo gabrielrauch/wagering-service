@@ -57,6 +57,7 @@ func (a *API) submitOperation(w http.ResponseWriter, r *http.Request, principal 
 			ExternalTransactionID:          body.ExternalTransactionID,
 			IdempotencyKey:                 key,
 			PlayerID:                       body.PlayerID,
+			WalletID:                       body.WalletID,
 			RoundID:                        body.RoundID,
 			GameID:                         body.GameID,
 			Kind:                           body.Kind,

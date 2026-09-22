@@ -128,7 +128,7 @@ func (w *Wagering) Submit(ctx context.Context, cmd SubmitOperation) (OperationRe
 		// twice, and would call CannotCarryForward for a live submission that was
 		// never parked, with a transaction id naming a row the rollback removed.
 		return OperationResult{}, conflict(failure.ReferenceAlreadyReversed, err,
-			"reference %q already carries an active reversal", command.ReferenceExternalTransactionID)
+			"reference %q is already reversed", command.ReferenceExternalTransactionID)
 	case err != nil:
 		return OperationResult{}, classify(err)
 	}
@@ -158,6 +158,10 @@ func (w *Wagering) command(f OperationFields, provider wagering.Provider) (wager
 	if err != nil {
 		return wagering.Command{}, classify(err)
 	}
+	wallet, err := wagering.ParseWalletID(f.WalletID)
+	if err != nil {
+		return wagering.Command{}, classify(err)
+	}
 	round, err := wagering.NewRoundID(f.RoundID)
 	if err != nil {
 		return wagering.Command{}, classify(err)
@@ -173,6 +177,7 @@ func (w *Wagering) command(f OperationFields, provider wagering.Provider) (wager
 
 	command := wagering.Command{
 		TransactionID:         w.ids.TransactionID(),
+		WalletID:              wallet,
 		Provider:              provider,
 		ExternalTransactionID: external,
 		IdempotencyKey:        key,
@@ -241,10 +246,11 @@ func (w *Wagering) submitOnce(
 			return nil
 		}
 
-		wallet, err := r.Wallets.LockForMovement(ctx, wagering.WalletKey{
-			PlayerID: command.PlayerID,
-			Currency: command.Money.Currency(),
-		})
+		// By the id the provider named, not by the player and currency: the
+		// wallet is a member of the contract, and a submission that names the
+		// wrong one is refused as a payload rather than resolved to the right
+		// one on its behalf.
+		wallet, err := r.Wallets.LockByID(ctx, command.WalletID)
 		if err != nil {
 			return err
 		}
@@ -252,7 +258,20 @@ func (w *Wagering) submitOnce(
 			// This layer never opens a wallet on a provider's behalf. Nothing is
 			// persisted, so the same submission succeeds under the same key once
 			// the wallet exists.
-			return notFound("player %q holds no %s wallet", command.PlayerID, command.Money.Currency())
+			return notFound("no wallet %s for player %q", command.WalletID, command.PlayerID)
+		}
+		// Before anything is recorded: a wallet held by another player is
+		// answered exactly as a wallet that does not exist — same class, same
+		// sentence, the owner never named. A provider cannot read wallets, and
+		// this is the one place it could otherwise learn, at no cost and under
+		// a key that stays free, whether an identifier is in use and whose it
+		// is. The distinction survives in the error chain for a log line and
+		// nowhere a caller can see it. The currency is deliberately not checked
+		// here — the domain settles a mismatch as a rejection, with a row and
+		// an event, because a wallet that exists and is the player's holding
+		// the wrong kind of money is a business outcome.
+		if err := wagering.WalletBelongsToPlayer(command, wallet); err != nil {
+			return notFoundWrapping(ErrForeignWallet, "no wallet %s for player %q", command.WalletID, command.PlayerID)
 		}
 
 		// Sampled here, under the lock, rather than on the way in: a command that
@@ -629,6 +648,7 @@ func (w *Wagering) Resume(ctx context.Context, principal Principal) (ResumeOutco
 		}
 		out.Result = resultOf(outcome.Transaction, false)
 		out.Woke = woke
+		out.Correlation = correlation
 		if !nextAttemptAt.IsZero() {
 			out.Rescheduled = true
 			out.NextAttemptAt = nextAttemptAt
@@ -670,6 +690,7 @@ func (w *Wagering) rebuild(tx *wagering.WagerTransaction) (wagering.Command, err
 
 	command := wagering.Command{
 		TransactionID:                  tx.ID(),
+		WalletID:                       tx.WalletID(),
 		Provider:                       provider,
 		ExternalTransactionID:          external,
 		IdempotencyKey:                 key,
@@ -882,15 +903,18 @@ func causationOf(cmd SubmitOperation) string {
 func resultOf(tx *wagering.WagerTransaction, replay bool) OperationResult {
 	result := OperationResult{
 		TransactionID:    tx.ID(),
+		WalletID:         tx.WalletID(),
 		Kind:             tx.Kind(),
 		Status:           tx.Status(),
 		Money:            tx.Money(),
 		IdempotentReplay: replay,
 	}
-	// Both accessors return the zero value when they report false, so assigning
-	// it says exactly what a guard would have. Balance is the one that genuinely
+	// Each accessor returns the zero value when it reports false, so assigning
+	// it says exactly what a guard would have: an opening has no provider and
+	// no external id, and names neither. Balance is the one that genuinely
 	// differs: absence is spelled nil there, so it keeps its guard.
 	result.ExternalTransactionID, _ = tx.ExternalTransactionID()
+	result.ProviderID, _ = tx.Provider()
 	result.FailureCode, _ = tx.FailureCode()
 	if balance, ok := tx.Result(); ok {
 		result.Balance = &balance

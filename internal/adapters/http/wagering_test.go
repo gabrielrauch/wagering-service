@@ -161,9 +161,10 @@ func TestSubmitPassesEveryFieldThroughUntouched(t *testing.T) {
 	// three decimals, a lower-case currency and OPENING all have to reach the
 	// service to be refused by it.
 	body := `{
-		"provider": "acme",
+		"providerId": "acme",
 		"externalTransactionId": " acme-TX-1 ",
 		"playerId": "Player-1",
+		"walletId": "not-a-uuid",
 		"roundId": "round-1",
 		"gameId": "game-1",
 		"kind": "OPENING",
@@ -177,6 +178,7 @@ func TestSubmitPassesEveryFieldThroughUntouched(t *testing.T) {
 		ExternalTransactionID:          " acme-TX-1 ",
 		IdempotencyKey:                 "acme-key-1",
 		PlayerID:                       "Player-1",
+		WalletID:                       "not-a-uuid",
 		RoundID:                        "round-1",
 		GameID:                         "game-1",
 		Kind:                           "OPENING",
@@ -197,7 +199,8 @@ func TestSubmitRefusesOpeningThroughTheDomainsCode(t *testing.T) {
 		"OPENING is raised only when a wallet is opened").WithField("kind")
 
 	recorder := h.do(t, submission(
-		`{"provider":"acme","externalTransactionId":"acme-tx-1","playerId":"p","roundId":"r",
+		`{"providerId":"acme","externalTransactionId":"acme-tx-1","playerId":"p",
+		  "walletId":"0192f291-27dd-7d3f-8071-5f8685deef37","roundId":"r",
 		  "gameId":"g","kind":"OPENING","money":{"amount":"25.00","currency":"BRL"}}`))
 
 	assertStatus(t, recorder, http.StatusBadRequest)
@@ -267,7 +270,8 @@ func TestSubmitRefusesABodyItCannotRead(t *testing.T) {
 	cases := []struct{ name, body, want string }{
 		{
 			name: "unknown field",
-			body: `{"provider":"acme","externalTransactionId":"x","playerId":"p","roundId":"r",
+			body: `{"providerId":"acme","externalTransactionId":"x","playerId":"p",
+			        "walletId":"0192f291-27dd-7d3f-8071-5f8685deef37","roundId":"r",
 			        "gameId":"g","kind":"BET","money":{"amount":"1.00","currency":"BRL"},
 			        "idempotencyKey":"smuggled"}`,
 			want: "body: the request body names a field this endpoint does not have",

@@ -609,10 +609,11 @@ func validBody(t *testing.T, overrides map[string]any) []byte {
 // validData renders the business fields, with the named members replaced.
 func validData(overrides map[string]any) map[string]any {
 	data := map[string]any{
-		"provider":              "acme",
+		"providerId":            "acme",
 		"externalTransactionId": "external-1",
 		"idempotencyKey":        "key-1",
 		"playerId":              "player-1",
+		"walletId":              "0192f291-27dd-7d3f-8071-5f8685deef37",
 		"roundId":               "round-1",
 		"gameId":                "game-1",
 		"kind":                  "BET",

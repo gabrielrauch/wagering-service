@@ -30,13 +30,13 @@ func reconciled(t *testing.T, base string, wallets ...string) {
 		report := reconcile(t, base, wallet)
 		if !report.Consistent {
 			t.Errorf("wallet %s does not balance: it holds %s and its ledger adds up to %s, "+
-				"a difference of %s", wallet, report.Stored.Amount,
-				report.Reconstructed.Amount, report.Difference.Amount)
+				"a difference of %s", wallet, report.StoredBalance.Amount,
+				report.CalculatedBalance.Amount, report.Difference.Amount)
 			continue
 		}
-		if report.Stored != report.Reconstructed {
+		if report.StoredBalance != report.CalculatedBalance {
 			t.Errorf("wallet %s is called consistent while holding %s against a ledger of %s",
-				wallet, report.Stored.Amount, report.Reconstructed.Amount)
+				wallet, report.StoredBalance.Amount, report.CalculatedBalance.Amount)
 		}
 		if report.Difference.Amount != "0.00" {
 			t.Errorf("wallet %s is called consistent with a difference of %s",
@@ -98,7 +98,7 @@ func TestTheReconciliationEndpointFindsAWalletThatDoesNotBalance(t *testing.T) {
 	player := scoped("player-audit")
 	wallet := openWallet(t, w.base, player, "100.00")
 	staked := operationOf(t, submit(t, w.base, providerA,
-		bet(providerA, scoped("audit-bet"), player, "30.00"), scoped("audit-key")))
+		bet(providerA, scoped("audit-bet"), wallet, "30.00"), scoped("audit-key")))
 	if staked.Status != processed {
 		t.Fatalf("the bet is %s (%s), wanted %s", staked.Status, staked.FailureCode, processed)
 	}
@@ -110,11 +110,11 @@ func TestTheReconciliationEndpointFindsAWalletThatDoesNotBalance(t *testing.T) {
 	if divergent.Consistent {
 		t.Fatalf("the endpoint called a wallet consistent that holds %s against a ledger of "+
 			"%s, so every other scenario's reconciliation proves nothing",
-			divergent.Stored.Amount, divergent.Reconstructed.Amount)
+			divergent.StoredBalance.Amount, divergent.CalculatedBalance.Amount)
 	}
-	if divergent.Stored.Amount != "70.01" || divergent.Reconstructed.Amount != "70.00" {
+	if divergent.StoredBalance.Amount != "70.01" || divergent.CalculatedBalance.Amount != "70.00" {
 		t.Errorf("the endpoint reports %s stored against %s reconstructed, wanted 70.01 "+
-			"against 70.00", divergent.Stored.Amount, divergent.Reconstructed.Amount)
+			"against 70.00", divergent.StoredBalance.Amount, divergent.CalculatedBalance.Amount)
 	}
 	if divergent.Difference.Amount != "0.01" {
 		t.Errorf("the endpoint reports a difference of %s, wanted 0.01",

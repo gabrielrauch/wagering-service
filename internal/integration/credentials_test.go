@@ -148,7 +148,7 @@ func guarded(t *testing.T) []call {
 		{
 			method:         http.MethodPost,
 			path:           "/wagering/transactions",
-			body:           encode(t, bet(providerA, "ext-guarded", "player-guarded", "1.00")),
+			body:           encode(t, bet(providerA, "ext-guarded", walletView{WalletID: wallet, PlayerID: "player-guarded"}, "1.00")),
 			idempotencyKey: "key-guarded",
 		},
 		{method: http.MethodGet, path: "/wagering/transactions/" + transaction},
@@ -251,7 +251,7 @@ func TestAnExpiredTokenIsRefused(t *testing.T) {
 	live := s.do(t, call{
 		method:         http.MethodPost,
 		path:           "/wagering/transactions",
-		body:           encode(t, bet(expiringProvider, "ext-while-live", "player-expired", "1.00")),
+		body:           encode(t, bet(expiringProvider, "ext-while-live", wallet, "1.00")),
 		token:          g.token,
 		idempotencyKey: "key-while-live",
 	})
@@ -272,7 +272,7 @@ func TestAnExpiredTokenIsRefused(t *testing.T) {
 	unauthenticated(t, s.do(t, call{
 		method:         http.MethodPost,
 		path:           "/wagering/transactions",
-		body:           encode(t, bet(expiringProvider, "ext-expired", "player-expired", "1.00")),
+		body:           encode(t, bet(expiringProvider, "ext-expired", wallet, "1.00")),
 		token:          g.token,
 		idempotencyKey: "key-expired",
 	}))

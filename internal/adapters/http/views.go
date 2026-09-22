@@ -79,7 +79,8 @@ func operationOf(result app.OperationResult) operationView {
 	return view
 }
 
-// walletView is a wallet as a caller sees it.
+// walletView is a wallet as a caller sees it, spelled as the specification
+// spells it: the wallet's identifier is id, because the object is the wallet.
 //
 // Opening is the wager transaction that recorded the starting balance, and is
 // absent when the wallet was opened at zero — there is no opening to report,
@@ -87,7 +88,7 @@ func operationOf(result app.OperationResult) operationView {
 // none. It is present only in the answer to a wallet being opened; reading a
 // wallet back reports the wallet, and the opening is in its ledger.
 type walletView struct {
-	WalletID  string         `json:"walletId"`
+	ID        string         `json:"id"`
 	PlayerID  string         `json:"playerId"`
 	Balance   moneyView      `json:"balance"`
 	Version   uint64         `json:"version"`
@@ -98,7 +99,7 @@ type walletView struct {
 
 func walletOf(view app.WalletView) walletView {
 	return walletView{
-		WalletID:  view.ID.String(),
+		ID:        view.ID.String(),
 		PlayerID:  view.PlayerID.String(),
 		Balance:   moneyOf(view.Balance),
 		Version:   view.Version,
@@ -109,12 +110,18 @@ func walletOf(view app.WalletView) walletView {
 
 // ledgerEntryView is one balance change.
 //
+// Its identifier is id, as the specification spells it, and every entry names
+// its wallet even though the page it sits in names the same one: an entry is
+// a record in its own right, and one copied out of a page should still say
+// which wallet it belongs to.
+//
 // It carries the wallet version its change produced, because (walletId,
 // walletVersion) is what orders a ledger exactly: two entries can share a
 // creation instant, so a caller sorting on createdAt alone would not get the
 // order the cursor pages in.
 type ledgerEntryView struct {
-	LedgerEntryID string    `json:"ledgerEntryId"`
+	ID            string    `json:"id"`
+	WalletID      string    `json:"walletId"`
 	TransactionID string    `json:"transactionId"`
 	Direction     string    `json:"direction"`
 	Money         moneyView `json:"money"`
@@ -139,7 +146,8 @@ func ledgerPageOf(id wagering.WalletID, page app.LedgerPage) ledgerPageView {
 	entries := make([]ledgerEntryView, 0, len(page.Entries))
 	for _, entry := range page.Entries {
 		entries = append(entries, ledgerEntryView{
-			LedgerEntryID: entry.ID().String(),
+			ID:            entry.ID().String(),
+			WalletID:      entry.WalletID().String(),
 			TransactionID: entry.TransactionID().String(),
 			Direction:     entry.Direction().String(),
 			Money:         moneyOf(entry.Amount()),
@@ -152,28 +160,36 @@ func ledgerPageOf(id wagering.WalletID, page app.LedgerPage) ledgerPageView {
 	return ledgerPageView{WalletID: id.String(), Entries: entries, NextCursor: page.NextCursor}
 }
 
-// reconciliationView is what checking a wallet against its ledger found.
+// reconciliationView is what checking a wallet against its ledger found, in
+// the specification's six members.
 //
-// Difference is Stored less Reconstructed and may be negative — which way a
-// wallet is out is the first thing an operator asks. It is never a correction:
-// a disagreement means either the balance or the ledger is wrong, and which one
-// is a question for an operator rather than something to be papered over by
-// adjusting the number that is easier to change.
+// StoredBalance is what the wallet row holds and CalculatedBalance is what its
+// ledger sums to. Difference is stored less calculated and may be negative —
+// which way a wallet is out is the first thing an operator asks. It is never a
+// correction: a disagreement means either the balance or the ledger is wrong,
+// and which one is a question for an operator rather than something to be
+// papered over by adjusting the number that is easier to change.
+//
+// CheckedEntries is how many ledger entries the calculation summed, the
+// opening included, so that a wallet found consistent over its whole ledger
+// can be told from one found consistent over nothing.
 type reconciliationView struct {
-	WalletID      string    `json:"walletId"`
-	Consistent    bool      `json:"consistent"`
-	Stored        moneyView `json:"stored"`
-	Reconstructed moneyView `json:"reconstructed"`
-	Difference    moneyView `json:"difference"`
+	WalletID          string    `json:"walletId"`
+	StoredBalance     moneyView `json:"storedBalance"`
+	CalculatedBalance moneyView `json:"calculatedBalance"`
+	Difference        moneyView `json:"difference"`
+	Consistent        bool      `json:"consistent"`
+	CheckedEntries    int       `json:"checkedEntries"`
 }
 
 func reconciliationOf(report app.Reconciliation) reconciliationView {
 	return reconciliationView{
-		WalletID:      report.WalletID.String(),
-		Consistent:    report.Consistent,
-		Stored:        moneyOf(report.Stored),
-		Reconstructed: moneyOf(report.Reconstructed),
-		Difference:    moneyOf(report.Difference),
+		WalletID:          report.WalletID.String(),
+		StoredBalance:     moneyOf(report.Stored),
+		CalculatedBalance: moneyOf(report.Reconstructed),
+		Difference:        moneyOf(report.Difference),
+		Consistent:        report.Consistent,
+		CheckedEntries:    report.CheckedEntries,
 	}
 }
 
@@ -188,12 +204,15 @@ type openWalletRequest struct {
 	InitialBalance moneyInput `json:"initialBalance"`
 }
 
-// submitRequest is the body of an operation being submitted.
+// submitRequest is the body of an operation being submitted, as the
+// specification spells it.
 //
 // The member names are the ones wagering.CanonicalPayload hashes, deliberately:
 // the bytes a provider sends, the bytes that are hashed and the bytes that come
 // back should be one vocabulary, so that a provider comparing a submission with
-// what was recorded is comparing like with like.
+// what was recorded is comparing like with like. The wallet is among them: the
+// provider names the wallet it addresses, and the service checks that it is the
+// player's rather than choosing one on the provider's behalf.
 //
 // The idempotency key is not among them. It arrives in a header, because it is
 // about this delivery of the operation rather than about the operation, and
@@ -201,9 +220,10 @@ type openWalletRequest struct {
 // different payloads — a key inside the payload would make every submission
 // trivially unique and the question unanswerable.
 type submitRequest struct {
-	Provider                       string     `json:"provider"`
+	Provider                       string     `json:"providerId"`
 	ExternalTransactionID          string     `json:"externalTransactionId"`
 	PlayerID                       string     `json:"playerId"`
+	WalletID                       string     `json:"walletId"`
 	RoundID                        string     `json:"roundId"`
 	GameID                         string     `json:"gameId"`
 	Kind                           string     `json:"kind"`

@@ -215,7 +215,7 @@ func TestAnUnreadableEnvelopeIsLeftForTheRedrivePolicy(t *testing.T) {
 		},
 		{
 			name: "a provider that is not an identifier",
-			body: validBody(t, map[string]any{"data": validData(map[string]any{"provider": ""})}),
+			body: validBody(t, map[string]any{"data": validData(map[string]any{"providerId": ""})}),
 		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -669,6 +669,73 @@ func TestTheLastDeliveryBeforeTheDeadLetterQueueIsSaidSo(t *testing.T) {
 	}
 }
 
+// A transient failure on the last delivery is still a transient failure — the
+// message is hidden for its backoff and the retry is counted — and it is ALSO
+// the last time this consumer will see it: when the backoff runs out the
+// redrive policy moves it, unhandled, to the dead-letter queue. The line that
+// says so is the one an operator most wants, and it was missing for exactly
+// this class of failure.
+func TestATransientFailureOnTheLastDeliveryIsSaidSo(t *testing.T) {
+	const maxReceives = 5
+	const lastDelivery = "the operation could not be applied and this was its last delivery " +
+		"before the dead-letter queue"
+	const deferred = "the operation could not be applied and will be delivered again"
+
+	for _, c := range []struct {
+		name         string
+		receiveCount int
+		said         bool
+	}{
+		{name: "an earlier delivery", receiveCount: maxReceives - 1, said: false},
+		{name: "the last delivery", receiveCount: maxReceives, said: true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			log := &recorder{}
+			queue := newFakeQueue([]sqs.Message{
+				message("handle-1", validBody(t, nil), c.receiveCount),
+			})
+			consumerOver(t, t.Context(), ConsumerConfig{
+				Queue: queue,
+				Wagering: &fakeSubmitter{
+					answer: func(context.Context, int, app.SubmitOperation) (app.OperationResult, error) {
+						return app.OperationResult{}, app.AsRetryable(errors.New("the database is down"))
+					},
+				},
+				Logger: log.logger(), MaxReceiveCount: maxReceives,
+			})
+			queue.handled(t)
+
+			// Whichever delivery it is, the message is hidden for its backoff
+			// and the deferral is said: the dead-letter line is in addition to
+			// the retry accounting, never instead of it.
+			log.await(t, deferred)
+			if got := queue.changes(); len(got) != 1 {
+				t.Errorf("visibility changes = %v, want the message hidden for its backoff", got)
+			}
+			if got := queue.deletedHandles(); len(got) != 0 {
+				t.Errorf("a message that failed transiently was deleted: %v", got)
+			}
+
+			record := log.find(lastDelivery)
+			switch {
+			case c.said && record == nil:
+				t.Fatalf("no line saying %q on delivery %d of %d", lastDelivery, c.receiveCount,
+					maxReceives)
+			case !c.said && record != nil:
+				t.Fatalf("delivery %d of %d was reported as the last one", c.receiveCount,
+					maxReceives)
+			case record == nil:
+				return
+			}
+			for _, key := range []string{"receiveCount", "class", "messageId", "correlationId"} {
+				if got, ok := attr(record, key); !ok || got == "" {
+					t.Errorf("the line does not carry %s", key)
+				}
+			}
+		})
+	}
+}
+
 // A receive that failed does not end the loop: the consumer says so and takes
 // the next batch.
 func TestAFailedReceiveDoesNotEndTheLoop(t *testing.T) {
@@ -802,6 +869,7 @@ func TestAReleaseThatFailedIsNotCountedAsReleased(t *testing.T) {
 // to see again. Neither line carries an amount, a balance or a player: those are
 // a financial payload and a log is not where one belongs.
 func TestWhatTheConsumerSaysAboutAMessage(t *testing.T) {
+	wallet := wagering.NewWalletID()
 	cases := []struct {
 		name   string
 		answer func(context.Context, int, app.SubmitOperation) (app.OperationResult, error)
@@ -812,8 +880,10 @@ func TestWhatTheConsumerSaysAboutAMessage(t *testing.T) {
 			name: "an operation that was applied",
 			answer: func(context.Context, int, app.SubmitOperation) (app.OperationResult, error) {
 				return app.OperationResult{
-					Kind:   wagering.Bet,
-					Status: wagering.Rejected,
+					WalletID:   wallet,
+					ProviderID: "acme",
+					Kind:       wagering.Bet,
+					Status:     wagering.Rejected,
 					// A rejection is an outcome, and the line has to say which.
 					FailureCode: failure.InsufficientFunds,
 				}, nil
@@ -823,6 +893,11 @@ func TestWhatTheConsumerSaysAboutAMessage(t *testing.T) {
 				"status":      "REJECTED",
 				"failureCode": failure.InsufficientFunds.String(),
 				"messageId":   "message-1",
+				// The two identifiers an operator pivots on, from the result and
+				// not from the body: the wallet the operation moved and the
+				// provider it was submitted as.
+				"walletId":   wallet.String(),
+				"providerId": "acme",
 			},
 		},
 		{

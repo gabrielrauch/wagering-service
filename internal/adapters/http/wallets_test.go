@@ -49,7 +49,7 @@ func TestOpenWalletAnswersTheWalletAndItsOpening(t *testing.T) {
 	}
 	var body walletView
 	bodyOf(t, recorder, &body)
-	if body.WalletID != view.ID.String() || body.Balance.Amount != "25.00" {
+	if body.ID != view.ID.String() || body.Balance.Amount != "25.00" {
 		t.Errorf("wallet = %+v, want %s holding 25.00", body, view.ID)
 	}
 	if body.Opening == nil || body.Opening.Kind != string(wagering.Opening) {
@@ -127,7 +127,7 @@ func TestReadWalletAnswersTheWallet(t *testing.T) {
 	assertStatus(t, recorder, http.StatusOK)
 	var body walletView
 	bodyOf(t, recorder, &body)
-	if body.WalletID != view.ID.String() || body.Version != 1 {
+	if body.ID != view.ID.String() || body.Version != 1 {
 		t.Errorf("wallet = %+v, want %s at version 1", body, view.ID)
 	}
 	if body.Opening != nil {

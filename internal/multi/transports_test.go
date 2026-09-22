@@ -26,6 +26,7 @@ import (
 	"context"
 	"encoding/json/v2"
 	"fmt"
+	"net/http"
 	"os/exec"
 	"strings"
 	"sync"
@@ -78,7 +79,7 @@ func TestOneOperationOverHTTPAndOverTheQueueSettlesOnceInEitherOrder(t *testing.
 		key := scoped("http-first-key")
 		message := scoped("http-first-message")
 		wallet := openWallet(t, instances[0], player, "100.00")
-		operation := bet(providerA, external, player, "25.00")
+		operation := bet(providerA, external, wallet, "25.00")
 
 		applied := operationOf(t, submit(t, instances[0], providerA, operation, key))
 		if applied.Status != processed || applied.IdempotentReplay {
@@ -108,7 +109,7 @@ func TestOneOperationOverHTTPAndOverTheQueueSettlesOnceInEitherOrder(t *testing.
 		key := scoped("queue-first-key")
 		message := scoped("queue-first-message")
 		wallet := openWallet(t, instances[0], player, "100.00")
-		operation := bet(providerA, external, player, "25.00")
+		operation := bet(providerA, external, wallet, "25.00")
 
 		since := time.Now()
 		putOnDeployedQueue(t, onTheQueue(operation, message, key), wallet.WalletID)
@@ -270,4 +271,156 @@ func composeLogs(t *testing.T, service string, since time.Time) []entry {
 		found = append(found, parsed)
 	}
 	return found
+}
+
+// TestOneOperationSubmittedOverHTTPAndTheQueueAtTheSameTimeSettlesOnce is the
+// scenario above with the order taken away: the request and the message are
+// released in the same instant, and neither transport is given the head start
+// the two halves above each give one of them.
+//
+// The two arrivals race for the same idempotency key from different processes
+// — an API replica and a worker replica — and whichever records the operation
+// first wins the key; the other loses on it inside its own transaction and is
+// answered from what the winner recorded. The assertion is the same three
+// things as before, with one difference stated exactly: EXACTLY one of the two
+// answers is a replay. Not "at most one", which a lost delivery satisfies, and
+// not "the second one", because here there is no second one — only the
+// database knows which arrived first, and it reports that by which of the two
+// it answered as a replay.
+//
+// # What a lost race leaves in the inbox
+//
+// A queue delivery that loses the race has recorded its inbox row in the
+// transaction the unique violation aborted, and is answered by a re-read in a
+// second transaction that writes nothing — so when the message is the replay,
+// there is no inbox row for it. That is not a defect: a later redelivery of
+// the same message is answered by the idempotency key rather than by the
+// inbox, once and with the same transaction. But it is why the inbox row is
+// asserted here only when the queue side was the first arrival, where the
+// scenario above asserts it unconditionally.
+func TestOneOperationSubmittedOverHTTPAndTheQueueAtTheSameTimeSettlesOnce(t *testing.T) {
+	requireStack(t)
+
+	player := scoped("player-both-at-once")
+	external := scoped("both-at-once")
+	key := scoped("both-at-once-key")
+	message := scoped("both-at-once-message")
+	wallet := openWallet(t, instances[0], player, "100.00")
+	operation := bet(providerA, external, wallet, "25.00")
+
+	// Everything either side needs is in hand before the gate opens: the token,
+	// the rendered bodies and the queue's URL. What the goroutines do after the
+	// gate is one request and one send, and nothing else.
+	body := encode(t, operation)
+	queued := encode(t, onTheQueue(operation, message, key))
+	credential := token(t, providerA)
+	url, err := deployedInboundURL()
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+
+	var (
+		overHTTP answer
+		httpErr  error
+		queueErr error
+		wg       sync.WaitGroup
+	)
+	released := make(chan struct{})
+	since := time.Now()
+	wg.Go(func() {
+		<-released
+		overHTTP, httpErr = attempt(call{
+			base:           instances[1],
+			method:         http.MethodPost,
+			path:           "/wagering/transactions",
+			body:           body,
+			token:          credential,
+			idempotencyKey: key,
+		})
+	})
+	wg.Go(func() {
+		<-released
+		_, queueErr = queues.SendMessage(context.Background(), &awssqs.SendMessageInput{
+			QueueUrl:               aws.String(url),
+			MessageBody:            aws.String(queued),
+			MessageGroupId:         aws.String(wallet.WalletID),
+			MessageDeduplicationId: aws.String(message),
+		})
+	})
+	close(released)
+	wg.Wait()
+	if httpErr != nil {
+		t.Fatalf("the submission over HTTP failed: %v", httpErr)
+	}
+	if queueErr != nil {
+		t.Fatalf("the send to %s failed: %v", deployedInbound, queueErr)
+	}
+
+	// Both arrivals reached an answer, and the same one.
+	applied := operationOf(t, overHTTP)
+	if applied.Status != processed {
+		t.Fatalf("the submission over HTTP is %s (%s), wanted %s",
+			applied.Status, applied.FailureCode, processed)
+	}
+	line := awaitConsumerLine(t, since, message)
+	if got := line.text("status"); got != processed {
+		t.Fatalf("the worker settled message %s as %s, wanted %s", message, got, processed)
+	}
+	if got := line.text("transactionId"); got != applied.TransactionID {
+		t.Errorf("the worker answered transaction %s and the HTTP door answered %s: one "+
+			"operation became two", got, applied.TransactionID)
+	}
+
+	// Exactly one of the two was a replay, which is the database saying that
+	// it saw both and applied one.
+	queueReplayed, stated := line.flag("replay")
+	if !stated {
+		t.Fatalf("the worker's line for %s does not say whether it was a replay", message)
+	}
+	switch replays := count(applied.IdempotentReplay) + count(queueReplayed); replays {
+	case 1:
+	case 0:
+		t.Errorf("neither arrival was answered as a replay: both were applied, or one was " +
+			"never seen")
+	default:
+		t.Errorf("both arrivals were answered as replays, so neither recorded the operation")
+	}
+
+	// One row, one entry, one movement — whichever side made it.
+	if operations := countRows(t, owner,
+		`SELECT count(*) FROM wagering.wager_transaction `+
+			`WHERE provider = $1 AND external_transaction_id = $2`, providerA, external); operations != 1 {
+		t.Errorf("the table holds %d wager transactions for %s, wanted 1", operations, external)
+	}
+	var moved int
+	for _, entry := range ledgerOf(t, owner, wallet.WalletID) {
+		if entry.transactionID == applied.TransactionID {
+			moved++
+		}
+	}
+	if moved != 1 {
+		t.Errorf("transaction %s produced %d ledger entries, wanted 1", applied.TransactionID, moved)
+	}
+	if got, want := balanceOf(t, owner, wallet.WalletID), minor(t, "75.00"); got != want {
+		t.Errorf("the wallet holds %d minor units, want %d", got, want)
+	}
+	row, found := inboxFor(t, owner, "wager-consumer", message)
+	switch {
+	case !queueReplayed && !found:
+		t.Errorf("the queue's delivery of %s was the first arrival and left no inbox row",
+			message)
+	case !queueReplayed && !row.completed:
+		t.Errorf("the inbox row for message %s is not completed", message)
+	case queueReplayed && found && !row.completed:
+		t.Errorf("the inbox row for message %s was left incomplete by a replay", message)
+	}
+	reconciled(t, instances[2], wallet.WalletID)
+}
+
+// count is a boolean as a number, for adding two of them up.
+func count(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }

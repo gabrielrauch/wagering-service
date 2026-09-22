@@ -5,6 +5,7 @@
 package messaging
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
@@ -64,7 +65,7 @@ func TestARefundDeliveredBeforeItsBetIsCarriedForwardWhenTheBetArrives(t *testin
 	startReferenceWorker(t, s)
 
 	put(t, name, body(t, message("msg-refund",
-		operationOf("REFUND", refund, player, "25.00").against(bet).inRound(round))),
+		operationOf("REFUND", refund, player, wallet, "25.00").against(bet).inRound(round))),
 		wallet, "dedupe-refund")
 
 	eventually(t, settleBudget, "the refund to be parked on the bet it names", func() error {
@@ -83,7 +84,7 @@ func TestARefundDeliveredBeforeItsBetIsCarriedForwardWhenTheBetArrives(t *testin
 	}
 
 	put(t, name, body(t, message("msg-bet",
-		operationOf("BET", bet, player, "25.00").inRound(round))),
+		operationOf("BET", bet, player, wallet, "25.00").inRound(round))),
 		wallet, "dedupe-bet")
 
 	s.logs.await(t, logCarried, 1, settleBudget)
@@ -145,6 +146,13 @@ func TestARefundDeliveredBeforeItsBetIsCarriedForwardWhenTheBetArrives(t *testin
 // that the test would also pass against a domain that refused the first attempt
 // outright, which is the opposite of the behaviour: an operation that gives up
 // immediately and one that waits its budget out reach the same row.
+//
+// The event is then followed onto the wire. A publisher runs beside the two
+// workers, and once the outbox has drained the outbound queue is read back:
+// exactly one WagerTransactionRejected for the refund's transaction, carrying
+// REFERENCE_NOT_FOUND. The outbox row is what the application wrote; the
+// message is what a subscriber gets, and a rejection that reached the table and
+// not the queue would be an outcome nobody was told about.
 func TestARefundWhoseBetNeverArrivesIsRejectedWhenTheBudgetRunsOut(t *testing.T) {
 	t.Parallel()
 
@@ -164,15 +172,18 @@ func TestARefundWhoseBetNeverArrivesIsRejectedWhenTheBudgetRunsOut(t *testing.T)
 		withReferenceSchedule(referenceSchedule))
 	wallet := s.openWallet(t, player, "100.00")
 	name := inbound(t, visibility)
+	events := outbound(t)
 
 	queue := watch(openQueue(t, name))
 	submitter := follow(s.wagering)
 	consumer := startConsumer(t, s, queue, submitter, consumerSettings{name: consumerName})
 	startReferenceWorker(t, s)
+	startPublisher(t, s, openQueue(t, events),
+		publisherSettings{name: "publisher-orphan", hold: 30 * time.Second})
 
 	sent := time.Now()
 	put(t, name, body(t, message("msg-orphan",
-		operationOf("REFUND", refund, player, "25.00").against(missing))),
+		operationOf("REFUND", refund, player, wallet, "25.00").against(missing))),
 		wallet, "dedupe-orphan")
 
 	eventually(t, settleBudget, "the refund to run out of budget", func() error {
@@ -230,4 +241,49 @@ func TestARefundWhoseBetNeverArrivesIsRejectedWhenTheBudgetRunsOut(t *testing.T)
 	}
 
 	empty(t, name, visibility+3*time.Second, "after the refund was given up on")
+
+	// And the rejection reached the wire, once. The outbox holds the opening's
+	// two events, one parking event per attempt and the rejection; every one
+	// of them is published before the queue is read, so that the count below
+	// is over the whole stream and not over whatever had gone out so far.
+	pending := s.outboxRows(t)
+	eventually(t, settleBudget, "every event to be published", func() error {
+		if got := len(s.publishedEvents(t)); got != len(pending) {
+			return fmt.Errorf("%d of %d events are marked published", got, len(pending))
+		}
+		return nil
+	})
+	rejections := 0
+	for _, m := range awaitMessages(t, events, len(pending), settleBudget, "the published events") {
+		var published struct {
+			EventType string `json:"eventType"`
+			Data      struct {
+				TransactionID string `json:"transactionId"`
+				FailureCode   string `json:"failureCode"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal([]byte(m.body), &published); err != nil {
+			t.Fatalf("read a published envelope: %v\n%s", err, m.body)
+		}
+		if published.Data.TransactionID != settled.id {
+			continue
+		}
+		switch published.EventType {
+		case "WagerTransactionRejected":
+			rejections++
+			if published.Data.FailureCode != failure.ReferenceNotFound.String() {
+				t.Errorf("the rejection on the wire carries %q, want %s",
+					published.Data.FailureCode, failure.ReferenceNotFound)
+			}
+		case "WagerTransactionPendingReference":
+			// One per attempt, and the operation waited more than once.
+		default:
+			t.Errorf("the refund put a %s on the wire, and it was never processed",
+				published.EventType)
+		}
+	}
+	if rejections != 1 {
+		t.Errorf("%d WagerTransactionRejected events for %s reached %s, want exactly 1",
+			rejections, settled.id, events)
+	}
 }

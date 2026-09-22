@@ -305,7 +305,11 @@ func TestReversalExclusivity(t *testing.T) {
 		assertBalance(t, w, "100.00")
 	})
 
-	t.Run("undoing the refund releases the bet again", func(t *testing.T) {
+	// Undoing the refund releases the bet — to a rollback, and not to a second
+	// refund. The active-reversal rule frees the slot; the brief's other rule,
+	// that a reference never receives two successful reversals of one kind,
+	// still counts the refund that was undone.
+	t.Run("undoing the refund releases the bet to a rollback, not to another refund", func(t *testing.T) {
 		t.Parallel()
 		p, w := newProcessor(t), newWallet(t, "100.00")
 		bet := processedOf(t, p, w, command(t, Bet, "25.00"), nil)
@@ -321,9 +325,37 @@ func TestReversalExclusivity(t *testing.T) {
 			t.Fatal("a reversed refund still holds the bet")
 		}
 
-		second := command(t, Refund, "25.00", withReference(externalID(t, bet)))
-		out := mustSubmit(t, p, w, second, freed, baseTime)
+		again := command(t, Refund, "25.00", withReference(externalID(t, bet)))
+		refused := submitOK(t, p, w, again, freed, baseTime)
+		assertRejected(t, refused, failure.ReferenceAlreadyReversed)
+		// The stake was returned once already, and stays where the rollback of
+		// the refund left it.
+		assertBalance(t, w, "75.00")
+
+		rollback := command(t, Rollback, "25.00", withReference(externalID(t, bet)))
+		out := mustSubmit(t, p, w, rollback, referenceWith(bet,
+			ReversalView{Transaction: refund, Reversed: true},
+			ReversalView{Transaction: refused.Transaction},
+		), baseTime)
 		assertStatus(t, out, Processed)
+		assertBalance(t, w, "100.00")
+	})
+
+	// A rollback cannot be reversed, so the first rollback of a win holds it
+	// for good and the active rule alone refuses the second. The code is the
+	// same one the per-kind rule would give, so a provider reads one answer.
+	t.Run("a win rolled back twice is refused under the same code", func(t *testing.T) {
+		t.Parallel()
+		p, w := newProcessor(t), newWallet(t, "100.00")
+		win := processedOf(t, p, w, command(t, Win, "40.00"), nil)
+		first := processedOf(t, p, w,
+			command(t, Rollback, "40.00", withReference(externalID(t, win))), referenceTo(win))
+		assertBalance(t, w, "100.00")
+
+		second := command(t, Rollback, "40.00", withReference(externalID(t, win)))
+		out := submitOK(t, p, w, second,
+			referenceWith(win, ReversalView{Transaction: first}), baseTime)
+		assertRejected(t, out, failure.ReferenceAlreadyReversed)
 		assertBalance(t, w, "100.00")
 	})
 
@@ -362,6 +394,48 @@ func TestReversalExclusivity(t *testing.T) {
 
 // TestReferenceOutcomes is the documented matrix of what a reference says about
 // an operation.
+// TestHasSuccessfulReversalOfKind pins what the per-kind rule counts: every
+// PROCESSED reversal of that kind pointing at the reference, whether or not it
+// has since been undone — and nothing else. A win pointing at a bet is not a
+// reversal, and a reversal that never took effect returned no money.
+func TestHasSuccessfulReversalOfKind(t *testing.T) {
+	t.Parallel()
+	p, w := newProcessor(t), newWallet(t, "100.00")
+	bet := processedOf(t, p, w, command(t, Bet, "25.00"), nil)
+	win := processedOf(t, p, w,
+		command(t, Win, "10.00", withReference(externalID(t, bet))), referenceTo(bet))
+	refused := submitOK(t, p, w,
+		command(t, Refund, "10.00", withReference(externalID(t, bet))), referenceTo(bet), baseTime)
+	assertRejected(t, refused, failure.ReversalAmountMismatch)
+	refund := processedOf(t, p, w,
+		command(t, Refund, "25.00", withReference(externalID(t, bet))), referenceTo(bet))
+
+	tests := []struct {
+		name string
+		view *ReferenceView
+		kind Kind
+		want bool
+	}{
+		{name: "a nil view", view: nil, kind: Refund, want: false},
+		{name: "no reversals", view: referenceTo(bet), kind: Refund, want: false},
+		{name: "a win pointing at the bet", view: referenceWith(bet, ReversalView{Transaction: win}), kind: Rollback, want: false},
+		{name: "a rejected refund", view: referenceWith(bet, ReversalView{Transaction: refused.Transaction}), kind: Refund, want: false},
+		{name: "a reversal view with no transaction", view: referenceWith(bet, ReversalView{}), kind: Refund, want: false},
+		{name: "a processed refund, for a refund", view: referenceWith(bet, ReversalView{Transaction: refund}), kind: Refund, want: true},
+		{name: "a processed refund, for a rollback", view: referenceWith(bet, ReversalView{Transaction: refund}), kind: Rollback, want: false},
+		{name: "a processed refund that was itself undone", view: referenceWith(bet, ReversalView{Transaction: refund, Reversed: true}), kind: Refund, want: true},
+		{name: "a kind that is not a reversal", view: referenceWith(bet, ReversalView{Transaction: refund}), kind: Bet, want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tc.view.HasSuccessfulReversalOfKind(tc.kind); got != tc.want {
+				t.Errorf("HasSuccessfulReversalOfKind(%s) = %t, want %t", tc.kind, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestReferenceOutcomes(t *testing.T) {
 	t.Parallel()
 
@@ -729,6 +803,7 @@ func TestCommandValidation(t *testing.T) {
 		{"unknown kind", func(c *Command) { c.Kind = "TRANSFER" }, failure.InvalidFieldFormat},
 		{"opening from a provider", func(c *Command) { c.Kind = Opening }, failure.UnsupportedTransactionKind},
 		{"no transaction id", func(c *Command) { c.TransactionID = TransactionID{} }, failure.MissingRequiredField},
+		{"no wallet", func(c *Command) { c.WalletID = WalletID{} }, failure.MissingRequiredField},
 		{"no ledger entry id", func(c *Command) { c.LedgerEntryID = LedgerEntryID{} }, failure.MissingRequiredField},
 		{"no provider", func(c *Command) { c.Provider = "" }, failure.MissingRequiredField},
 		{"no external id", func(c *Command) { c.ExternalTransactionID = "" }, failure.MissingRequiredField},

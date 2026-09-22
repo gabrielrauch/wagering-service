@@ -75,9 +75,10 @@ const (
 // The idempotency key is not a member. It rides in a header, because it is
 // about this delivery of the operation rather than about the operation.
 type submission struct {
-	Provider                       string `json:"provider"`
+	Provider                       string `json:"providerId"`
 	ExternalTransactionID          string `json:"externalTransactionId"`
 	PlayerID                       string `json:"playerId"`
+	WalletID                       string `json:"walletId"`
 	RoundID                        string `json:"roundId"`
 	GameID                         string `json:"gameId"`
 	Kind                           string `json:"kind"`
@@ -108,10 +109,11 @@ type envelope struct {
 // queued is a submission as the queue carries it: the same business fields,
 // plus the idempotency key as a member because a queue has no headers.
 type queued struct {
-	Provider                       string `json:"provider"`
+	Provider                       string `json:"providerId"`
 	ExternalTransactionID          string `json:"externalTransactionId"`
 	IdempotencyKey                 string `json:"idempotencyKey"`
 	PlayerID                       string `json:"playerId"`
+	WalletID                       string `json:"walletId"`
 	RoundID                        string `json:"roundId"`
 	GameID                         string `json:"gameId"`
 	Kind                           string `json:"kind"`
@@ -119,8 +121,9 @@ type queued struct {
 	ReferenceExternalTransactionID string `json:"referenceExternalTransactionId,omitempty"`
 }
 
-// messageType is the one type the consumer accepts on the inbound queue.
-const messageType = "WagerTransactionSubmitted"
+// messageType is the one type the consumer accepts on the inbound queue, as
+// the specification spells it.
+const messageType = "WagerTransactionRequested"
 
 // operationAnswer is the view a submission and a read both answer with.
 type operationAnswer struct {
@@ -134,21 +137,24 @@ type operationAnswer struct {
 	IdempotentReplay      bool    `json:"idempotentReplay"`
 }
 
-// walletAnswer is the view /wallets answers with.
+// walletAnswer is the view /wallets answers with. The wallet's identifier is
+// spelled id, as the specification spells it.
 type walletAnswer struct {
-	WalletID string `json:"walletId"`
+	WalletID string `json:"id"`
 	PlayerID string `json:"playerId"`
 	Balance  amount `json:"balance"`
 	Version  uint64 `json:"version"`
 }
 
-// reconciliation is what checking a wallet against its ledger found.
+// reconciliation is what checking a wallet against its ledger found, in the
+// specification's six members.
 type reconciliation struct {
-	WalletID      string `json:"walletId"`
-	Consistent    bool   `json:"consistent"`
-	Stored        amount `json:"stored"`
-	Reconstructed amount `json:"reconstructed"`
-	Difference    amount `json:"difference"`
+	WalletID          string `json:"walletId"`
+	StoredBalance     amount `json:"storedBalance"`
+	CalculatedBalance amount `json:"calculatedBalance"`
+	Difference        amount `json:"difference"`
+	Consistent        bool   `json:"consistent"`
+	CheckedEntries    int    `json:"checkedEntries"`
 }
 
 // The statuses and failure codes this suite asserts on, as literals.
@@ -166,12 +172,15 @@ const (
 	referenceNotFound = "REFERENCE_NOT_FOUND"
 )
 
-// bet builds the submission a provider makes for a wager.
-func bet(provider, external, player, value string) submission {
+// bet builds the submission a provider makes for a wager, against the wallet
+// the scenario opened: a provider names both the player and the wallet it
+// addresses, as one that was told the id at opening would.
+func bet(provider, external string, wallet walletAnswer, value string) submission {
 	return submission{
 		Provider:              provider,
 		ExternalTransactionID: external,
-		PlayerID:              player,
+		PlayerID:              wallet.PlayerID,
+		WalletID:              wallet.WalletID,
 		RoundID:               "round-" + external,
 		GameID:                "game-1",
 		Kind:                  "BET",
@@ -181,8 +190,8 @@ func bet(provider, external, player, value string) submission {
 
 // refund builds the submission that returns a bet's stake, naming the bet by
 // the identifier the provider gave it rather than by ours.
-func refund(provider, external, player, value, reference string) submission {
-	s := bet(provider, external, player, value)
+func refund(provider, external string, wallet walletAnswer, value, reference string) submission {
+	s := bet(provider, external, wallet, value)
 	s.Kind = "REFUND"
 	s.ReferenceExternalTransactionID = reference
 	return s
@@ -212,6 +221,7 @@ func onTheQueue(s submission, messageID, key string) envelope {
 			ExternalTransactionID:          s.ExternalTransactionID,
 			IdempotencyKey:                 key,
 			PlayerID:                       s.PlayerID,
+			WalletID:                       s.WalletID,
 			RoundID:                        s.RoundID,
 			GameID:                         s.GameID,
 			Kind:                           s.Kind,

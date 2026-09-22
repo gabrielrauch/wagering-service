@@ -41,7 +41,7 @@ func TestARefundDeliveredBeforeItsBetIsCarriedForwardByWhicheverWorkerGetsThere(
 
 	workers := w.twoWorkers(t, patientReference)
 
-	w.put(t, onTheQueue(inRound(refund(providerA, reversal, player, "25.00", stake), round),
+	w.put(t, onTheQueue(inRound(refund(providerA, reversal, wallet, "25.00", stake), round),
 		scoped("early-refund-refund-message"), scoped("early-refund-refund-key")),
 		wallet.WalletID)
 
@@ -51,7 +51,7 @@ func TestARefundDeliveredBeforeItsBetIsCarriedForwardByWhicheverWorkerGetsThere(
 			got, want)
 	}
 
-	w.put(t, onTheQueue(inRound(bet(providerA, stake, player, "25.00"), round),
+	w.put(t, onTheQueue(inRound(bet(providerA, stake, wallet, "25.00"), round),
 		scoped("early-refund-bet-message"), scoped("early-refund-bet-key")),
 		wallet.WalletID)
 
@@ -120,7 +120,7 @@ func TestARefundWhoseBetNeverArrivesIsRejectedWhenTheBudgetRunsOut(t *testing.T)
 	workers := w.twoWorkers(t, budget)
 
 	sent := time.Now()
-	w.put(t, onTheQueue(inRound(refund(providerA, reversal, player, "25.00", missing), round),
+	w.put(t, onTheQueue(inRound(refund(providerA, reversal, wallet, "25.00", missing), round),
 		scoped("expiry-refund-message"), scoped("expiry-refund-key")),
 		wallet.WalletID)
 

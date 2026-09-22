@@ -109,7 +109,12 @@ func command(t *testing.T, kind Kind, amount string, opts ...cmdOption) Command 
 	t.Helper()
 	txID := NewTransactionID()
 	c := Command{
-		TransactionID:         txID,
+		TransactionID: txID,
+		// Fresh rather than the wallet's own: the domain checks the player a
+		// wallet belongs to and takes the wallet's id from the wallet it is
+		// handed, so a test names the wallet only when the naming is what it
+		// is about.
+		WalletID:              NewWalletID(),
 		Provider:              testProvider,
 		ExternalTransactionID: ExternalTransactionID("ext-" + txID.String()),
 		IdempotencyKey:        IdempotencyKey("key-" + txID.String()),

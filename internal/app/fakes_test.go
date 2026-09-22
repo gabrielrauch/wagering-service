@@ -28,8 +28,9 @@ import (
 // What these reproduce on purpose, because the design rests on it: atomicity,
 // every unique constraint, the schedule-iff-parked equivalence, monotonic
 // updated_at, the ledger version chain and the wallet-iff-ledger pairing, one
-// active reversal per reference with release-on-reversal, read-your-own-writes,
-// and two transactions open at once.
+// active reversal per reference with release-on-reversal, one successful
+// reversal per kind per reference, read-your-own-writes, and two transactions
+// open at once.
 
 type txnRow struct {
 	snap          wagering.TransactionSnapshot
@@ -121,12 +122,13 @@ type fakeDB struct {
 	// so without this the second half of that sequence is unreachable here.
 	blindToKeyOnce bool
 
-	// blindToActiveReversals makes ReferenceFor omit a hold that is really
-	// there, which is the one way the ErrReferenceAlreadyReversed backstop can
-	// be reached: the domain rejects a held reference properly when the view
-	// shows it, so only a view built wrongly gets as far as the trigger. It is
-	// how the schema would behave against a reference query that had drifted
-	// out of step with active_reversal.
+	// blindToActiveReversals makes ReferenceFor omit every reversal that is
+	// really there, which is the one way the ErrReferenceAlreadyReversed
+	// backstop can be reached: the domain rejects a held or already-reversed
+	// reference properly when the view shows it, so only a view built wrongly
+	// gets as far as the schema. It is how the schema would behave against a
+	// reference query that had drifted out of step with wager_transaction and
+	// active_reversal.
 	blindToActiveReversals bool
 
 	// duringRecord runs in the window between a submission's read and its
@@ -271,6 +273,22 @@ func (d *fakeDB) empty() bool {
 // existence — through wagering.OpenWallet, with its opening transaction and the
 // ledger entry that records it — so that a test which later reconciles the
 // wallet is reconciling something that could exist.
+// walletFor names the wallet a player holds in a currency, as a provider that
+// was told the id at opening would remember it. It answers false for a pair
+// that names no wallet, and for a pair that could not name one.
+func (d *fakeDB) walletFor(player, currency string) (wagering.WalletID, bool) {
+	playerID, err := wagering.NewPlayerID(player)
+	if err != nil {
+		return wagering.WalletID{}, false
+	}
+	code, err := money.ParseCurrency(currency)
+	if err != nil {
+		return wagering.WalletID{}, false
+	}
+	id, ok := d.committed.byKey[wagering.WalletKey{PlayerID: playerID, Currency: code}]
+	return id, ok
+}
+
 func (d *fakeDB) seedWallet(t *testing.T, player, amount, currency string) wagering.WalletID {
 	t.Helper()
 	playerID, err := wagering.NewPlayerID(player)
@@ -495,10 +513,16 @@ func (t txnStore) ByIdempotencyKey(
 	return storedFrom(row)
 }
 
-// ReferenceFor builds the view the domain reasons over, rehydrating the reversal
-// that holds the reference rather than signalling it with a flag — a view whose
-// Transaction is nil is skipped by ActiveReversal, which would put
-// REFERENCE_ALREADY_REVERSED out of the domain's reach entirely.
+// ReferenceFor builds the view the domain reasons over, rehydrating every
+// processed reversal that resolved to the reference rather than signalling one
+// with a flag — a view whose Transaction is nil is skipped by ActiveReversal,
+// which would put REFERENCE_ALREADY_REVERSED out of the domain's reach entirely.
+//
+// Every processed reversal, not only the one holding the reference. The
+// per-kind rule counts a refund that was itself rolled back, and a view built
+// from active_reversal alone has forgotten it: a released hold is deleted rather
+// than marked. So the reversals come from the transactions, and active_reversal
+// answers only whether each one still holds — which is what Reversed is.
 func (t txnStore) ReferenceFor(
 	ctx context.Context,
 	p wagering.Provider,
@@ -518,16 +542,37 @@ func (t txnStore) ReferenceFor(
 		return nil, err
 	}
 	view := &wagering.ReferenceView{Transaction: reference}
-	if h, held := t.st.holder[row.snap.ID]; held && !t.db.blindToActiveReversals {
-		holder, err := wagering.RehydrateWagerTransaction(t.st.txns[h.reversalID].snap)
+	if t.db.blindToActiveReversals {
+		return view, nil
+	}
+	for _, id := range t.processedReversalsOf(row.snap.ID) {
+		reversal, err := wagering.RehydrateWagerTransaction(t.st.txns[id].snap)
 		if err != nil {
 			return nil, err
 		}
-		// Reversed is always false: a released hold is deleted rather than
-		// marked, so a row that is here is a hold that still stands.
-		view.Reversals = append(view.Reversals, wagering.ReversalView{Transaction: holder})
+		h, holds := t.st.holder[row.snap.ID]
+		view.Reversals = append(view.Reversals, wagering.ReversalView{
+			Transaction: reversal,
+			Reversed:    !holds || h.reversalID != id,
+		})
 	}
 	return view, nil
+}
+
+// processedReversalsOf lists every PROCESSED reversal resolved to reference, in
+// the order they were created.
+func (t txnStore) processedReversalsOf(reference wagering.TransactionID) []wagering.TransactionID {
+	var found []wagering.TransactionID
+	for _, id := range slices.SortedFunc(maps.Keys(t.st.txns), func(a, b wagering.TransactionID) int {
+		return t.st.txns[a].snap.CreatedAt.Compare(t.st.txns[b].snap.CreatedAt)
+	}) {
+		snap := t.st.txns[id].snap
+		if snap.Status == wagering.Processed && snap.Kind.IsReversal() &&
+			snap.External != nil && snap.External.ResolvedReferenceID == reference {
+			found = append(found, id)
+		}
+	}
+	return found
 }
 
 func (t txnStore) find(match func(txnRow) bool) (txnRow, bool) {
@@ -928,6 +973,17 @@ func (b *stores) maintainActiveReversal(snap wagering.TransactionSnapshot) error
 		return nil
 	}
 	reference := snap.External.ResolvedReferenceID
+	// wager_transaction_one_successful_reversal_per_kind, checked where the
+	// index is: on the row, before the trigger runs. A second processed
+	// reversal of one kind on one reference is a duplicate key whether or not
+	// the first has since been released.
+	for id, other := range b.st.txns {
+		if id == snap.ID || other.snap.Status != wagering.Processed || other.snap.Kind != snap.Kind ||
+			other.snap.External == nil || other.snap.External.ResolvedReferenceID != reference {
+			continue
+		}
+		return app.ErrReferenceAlreadyReversed
+	}
 	if released, found := b.release(reference); found {
 		// The conditional release is the whole of ADR-0003. Releasing on reversal
 		// id alone would also release a ROLLBACK's hold, and a rollback applied

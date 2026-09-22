@@ -19,13 +19,13 @@ import (
 func TestTwoProvidersMayUseTheSameExternalTransactionID(t *testing.T) {
 	t.Parallel()
 	s := newStack(t)
-	s.openWallet(t, "player-shared", "100.00")
+	wallet := s.openWallet(t, "player-shared", "100.00")
 
 	const shared = "ext-shared-1"
 	first := operationOf(t, s.submit(t, providerA,
-		bet(providerA, shared, "player-shared", "10.00"), "key-a-1"))
+		bet(providerA, shared, wallet, "10.00"), "key-a-1"))
 	second := operationOf(t, s.submit(t, providerB,
-		bet(providerB, shared, "player-shared", "20.00"), "key-b-1"))
+		bet(providerB, shared, wallet, "20.00"), "key-b-1"))
 
 	if first.Status != "PROCESSED" || second.Status != "PROCESSED" {
 		t.Fatalf("the two submissions came to %s and %s, wanted both PROCESSED",
@@ -94,11 +94,11 @@ func TestTwoProvidersMayUseTheSameExternalTransactionID(t *testing.T) {
 func TestAProviderMayNotSubmitAsAnother(t *testing.T) {
 	t.Parallel()
 	s := newStack(t)
-	s.openWallet(t, "player-impersonated", "100.00")
+	wallet := s.openWallet(t, "player-impersonated", "100.00")
 
 	before := s.snapshot(t)
 	got := s.submit(t, providerB,
-		bet(providerA, "ext-impersonated", "player-impersonated", "10.00"), "key-impersonated")
+		bet(providerA, "ext-impersonated", wallet, "10.00"), "key-impersonated")
 	body := refused(t, got, http.StatusForbidden, "UNAUTHORIZED")
 	if body.Message != `provider provider-b may not submit as "provider-a"` {
 		t.Fatalf("the refusal says %q", body.Message)
@@ -108,7 +108,7 @@ func TestAProviderMayNotSubmitAsAnother(t *testing.T) {
 	// The control: the same body from the provider it names is accepted, so the
 	// refusal above is about who sent it and not about what it said.
 	accepted := s.submit(t, providerA,
-		bet(providerA, "ext-impersonated", "player-impersonated", "10.00"), "key-impersonated")
+		bet(providerA, "ext-impersonated", wallet, "10.00"), "key-impersonated")
 	if accepted.status != http.StatusOK {
 		t.Fatalf("provider-a's own submission was answered %s", accepted)
 	}
@@ -123,9 +123,9 @@ func TestAProviderMayNotSubmitAsAnother(t *testing.T) {
 func TestAProviderMayNotReadAsAnother(t *testing.T) {
 	t.Parallel()
 	s := newStack(t)
-	s.openWallet(t, "player-read-as", "100.00")
+	wallet := s.openWallet(t, "player-read-as", "100.00")
 	mine := operationOf(t, s.submit(t, providerA,
-		bet(providerA, "ext-read-as", "player-read-as", "10.00"), "key-read-as"))
+		bet(providerA, "ext-read-as", wallet, "10.00"), "key-read-as"))
 
 	for _, external := range []string{"ext-read-as", "an-id-that-exists-nowhere"} {
 		got := s.do(t, call{
@@ -167,9 +167,9 @@ func TestAForeignOperationIsAnsweredExactlyAsAnAbsentOneIs(t *testing.T) {
 	holds := newStack(t)
 	empty := newStack(t)
 
-	holds.openWallet(t, "player-oracle", "100.00")
+	wallet := holds.openWallet(t, "player-oracle", "100.00")
 	mine := operationOf(t, holds.submit(t, providerA,
-		bet(providerA, "ext-oracle", "player-oracle", "10.00"), "key-oracle"))
+		bet(providerA, "ext-oracle", wallet, "10.00"), "key-oracle"))
 
 	// The same correlation on both, because it is the one member of the body
 	// the caller controls and it would otherwise be the only difference.
@@ -211,13 +211,13 @@ func TestAForeignOperationIsAnsweredExactlyAsAnAbsentOneIs(t *testing.T) {
 func TestAProvidersIdempotencyKeyIsItsOwn(t *testing.T) {
 	t.Parallel()
 	s := newStack(t)
-	s.openWallet(t, "player-replay", "100.00")
+	wallet := s.openWallet(t, "player-replay", "100.00")
 
 	const key = "key-replay-shared"
 	const external = "ext-replay-shared"
 	const correlation = "01a0c512-b9b1-7a7e-a26a-52633f063ab0"
 
-	body := bet(providerA, external, "player-replay", "10.00")
+	body := bet(providerA, external, wallet, "10.00")
 	first := operationOf(t, s.submit(t, providerA, body, key))
 	if first.IdempotentReplay {
 		t.Fatal("the first submission was answered as a replay")
@@ -242,7 +242,7 @@ func TestAProvidersIdempotencyKeyIsItsOwn(t *testing.T) {
 
 	// provider-b, provider-a's key, provider-a's payload in every respect but
 	// the provider — which it may not name, so it names itself.
-	theirs := bet(providerB, external, "player-replay", "10.00")
+	theirs := bet(providerB, external, wallet, "10.00")
 	got := operationOf(t, s.submit(t, providerB, theirs, key))
 	if got.IdempotentReplay {
 		t.Fatal("provider-b's submission was answered as a replay of provider-a's")

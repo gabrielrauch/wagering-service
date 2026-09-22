@@ -186,7 +186,7 @@ func TestACommandThatFailsPartwayLeavesNothingBehind(t *testing.T) {
 
 	operations := []struct {
 		name  string
-		build func(t *testing.T) app.SubmitOperation
+		build func(t *testing.T, wallet app.WalletView) app.SubmitOperation
 		// holds is how many rows in active_reversal this operation takes when
 		// it is allowed to finish. It is asserted after the repair, and it is
 		// what stops the refund case proving nothing: a refund that was
@@ -196,16 +196,16 @@ func TestACommandThatFailsPartwayLeavesNothingBehind(t *testing.T) {
 	}{
 		{
 			name: "a bet",
-			build: func(t *testing.T) app.SubmitOperation {
-				return carrying(submission(t, wagering.Bet, atomicPlayer,
+			build: func(t *testing.T, wallet app.WalletView) app.SubmitOperation {
+				return carrying(submission(t, wagering.Bet, wallet,
 					atomicExternal, "key-atomic", "40.00"), atomicMessage)
 			},
 		},
 		{
 			name: "a refund, which takes a hold on its reference",
-			build: func(t *testing.T) app.SubmitOperation {
+			build: func(t *testing.T, wallet app.WalletView) app.SubmitOperation {
 				return carrying(reversingSubmission(
-					submission(t, wagering.Refund, atomicPlayer,
+					submission(t, wagering.Refund, wallet,
 						atomicExternal, "key-atomic", atomicStake),
 					atomicReference), atomicMessage)
 			},
@@ -224,14 +224,14 @@ func TestACommandThatFailsPartwayLeavesNothingBehind(t *testing.T) {
 				opened := w.wire(t, at(0))
 				wallet := opened.open(t, atomicPlayer, "100.00")
 				opened.clock.moveTo(at(1))
-				opened.submit(t, submission(t, wagering.Bet, atomicPlayer,
+				opened.submit(t, submission(t, wagering.Bet, wallet,
 					atomicReference, "key-atomic-bet", atomicStake), wagering.Processed)
 				before := w.footprintOf(t, wallet.ID)
 
 				injected := fault.inject(t, w)
 				failing := wireOnto(t, w.tm, injected.ids, at(2))
 
-				result, err := failing.wagers.Submit(injected.ctx, operation.build(t))
+				result, err := failing.wagers.Submit(injected.ctx, operation.build(t, wallet))
 				if err == nil {
 					t.Fatalf("the submission came to %s, wanted it to fail partway", result.Status)
 				}
@@ -297,7 +297,7 @@ func TestACommandThatFailsPartwayLeavesNothingBehind(t *testing.T) {
 				// the ones the failed attempt had to undo, which is what makes
 				// their absence above a comparison rather than a tautology.
 				healed := injected.repair(t, w)
-				healed.submit(t, operation.build(t), wagering.Processed)
+				healed.submit(t, operation.build(t, wallet), wagering.Processed)
 				for _, present := range absences {
 					if got := w.count(t, present.query, present.args...); got == 0 {
 						t.Fatalf("the repeated command wrote no %s, so its absence after "+
@@ -344,8 +344,8 @@ func TestTwoConcurrentBetsSpendOneBalanceOnce(t *testing.T) {
 	u.clock.moveTo(at(1))
 
 	bets := []app.SubmitOperation{
-		submission(t, wagering.Bet, "player-spec", "ext-spec-a", "key-spec-a", "80.00"),
-		submission(t, wagering.Bet, "player-spec", "ext-spec-b", "key-spec-b", "80.00"),
+		submission(t, wagering.Bet, wallet, "ext-spec-a", "key-spec-a", "80.00"),
+		submission(t, wagering.Bet, wallet, "ext-spec-b", "key-spec-b", "80.00"),
 	}
 
 	held := w.holdWallet(t, "player-spec")
@@ -498,7 +498,7 @@ func TestFiftyIdenticalBetsProduceOneDebit(t *testing.T) {
 	// what makes "all fifty were answered with one identifier" a fact about the
 	// database rather than about the fixture. A source that handed the same id
 	// to all of them would make this test pass for the wrong reason.
-	one := submission(t, wagering.Bet, "player-fifty", "ext-fifty", "key-fifty", "10.00")
+	one := submission(t, wagering.Bet, wallet, "ext-fifty", "key-fifty", "10.00")
 	identical := make([]app.SubmitOperation, bets)
 	for i := range identical {
 		identical[i] = one
@@ -565,6 +565,84 @@ func TestFiftyIdenticalBetsProduceOneDebit(t *testing.T) {
 	}
 }
 
+// TestAReleasedBetIsRefundableNoMoreAndRollbackableOnce is the per-kind rule
+// through the real adapter, end to end.
+//
+// BET → REFUND → ROLLBACK of the refund releases the bet from its active
+// reversal, and the sequence used to continue with a second REFUND that
+// returned the stake again. Now the second refund is REJECTED under
+// REFERENCE_ALREADY_REVERSED — with a row and an event, decided by the domain
+// from a view that remembers the refund that was undone, and not refused by
+// the index the schema keeps behind it — while a ROLLBACK of the same bet is
+// the case ADR-0003 exists to permit, and goes through.
+func TestAReleasedBetIsRefundableNoMoreAndRollbackableOnce(t *testing.T) {
+	t.Parallel()
+	w := newWorld(t)
+	u := w.wire(t, at(0))
+	wallet := u.open(t, "player-released", "100.00")
+
+	u.clock.moveTo(at(1))
+	u.submit(t, submission(t, wagering.Bet, wallet, "ext-bet", "key-bet", "30.00"),
+		wagering.Processed)
+	u.clock.moveTo(at(2))
+	u.submit(t, reversingSubmission(
+		submission(t, wagering.Refund, wallet, "ext-refund", "key-refund", "30.00"),
+		"ext-bet"), wagering.Processed)
+	u.clock.moveTo(at(3))
+	u.submit(t, reversingSubmission(
+		submission(t, wagering.Rollback, wallet, "ext-undo", "key-undo", "30.00"),
+		"ext-refund"), wagering.Processed)
+
+	if got := u.balanceOf(t, wallet.ID); got != "70.00" {
+		t.Fatalf("the wallet holds %s, wanted the 70.00 the undone refund left", got)
+	}
+	if got := w.count(t, `SELECT count(*) FROM wagering.active_reversal WHERE reference_id = $1`,
+		uuidOf(wallet.ID)); got != 0 {
+		t.Fatalf("the bet is held %d times, wanted none after its refund was undone", got)
+	}
+
+	u.clock.moveTo(at(4))
+	result, err := u.wagers.Submit(t.Context(), reversingSubmission(
+		submission(t, wagering.Refund, wallet, "ext-refund-2", "key-refund-2", "30.00"),
+		"ext-bet"))
+	if err != nil {
+		t.Fatalf("a second refund was refused rather than rejected, which means the reference "+
+			"view forgot the refund that was undone and the rule now lives only in the schema: %v", err)
+	}
+	if result.Status != wagering.Rejected || result.FailureCode != failure.ReferenceAlreadyReversed {
+		t.Fatalf("a second refund came to %s under %q, wanted REJECTED under %s",
+			result.Status, result.FailureCode, failure.ReferenceAlreadyReversed)
+	}
+	stored, err := u.wagers.TransactionByExternalID(t.Context(), providerPrincipal(t),
+		"acme", "ext-refund-2")
+	if err != nil {
+		t.Fatalf("read the second refund back: %v", err)
+	}
+	if stored.Status != wagering.Rejected || stored.FailureCode != failure.ReferenceAlreadyReversed {
+		t.Fatalf("the second refund is stored as %s under %q, wanted REJECTED under %s",
+			stored.Status, stored.FailureCode, failure.ReferenceAlreadyReversed)
+	}
+	if got := w.count(t,
+		`SELECT count(*) FROM wagering.outbox WHERE aggregate_id = $1 `+
+			`AND event_type = 'WagerTransactionRejected' `+
+			`AND payload->'data'->>'externalTransactionId' = $2 `+
+			`AND payload->'data'->>'failureCode' = $3`,
+		uuidOf(wallet.ID), "ext-refund-2", failure.ReferenceAlreadyReversed.String()); got != 1 {
+		t.Fatalf("the second refund emitted %d rejection events, wanted 1", got)
+	}
+	if got := u.balanceOf(t, wallet.ID); got != "70.00" {
+		t.Fatalf("the wallet holds %s after the rejected refund, wanted 70.00 untouched", got)
+	}
+
+	u.clock.moveTo(at(5))
+	u.submit(t, reversingSubmission(
+		submission(t, wagering.Rollback, wallet, "ext-rollback", "key-rollback", "30.00"),
+		"ext-bet"), wagering.Processed)
+	if got := u.balanceOf(t, wallet.ID); got != "100.00" {
+		t.Fatalf("the wallet holds %s after the rollback, wanted the 100.00 it opened with", got)
+	}
+}
+
 // TestAHeldReferenceRejectsFurtherReversals takes a bet, returns it with a
 // refund, and then tries to reverse the same bet again — twice, once with
 // another refund and once with a rollback, because the rule is about reversals
@@ -586,11 +664,11 @@ func TestAHeldReferenceRejectsFurtherReversals(t *testing.T) {
 	wallet := u.open(t, "player-reversed", "100.00")
 
 	u.clock.moveTo(at(1))
-	u.submit(t, submission(t, wagering.Bet, "player-reversed", "ext-bet", "key-bet", "30.00"),
+	u.submit(t, submission(t, wagering.Bet, wallet, "ext-bet", "key-bet", "30.00"),
 		wagering.Processed)
 	u.clock.moveTo(at(2))
 	u.submit(t, reversingSubmission(
-		submission(t, wagering.Refund, "player-reversed", "ext-refund", "key-refund", "30.00"),
+		submission(t, wagering.Refund, wallet, "ext-refund", "key-refund", "30.00"),
 		"ext-bet"), wagering.Processed)
 
 	// The stake is back and the bet is held by the refund that returned it.
@@ -618,7 +696,7 @@ func TestAHeldReferenceRejectsFurtherReversals(t *testing.T) {
 			before := w.footprintOf(t, wallet.ID)
 			u.clock.moveTo(at(3 + i))
 			result, err := u.wagers.Submit(t.Context(), reversingSubmission(
-				submission(t, attempt.kind, "player-reversed",
+				submission(t, attempt.kind, wallet,
 					attempt.external, attempt.key, "30.00"),
 				"ext-bet"))
 			if err != nil {

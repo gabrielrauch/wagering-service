@@ -80,7 +80,7 @@ func TestOneOperationWithAndWithoutAnInboxIdentityMovesMoneyOnceAndReplaysOnce(
 			consumer := startConsumer(t, s, queue, submitter,
 				consumerSettings{name: consumerName})
 
-			op := operationOf("BET", external, player, "25.00")
+			op := operationOf("BET", external, player, wallet, "25.00")
 			var direct app.OperationResult
 			if c.queueFirst {
 				put(t, name, body(t, message(messageID, op)), wallet, "dedupe-"+messageID)

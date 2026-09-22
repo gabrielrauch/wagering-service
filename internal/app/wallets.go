@@ -218,11 +218,12 @@ func (s *Wallets) Reconcile(ctx context.Context, principal Principal, id wagerin
 				return classify(err)
 			}
 			report = Reconciliation{
-				Consistent:    true,
-				WalletID:      id,
-				Stored:        wallet.Balance(),
-				Reconstructed: wallet.Balance(),
-				Difference:    zero,
+				Consistent:     true,
+				CheckedEntries: len(entries),
+				WalletID:       id,
+				Stored:         wallet.Balance(),
+				Reconstructed:  wallet.Balance(),
+				Difference:     zero,
 			}
 			return nil
 		}
@@ -253,11 +254,12 @@ func (s *Wallets) Reconcile(ctx context.Context, principal Principal, id wagerin
 			return classify(err)
 		}
 		report = Reconciliation{
-			Consistent:    false,
-			WalletID:      id,
-			Stored:        mismatch.Actual(),
-			Reconstructed: mismatch.Expected(),
-			Difference:    difference,
+			Consistent:     false,
+			CheckedEntries: len(entries),
+			WalletID:       id,
+			Stored:         mismatch.Actual(),
+			Reconstructed:  mismatch.Expected(),
+			Difference:     difference,
 		}
 		return nil
 	})

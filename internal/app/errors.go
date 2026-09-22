@@ -313,6 +313,16 @@ func notFound(format string, a ...any) *Error {
 // built to deny. Match it, count it, log it; never answer with it.
 var ErrForeignOperation = errors.New("app: operation belongs to another provider")
 
+// ErrForeignWallet marks a submission refused because the wallet it names is
+// held by another player. It is [ErrForeignOperation]'s twin for the write
+// path, and everything said there holds here: the caller is told what a caller
+// naming a wallet that does not exist is told, byte for byte, because a
+// provider cannot read wallets and this is the one door through which it could
+// otherwise learn, at no cost, whether an identifier is in use and whose it is.
+// The domain's own refusal is not wrapped, deliberately — it carries a failure
+// code, and a code in the chain would be rendered where a sentinel is not.
+var ErrForeignWallet = errors.New("app: wallet belongs to another player")
+
 // notFoundWrapping is notFound carrying a cause the caller cannot see. The
 // rendered message is the one notFound would have produced, because Error
 // prints the head and the message and never the cause.

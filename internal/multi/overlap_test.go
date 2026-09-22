@@ -94,7 +94,7 @@ func TestTwoWalletsAreProcessedAtTheSameTimeAcrossTwoInstances(t *testing.T) {
 	credential := token(t, providerA)
 	// Rendered before the goroutine starts, because encode fails the test and a
 	// test may only be failed from the goroutine running it.
-	heldBody := encode(t, bet(providerA, scoped("held-bet"), held, "10.00"))
+	heldBody := encode(t, bet(providerA, scoped("held-bet"), heldWallet, "10.00"))
 	blocked := make(chan interval, 1)
 	go func() {
 		span := interval{started: time.Now()}
@@ -120,7 +120,7 @@ func TestTwoWalletsAreProcessedAtTheSameTimeAcrossTwoInstances(t *testing.T) {
 		base:           instances[1],
 		method:         http.MethodPost,
 		path:           "/wagering/transactions",
-		body:           encode(t, bet(providerA, scoped("free-bet"), free, "10.00")),
+		body:           encode(t, bet(providerA, scoped("free-bet"), freeWallet, "10.00")),
 		token:          credential,
 		idempotencyKey: scoped("free-key"),
 	})

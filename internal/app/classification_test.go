@@ -121,7 +121,7 @@ func TestARepositoryFailureIsClassifiedByWhatTheAdapterSaid(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(t)
 			f.db.seedWallet(t, "player-1", "100.00", "BRL")
-			f.db.failNext("wallet.LockForMovement", tc.injected)
+			f.db.failNext("wallet.LockByID", tc.injected)
 
 			_, err := f.trySubmit(t, fields(acme, submission{
 				Kind: "BET", External: "ext-1", Key: "key-1", Amount: "25.00",

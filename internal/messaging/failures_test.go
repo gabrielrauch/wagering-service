@@ -131,7 +131,7 @@ func TestATransientFailureLeavesTheMessageVisibleAgain(t *testing.T) {
 			submitter := follow(s.wagering)
 			clear := c.obstruct(t, s, wallet)
 
-			raw := body(t, message(messageID, operationOf("BET", external, player, "25.00")))
+			raw := body(t, message(messageID, operationOf("BET", external, player, wallet, "25.00")))
 			sent := put(t, name, raw, wallet, "dedupe-"+messageID)
 			consumer := startConsumer(t, s, queue, submitter, consumerSettings{
 				name:    consumerName,
@@ -344,7 +344,7 @@ func TestAGracefulShutdownReleasesAMessageStillInFlight(t *testing.T) {
 
 	release := holdWallet(t, s, wallet)
 
-	raw := body(t, message(messageID, operationOf("BET", external, player, "25.00")))
+	raw := body(t, message(messageID, operationOf("BET", external, player, wallet, "25.00")))
 	sent := put(t, name, raw, wallet, "dedupe-"+messageID)
 	consumer := startConsumer(t, s, queue, submitter,
 		consumerSettings{name: consumerName, drain: drain})

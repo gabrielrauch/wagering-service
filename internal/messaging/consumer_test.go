@@ -58,7 +58,7 @@ func TestTheConsumerAppliesAnOperationAndDeletesTheMessage(t *testing.T) {
 	submitter := follow(s.wagering)
 	consumer := startConsumer(t, s, queue, submitter, consumerSettings{name: consumerName})
 
-	raw := body(t, message(messageID, operationOf("BET", external, player, "25.00")))
+	raw := body(t, message(messageID, operationOf("BET", external, player, wallet, "25.00")))
 	sent := put(t, name, raw, wallet, "dedupe-"+messageID)
 
 	s.logs.await(t, logApplied, 1, settleBudget)
@@ -135,7 +135,7 @@ func TestARedeliveredMessageIsReplayedFromTheInboxAndDeleted(t *testing.T) {
 	submitter := follow(s.wagering)
 	consumer := startConsumer(t, s, queue, submitter, consumerSettings{name: consumerName})
 
-	raw := body(t, message(messageID, operationOf("BET", external, player, "25.00")))
+	raw := body(t, message(messageID, operationOf("BET", external, player, wallet, "25.00")))
 	first := put(t, name, raw, wallet, "dedupe-first")
 	s.logs.await(t, logApplied, 1, settleBudget)
 
@@ -218,18 +218,18 @@ func TestAMessageIdReusedForADifferentBodyReachesTheDeadLetterQueue(t *testing.T
 	cases := []struct {
 		name string
 		// forge renders the second body from the first.
-		forge func(t *testing.T, player, external, messageID, honest string) string
+		forge func(t *testing.T, player, external, messageID, wallet, honest string) string
 	}{
 		{
 			name: "the second body says something different",
-			forge: func(t *testing.T, player, external, messageID, _ string) string {
+			forge: func(t *testing.T, player, external, messageID, wallet, _ string) string {
 				return body(t, message(messageID,
-					operationOf("BET", external, player, "90.00")))
+					operationOf("BET", external, player, wallet, "90.00")))
 			},
 		},
 		{
 			name: "the second body says the same thing in different bytes",
-			forge: func(t *testing.T, _, _, _, honest string) string {
+			forge: func(t *testing.T, _, _, _, _, honest string) string {
 				// One space after the opening brace: the same document, the
 				// same fields, the same idempotency key and the same payload
 				// hash — and a different fingerprint, because the inbox hashes
@@ -259,11 +259,11 @@ func TestAMessageIdReusedForADifferentBodyReachesTheDeadLetterQueue(t *testing.T
 				consumerSettings{name: consumerName})
 
 			honest := body(t, message(messageID,
-				operationOf("BET", external, player, "25.00")))
+				operationOf("BET", external, player, wallet, "25.00")))
 			put(t, source, honest, wallet, "dedupe-honest")
 			s.logs.await(t, logApplied, 1, settleBudget)
 
-			forged := c.forge(t, player, external, messageID, honest)
+			forged := c.forge(t, player, external, messageID, wallet, honest)
 			if forged == honest {
 				t.Fatal("the two bodies are identical; there is no fingerprint conflict")
 			}
@@ -345,9 +345,9 @@ func TestAnUnreadableMessageReachesTheDeadLetterQueueAfterTheRetryLimit(t *testi
 	// on — and because it proves the refusal is the envelope's own rather than
 	// the decoder giving up.
 	unreadable := `{"messageId":"msg-unreadable","type":"SomethingElseEntirely",` +
-		`"occurredAt":"2026-09-21T12:00:00Z","data":{"provider":"provider-a",` +
+		`"occurredAt":"2026-09-21T12:00:00Z","data":{"providerId":"provider-a",` +
 		`"externalTransactionId":"ext-unreadable","idempotencyKey":"key-unreadable",` +
-		`"playerId":"player-unreadable","roundId":"round-1","gameId":"game-1",` +
+		`"playerId":"player-unreadable","walletId":"` + wallet + `","roundId":"round-1","gameId":"game-1",` +
 		`"kind":"BET","money":{"amount":"25.00","currency":"BRL"}}}`
 	sent := put(t, source, unreadable, wallet, "dedupe-unreadable")
 
@@ -380,4 +380,115 @@ func TestAnUnreadableMessageReachesTheDeadLetterQueueAfterTheRetryLimit(t *testi
 	}
 
 	empty(t, source, visibility+3*time.Second, "after the unreadable message was redriven")
+}
+
+// TestTheSpecificationsEnvelopeIsAppliedOnce sends the specification's own
+// message shape — type WagerTransactionRequested, data.providerId and
+// data.walletId, an occurredAt carrying milliseconds — twice, under two
+// deduplication ids so that the queue delivers both. It is applied once and
+// the second delivery is answered as a replay.
+//
+// The body is written out rather than built from this suite's [envelope]
+// type, so that the spelling asserted is the specification's and not this
+// suite's reading of it.
+func TestTheSpecificationsEnvelopeIsAppliedOnce(t *testing.T) {
+	t.Parallel()
+
+	const (
+		player     = "player-specification"
+		external   = "transaction-specification"
+		messageID  = "msg-specification"
+		visibility = 2 * time.Second
+	)
+	s := newStack(t)
+	wallet := s.openWallet(t, player, "100.00")
+	name := inbound(t, visibility)
+
+	queue := watch(openQueue(t, name))
+	submitter := follow(s.wagering)
+	consumer := startConsumer(t, s, queue, submitter, consumerSettings{name: consumerName})
+
+	raw := `{"messageId":"` + messageID + `","type":"WagerTransactionRequested",` +
+		`"occurredAt":"2026-09-08T12:00:00.000Z","data":{"providerId":"` + provider + `",` +
+		`"externalTransactionId":"` + external + `","idempotencyKey":"` + provider + `:` + external + `",` +
+		`"playerId":"` + player + `","walletId":"` + wallet + `","roundId":"round-987",` +
+		`"gameId":"fortune-chimp","kind":"BET","money":{"amount":"25.00","currency":"BRL"}}}`
+	first := put(t, name, raw, wallet, "dedupe-specification-first")
+	s.logs.await(t, logApplied, 1, settleBudget)
+	second := put(t, name, raw, wallet, "dedupe-specification-second")
+	s.logs.await(t, logApplied, 2, settleBudget)
+	finished(t, consumer)
+
+	if first == second {
+		t.Fatalf("the queue collapsed the two sends into one message %s", first)
+	}
+	calls := submitter.submissions()
+	if len(calls) != 2 {
+		t.Fatalf("%d submissions, want 2: %+v", len(calls), calls)
+	}
+	if calls[0].result.IdempotentReplay || !calls[1].result.IdempotentReplay {
+		t.Errorf("replay flags = %v then %v, want false then true",
+			calls[0].result.IdempotentReplay, calls[1].result.IdempotentReplay)
+	}
+	if got, want := s.balance(t, player), minor(t, "75.00"); got != want {
+		t.Errorf("balance = %d minor units, want %d — the wallet the message named moved once", got, want)
+	}
+	op := s.operationRow(t, external)
+	if op.status != wagering.Processed.String() {
+		t.Errorf("the operation is %s, want %s", op.status, wagering.Processed)
+	}
+	if got := s.rowCount(t, "wallet_ledger_entry", "wallet_id = $1", wallet); got != 2 {
+		t.Errorf("%d ledger entries, want 2 — the opening's and the bet's", got)
+	}
+	if got := len(s.inboxRows(t)); got != 1 {
+		t.Errorf("%d inbox rows, want 1", got)
+	}
+	if deleted := queue.messagesFor(queue.deleted()); len(deleted) != 2 {
+		t.Errorf("deleted %v, want both %s and %s", deleted, first, second)
+	}
+}
+
+// TestTheSupersededEnvelopeSpellingIsUnreadable sends the message shape this
+// consumer accepted before the specification was in the tree — type
+// WagerTransactionSubmitted, data.provider, no walletId — and proves it is
+// refused as unreadable rather than quietly applied: it reaches the
+// dead-letter queue after the deployed number of deliveries and no submission
+// was ever made for it.
+func TestTheSupersededEnvelopeSpellingIsUnreadable(t *testing.T) {
+	t.Parallel()
+
+	const (
+		player     = "player-superseded"
+		visibility = time.Second
+	)
+	s := newStack(t)
+	wallet := s.openWallet(t, player, "100.00")
+	source, dead := inboundPair(t, visibility)
+
+	queue := watch(openQueue(t, source))
+	submitter := follow(s.wagering)
+	consumer := startConsumer(t, s, queue, submitter, consumerSettings{name: consumerName})
+
+	superseded := `{"messageId":"msg-superseded","type":"WagerTransactionSubmitted",` +
+		`"occurredAt":"2026-09-21T12:00:00Z","data":{"provider":"` + provider + `",` +
+		`"externalTransactionId":"ext-superseded","idempotencyKey":"key-superseded",` +
+		`"playerId":"` + player + `","roundId":"round-1","gameId":"game-1",` +
+		`"kind":"BET","money":{"amount":"25.00","currency":"BRL"}}}`
+	sent := put(t, source, superseded, wallet, "dedupe-superseded")
+
+	dropped := awaitMessages(t, dead, 1, settleBudget, "the superseded message")
+	finished(t, consumer)
+	if len(dropped) != 1 || dropped[0].body != superseded {
+		t.Fatalf("the dead-letter queue holds %+v, want the one superseded body", dropped)
+	}
+	if got := len(queue.delivered(sent)); got != maxReceives {
+		t.Errorf("%d deliveries before the dead-letter queue, want the deployed limit of %d",
+			got, maxReceives)
+	}
+	if calls := submitter.submissions(); len(calls) != 0 {
+		t.Errorf("%d submissions for a message in the superseded spelling: %+v", len(calls), calls)
+	}
+	if got, want := s.balance(t, player), minor(t, "100.00"); got != want {
+		t.Errorf("balance = %d minor units, want %d untouched", got, want)
+	}
 }

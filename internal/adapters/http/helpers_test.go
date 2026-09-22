@@ -166,9 +166,10 @@ func assertJSON(t *testing.T, recorder *httptest.ResponseRecorder) {
 // submitBody is a well-formed submission, so that a test changing one thing
 // about a request changes one thing.
 const submitBody = `{
-	"provider": "acme",
+	"providerId": "acme",
 	"externalTransactionId": "acme-tx-1",
 	"playerId": "player-1",
+	"walletId": "0192f291-27dd-7d3f-8071-5f8685deef37",
 	"roundId": "round-1",
 	"gameId": "game-1",
 	"kind": "BET",

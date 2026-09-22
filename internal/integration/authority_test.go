@@ -42,7 +42,7 @@ func TestOnlyTheServiceMayAdministerWallets(t *testing.T) {
 
 	// Something in the ledger to page and to reconcile against.
 	if got := s.submit(t, providerA,
-		bet(providerA, "ext-administered", "player-administered", "10.00"),
+		bet(providerA, "ext-administered", wallet, "10.00"),
 		"key-administered"); got.status != http.StatusOK {
 		t.Fatalf("seeding the ledger was answered %s", got)
 	}
@@ -107,12 +107,12 @@ func TestOnlyTheServiceMayAdministerWallets(t *testing.T) {
 func TestTheServiceReadsEveryProvidersOperations(t *testing.T) {
 	t.Parallel()
 	s := newStack(t)
-	s.openWallet(t, "player-visible", "100.00")
+	wallet := s.openWallet(t, "player-visible", "100.00")
 
 	mine := operationOf(t, s.submit(t, providerA,
-		bet(providerA, "ext-visible", "player-visible", "10.00"), "key-visible"))
+		bet(providerA, "ext-visible", wallet, "10.00"), "key-visible"))
 	theirs := operationOf(t, s.submit(t, providerB,
-		bet(providerB, "ext-visible", "player-visible", "20.00"), "key-visible-b"))
+		bet(providerB, "ext-visible", wallet, "20.00"), "key-visible-b"))
 
 	service := tokenFor(t, walletService)
 	for _, c := range []struct {
@@ -155,7 +155,7 @@ func TestTheServiceReadsEveryProvidersOperations(t *testing.T) {
 	// nothing; submitting as a provider it is not would make the check on the
 	// submission path meaningless for the one identity that could bypass it.
 	body := refused(t, s.submit(t, walletService,
-		bet(providerA, "ext-by-the-service", "player-visible", "1.00"), "key-by-the-service"),
+		bet(providerA, "ext-by-the-service", wallet, "1.00"), "key-by-the-service"),
 		http.StatusForbidden, "UNAUTHORIZED")
 	if body.Message != "the service may not submit wager operations" {
 		t.Fatalf("the service submitting was refused with %q", body.Message)
