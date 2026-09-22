@@ -10,9 +10,9 @@
 //
 // # What it is for
 //
-// The four points are the four windows in which this system can lose or
-// duplicate work, and each one exists because something outside the database
-// has to happen after a transaction commits:
+// Four of the five points are the four windows in which this system can lose
+// or duplicate work, and each one exists because something outside the
+// database has to happen after a transaction commits:
 //
 //   - [AfterCommitBeforeAck] — the consumer has committed the wager transaction
 //     and has not yet deleted the message. A process that dies here must see
@@ -28,6 +28,14 @@
 //   - [AfterPendingCommit] — the reference worker has committed an operation's
 //     parked state and has not done whatever follows. A process that dies here
 //     must find the operation again when it comes back.
+//
+// The fifth is the other side of the same line:
+//
+//   - [BeforeCommit] — a movement has run every statement of its command and
+//     has not committed. A process that dies here must leave nothing behind —
+//     no row, no entry, no inbox row, no event — and the redelivery must apply
+//     the operation as if it had never been seen; the transaction being one
+//     transaction is what makes that true.
 //
 // # The decisions
 //
@@ -72,9 +80,9 @@ const Variable = "FAULT_POINT"
 // asserting that the fault fired and not that the process died some other way.
 const ExitCode = 99
 
-// The points this system can be killed at. Each is the instant after a
+// The points this system can be killed at. Four are the instant after a
 // transaction has committed and before the effect outside the database that
-// was supposed to follow it.
+// was supposed to follow it; the fifth is the instant before the commit.
 const (
 	// AfterCommitBeforeAck is the consumer, between the commit and the delete.
 	AfterCommitBeforeAck = "after_commit_before_ack"
@@ -87,6 +95,14 @@ const (
 	// AfterPendingCommit is the reference worker, after the commit that parked
 	// or resumed an operation.
 	AfterPendingCommit = "after_pending_commit"
+	// BeforeCommit is the movement transaction, after the last statement of
+	// the command and before COMMIT. It is hit by whichever process runs the
+	// movement — the consumer, the API, the reference worker — and by every
+	// movement transaction, including one that wrote nothing: an idle turn of
+	// the reference loop and a pure replay both commit, so a worker armed here
+	// with the reference loop enabled dies on its first idle turn. Arm it on a
+	// worker running the consumer alone (REFERENCE_WORKER_ENABLED=false).
+	BeforeCommit = "before_commit"
 )
 
 // points is every name [Hit] will act on, so that a FAULT_POINT nobody
@@ -96,6 +112,7 @@ var points = map[string]bool{
 	AfterPublishBeforeMark:  true,
 	AfterClaimBeforePublish: true,
 	AfterPendingCommit:      true,
+	BeforeCommit:            true,
 }
 
 // warnOnce keeps the report of an unrecognised FAULT_POINT to one line, because

@@ -12,6 +12,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/gabrielrauch/wagering-service/internal/app"
+	"github.com/gabrielrauch/wagering-service/internal/faults"
 	"github.com/gabrielrauch/wagering-service/internal/telemetry"
 )
 
@@ -121,6 +122,14 @@ var snapshotOptions = pgx.TxOptions{
 }
 
 // WithinMovement runs fn in a READ COMMITTED, READ WRITE transaction.
+//
+// The fault point sits between the callback's last statement and the COMMIT
+// that [TxManager.run] issues next, and only on this transaction: a snapshot
+// writes nothing, so there is nothing a death before its commit could lose. A
+// process killed here has run every statement of its command — the inbox row,
+// the wallet lock, the wager transaction, the ledger entry, the outbox rows —
+// and committed none of them, which is the state the recovery scenario armed
+// with [faults.BeforeCommit] proves leaves no trace.
 func (m *TxManager) WithinMovement(
 	ctx context.Context,
 	fn func(context.Context, *app.Repos) error,
@@ -128,14 +137,18 @@ func (m *TxManager) WithinMovement(
 	return m.within(ctx, telemetry.SpanMovement, telemetry.Movement, movementOptions,
 		func(ctx context.Context, tx pgx.Tx) error {
 			w := &writer{tx: tx}
-			return fn(ctx, &app.Repos{
+			if err := fn(ctx, &app.Repos{
 				Wallets:      wallets{tx: tx},
 				Transactions: transactions{tx: tx},
 				Inbox:        inbox{tx: tx},
 				Outbox:       outbox{tx: tx, telemetry: m.telemetry},
 				Open:         w.open,
 				Settle:       w.settle,
-			})
+			}); err != nil {
+				return err
+			}
+			faults.Hit(faults.BeforeCommit)
+			return nil
 		})
 }
 

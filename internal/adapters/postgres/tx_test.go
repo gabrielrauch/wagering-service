@@ -3,8 +3,12 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"os"
+	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +19,7 @@ import (
 
 	"github.com/gabrielrauch/wagering-service/internal/app"
 	"github.com/gabrielrauch/wagering-service/internal/domain/wagering"
+	"github.com/gabrielrauch/wagering-service/internal/faults"
 	"github.com/gabrielrauch/wagering-service/internal/telemetry"
 )
 
@@ -507,4 +512,130 @@ func sumOf(
 		}
 	}
 	return 0
+}
+
+// childDatabase is how the child process of
+// TestAMovementKilledBeforeTheCommitLeavesNothing is told which database to run
+// its one movement against. Set, it means "you are the child".
+const childDatabase = "POSTGRES_TEST_CHILD_DATABASE"
+
+// TestAMovementKilledBeforeTheCommitLeavesNothing proves that the fault point
+// in [TxManager.WithinMovement] is reached, and where.
+//
+// A fault point ends the process it fires in, so the firing path cannot be
+// tested in the process running the assertions. The test binary re-executes
+// itself with this one test selected, pointed at THIS test's database, on this
+// test's cluster, and armed with [faults.BeforeCommit]. The child opens a
+// funded wallet through the real manager — a wallet row, an opening
+// transaction, a ledger entry and two outbox rows, which is every table a
+// movement writes — and dies at the point. The parent then reads the exit
+// status, which is the whole of what the recovery scenario in internal/multi
+// reads, and the four tables, which should be empty: every statement ran and
+// none of them committed.
+//
+// The second half runs the same child unarmed. It commits, and the same four
+// tables hold what the movement wrote — which is what shows the emptiness
+// above is the kill's doing and not the child's failing to reach the commit
+// for some other reason.
+func TestAMovementKilledBeforeTheCommitLeavesNothing(t *testing.T) {
+	if dsn := os.Getenv(childDatabase); dsn != "" {
+		openWalletInChild(t, dsn)
+		return
+	}
+	t.Parallel()
+	w := newWorld(t)
+
+	tables := []string{"wallet", "wager_transaction", "wallet_ledger_entry", "outbox"}
+
+	t.Run("armed, it dies having committed nothing", func(t *testing.T) {
+		code, stderr := runMovementChild(t, w, faults.BeforeCommit)
+		if code != faults.ExitCode {
+			t.Fatalf("the child exited %d, want %d: the fault point was not reached\n%s",
+				code, faults.ExitCode, stderr)
+		}
+		if want := "FAULT_POINT=" + faults.BeforeCommit + " fired"; !strings.Contains(stderr, want) {
+			t.Fatalf("the child exited %d but never said %q, so it died somewhere else\n%s",
+				code, want, stderr)
+		}
+		for _, table := range tables {
+			if got := w.count(t, `SELECT count(*) FROM wagering.`+table); got != 0 {
+				t.Errorf("wagering.%s holds %d rows after a death before the commit, want 0",
+					table, got)
+			}
+		}
+	})
+
+	t.Run("unarmed, the same movement commits", func(t *testing.T) {
+		code, stderr := runMovementChild(t, w, "")
+		if code != 0 {
+			t.Fatalf("the child exited %d, want 0\n%s", code, stderr)
+		}
+		for table, want := range map[string]int{
+			"wallet": 1, "wager_transaction": 1, "wallet_ledger_entry": 1, "outbox": 2,
+		} {
+			if got := w.count(t, `SELECT count(*) FROM wagering.`+table); got != want {
+				t.Errorf("wagering.%s holds %d rows after the commit, want %d", table, got, want)
+			}
+		}
+	})
+}
+
+// runMovementChild re-executes the test binary against this world's database
+// with one fault point armed, and reports how it ended.
+//
+// TEST_DATABASE_URL is handed down so that the child's TestMain joins this
+// process's cluster rather than starting a container of its own; the child
+// creates no database and drops none — it is handed one.
+func runMovementChild(t *testing.T, w *world, armed string) (int, string) {
+	t.Helper()
+	cmd := exec.CommandContext(t.Context(), os.Args[0],
+		"-test.run=^TestAMovementKilledBeforeTheCommitLeavesNothing$")
+	cmd.Env = append(os.Environ(),
+		"TEST_DATABASE_URL="+sharedDSN,
+		childDatabase+"="+w.dsn,
+		faults.Variable+"="+armed)
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	err := cmd.Run()
+
+	var exit *exec.ExitError
+	switch {
+	case err == nil:
+		return 0, output.String()
+	case errors.As(err, &exit):
+		return exit.ExitCode(), output.String()
+	default:
+		t.Fatalf("run the child: %v", err)
+		return 0, ""
+	}
+}
+
+// openWalletInChild is the one movement the child runs: a funded wallet, with
+// its opening and the two events it emits, through the real manager as the
+// application role. Armed, this function never returns.
+func openWalletInChild(t *testing.T, dsn string) {
+	t.Helper()
+	pool := newAppPool(t, dsn, 2)
+	tm, err := NewTxManager(TxConfig{
+		Pool:             pool,
+		LockTimeout:      testLockTimeout,
+		StatementTimeout: testStatementTimeout,
+	})
+	if err != nil {
+		t.Fatalf("new transaction manager: %v", err)
+	}
+	wallet, outcome := newWallet(t, "player-child", "100.00", "BRL")
+	// The events are appended through the same helper every fixture uses; it
+	// reads nothing off the world it hangs off, so an empty one serves.
+	var fixtures world
+	err = tm.WithinMovement(t.Context(), func(ctx context.Context, r *app.Repos) error {
+		if err := r.Open(ctx, wallet, outcome, "child"); err != nil {
+			return err
+		}
+		return fixtures.append(ctx, r.Outbox, outcome.Events, at(0))
+	})
+	if err != nil {
+		t.Fatalf("open a wallet in the child: %v", err)
+	}
 }

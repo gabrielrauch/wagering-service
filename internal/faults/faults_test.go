@@ -80,13 +80,28 @@ func TestHit(t *testing.T) {
 		{
 			// The point step 6's publisher-recovery test arms. It fires in a
 			// case of its own rather than only appearing as the "some other
-			// point" of the case above, so that all four are exercised the
+			// point" of the case above, so that all five are exercised the
 			// same way.
 			name:     "the publisher's mark point fires",
 			armed:    AfterPublishBeforeMark,
 			hit:      AfterPublishBeforeMark,
 			exitCode: ExitCode,
 			stderr:   "after_publish_before_mark",
+		},
+		{
+			name:     "the movement's point before the commit fires",
+			armed:    BeforeCommit,
+			hit:      BeforeCommit,
+			exitCode: ExitCode,
+			stderr:   "before_commit",
+		},
+		{
+			// The two points either side of a commit are different points: a
+			// process armed before the commit must not die after it.
+			name:     "the point before the commit leaves the one after it alone",
+			armed:    BeforeCommit,
+			hit:      AfterCommitBeforeAck,
+			exitCode: 0,
 		},
 	}
 
@@ -159,6 +174,7 @@ func TestThePointsAreSpeltAsTheEnvironmentSpellsThem(t *testing.T) {
 		{AfterPublishBeforeMark, "after_publish_before_mark"},
 		{AfterClaimBeforePublish, "after_claim_before_publish"},
 		{AfterPendingCommit, "after_pending_commit"},
+		{BeforeCommit, "before_commit"},
 	}
 	for _, c := range cases {
 		if c.constant != c.spelling {
@@ -181,6 +197,7 @@ func TestEveryPointIsRegistered(t *testing.T) {
 		AfterPublishBeforeMark,
 		AfterClaimBeforePublish,
 		AfterPendingCommit,
+		BeforeCommit,
 	}
 	if len(points) != len(declared) {
 		t.Errorf("points holds %d names, but %d are declared", len(points), len(declared))

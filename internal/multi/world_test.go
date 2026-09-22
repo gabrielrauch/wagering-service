@@ -342,12 +342,21 @@ func (w *world) noneDeadLettered(t *testing.T) {
 	}
 }
 
-// drain takes everything off a queue and answers the bodies, oldest first.
+// drain takes everything off one of this world's queues and answers the
+// bodies, oldest first.
+func (w *world) drain(t *testing.T, url string) []string {
+	t.Helper()
+	return drainQueue(t, url)
+}
+
+// drainQueue takes everything off a queue and answers the bodies, oldest
+// first. It is a function rather than only a method because the deployment's
+// own outbound queue is read the same way, and the deployment is not a world.
 //
 // Deleting as it goes, because a FIFO group delivers one message at a time and
 // a drain that left them in flight would read the first message of each group
 // and call the queue empty.
-func (w *world) drain(t *testing.T, url string) []string {
+func drainQueue(t *testing.T, url string) []string {
 	t.Helper()
 	var bodies []string
 	// Three empty receives in a row rather than one: LocalStack answers a

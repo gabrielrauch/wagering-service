@@ -21,25 +21,29 @@
 // fixed cost, around a minute cold and a few seconds against a warm build
 // cache.
 //
-// The scenarios themselves take about thirty seconds. The four that run against
-// the compose replicas run first and are over in under a second between them;
-// the six that build a world of their own run in parallel, so the thirty
-// seconds is the slowest of the six — the killed consumer, waiting out the
-// visibility timeout on a message its process died holding.
+// The scenarios themselves take about a minute. The seven that run against the
+// compose replicas run first, one at a time: four are over in under a second
+// between them, the two outage scenarios pause a container each and spend the
+// deployment's own timeouts noticing, and the simultaneous cross-transport one
+// waits on a worker replica. The seven that build a world of their own then run
+// in parallel, so their cost is the slowest of the seven — a killed consumer,
+// waiting out the visibility timeout on a message its process died holding.
 //
 // Measured on this tree. Which of these you get depends on one thing — how much
 // Compose and the Go build cache have to redo:
 //
-//   - About forty-five seconds for this package on its own, with the stack up
-//     and the images current. That is the ordinary case.
-//   - About seventy-five when one delivery to the deployment's own queue is
+//   - About sixty-five seconds for this package on its own, with the stack up
+//     and the images current — some twenty of them the two outage scenarios,
+//     which pause a container and wait for the stack to answer again. That is
+//     the ordinary case.
+//   - About ninety-five when one delivery to the deployment's own queue is
 //     swallowed. A receive left open on a worker container Compose replaced
 //     takes the message and never answers for it, so it comes back at the
 //     deployment's own thirty-second visibility timeout. That is LocalStack's
 //     rather than this service's, it is the single biggest source of spread
 //     here, and it is why the cross-transport scenario waits under a budget of
 //     its own rather than under settleBudget.
-//   - Fifty seconds to a minute and a half for `go test ./...`, which runs the
+//   - Seventy seconds to a minute and three quarters for `go test ./...`, which runs the
 //     rest of the tree beside it — including the suites that start PostgreSQL
 //     containers of their own.
 //   - About ninety seconds whenever Compose rebuilds the images, which it does
@@ -55,29 +59,36 @@
 // or the compose replicas. Both are here, because the scenarios divide cleanly
 // in two and each half is cheaper and more honest under a different one.
 //
-// Six scenarios need a process to die at a named instant, need the wait budget
-// to be seconds rather than minutes, or need to write something the schema is
-// entitled to refuse. Those build a world of their own: a database created and
-// migrated for the scenario, three FIFO queues created for the scenario —
-// inbound, outbound and the dead letter queue the first one redrives to — and
-// processes this suite starts, arms with
-// FAULT_POINT, kills and replaces. A world is isolated from the compose stack
-// and from every other world, so a publisher that must be one of exactly two is
-// one of exactly two, and a message that must be received by the process that
-// is about to die is not taken by a replica that is not.
+// Seven scenarios need a process to die at a named instant, need the wait
+// budget to be seconds rather than minutes, or need to write something the
+// schema is entitled to refuse. Those build a world of their own: a database
+// created and migrated for the scenario, three FIFO queues created for the
+// scenario — inbound, outbound and the dead letter queue the first one redrives
+// to — and processes this suite starts, arms with FAULT_POINT, kills and
+// replaces. All five fault points are killed at here: the consumer on
+// either side of its commit (before_commit and after_commit_before_ack), the
+// publisher at either end of a send, and the reference worker after it parks
+// an operation. A world is isolated from the compose stack and from every
+// other world, so a publisher that must be one of exactly two is one of
+// exactly two, and a message that must be received by the process that is
+// about to die is not taken by a replica that is not.
 //
-// Four scenarios need none of that, and for them the deployment itself is the
+// Seven scenarios need none of that, and for them the deployment itself is the
 // better fixture: api-1, api-2 and api-3 on 8081, 8082 and 8083 are three
 // genuinely separate containers with separate pools, and the two worker
 // replicas are the ones a deployment runs. Those scenarios talk to the real
 // published ports with a real token from the real Keycloak, and read the two
-// worker replicas' own logs back out of Compose.
+// worker replicas' own logs back out of Compose. Two of them take a dependency
+// away — `docker compose pause` on the database, then on LocalStack — and
+// watch what the deployment's own processes do without it and once it is back;
+// they are sequential, because a paused database is paused for everybody, and
+// each restores the stack in a cleanup whether it passed or not.
 //
-// What the split gives up is stated plainly. The six isolated scenarios do not
-// exercise the container image, the health checks or the compose network; they
-// exercise the same binaries on the host. The four deployment scenarios do not
-// get a private database, so they are careful to identify everything they
-// assert on by a run-scoped identifier rather than by counting rows.
+// What the split gives up is stated plainly. The seven isolated scenarios do
+// not exercise the container image, the health checks or the compose network;
+// they exercise the same binaries on the host. The seven deployment scenarios
+// do not get a private database, so they are careful to identify everything
+// they assert on by a run-scoped identifier rather than by counting rows.
 //
 // # This is not a fourth copy of the PostgreSQL harness
 //

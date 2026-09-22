@@ -137,4 +137,12 @@
 //     outbox row being marked published.
 //   - [faults.AfterPendingCommit] in the reference worker, after the commit that
 //     parked or settled an operation.
+//
+// A fifth is the other side of the consumer's commit, and it is not in this
+// package: [faults.BeforeCommit] is hit by the transaction manager in
+// internal/adapters/postgres, after the last statement of a movement and
+// before its COMMIT, whichever process — this consumer, the API, the reference
+// worker — ran the movement. A consumer killed there has taken the message and
+// written nothing, and the redelivery is a first application rather than a
+// replay.
 package workers
